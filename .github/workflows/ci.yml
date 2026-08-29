@@ -32,25 +32,24 @@ jobs:
             pyproject.toml
             requirements/constraints.txt
 
-      - name: Install development dependencies
+      - name: Validate shell syntax
+        run: bash -n scripts/*.sh
+
+      - name: Follow the README quick start
         run: |
-          python -m pip install --upgrade pip wheel
-          python -m pip install -c requirements/constraints.txt -e '.[dev]'
+          bash scripts/setup.sh dev
+          cp .env.example .env
+          source scripts/activate.sh
+          cpv26 show-config
+          cpv26 db-init
+          cpv26 db-check
 
-      - name: Compile
-        run: python -m compileall -q src tests scripts/build_code_summary.py
-
-      - name: Lint
-        run: python -m ruff check src tests scripts/build_code_summary.py
-
-      - name: Type check
-        run: python -m mypy --no-incremental src/cpv26
-
-      - name: Test core contracts
-        run: python -m pytest
-
-      - name: Check dependency consistency
-        run: python -m pip check
+      - name: Run the complete validation suite
+        run: |
+          source scripts/activate.sh
+          bash scripts/check.sh
 
       - name: Build wheel
-        run: python -m pip wheel . --no-deps -w dist
+        run: |
+          source scripts/activate.sh
+          python -m pip wheel . --no-deps -w dist

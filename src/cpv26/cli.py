@@ -77,6 +77,7 @@ def db_check() -> None:
     try:
         with DuckDBStore(settings.database_path, read_only=True) as store:
             store.assert_referential_integrity()
+            store.assert_composite_referential_integrity()
     except (DuckDBError, OSError, RuntimeError) as exc:
         error_console.print(f"[red]Database check failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc

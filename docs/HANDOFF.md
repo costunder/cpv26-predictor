@@ -34,7 +34,8 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
 ## 2. 전달 파일
 
 - `README.md`
-  - Linux/MobaXterm 설치, 실행 profile, 구조, 현재 한계를 설명한다.
+  - 초보자가 MobaXterm에서 clone, 설치, 환경 활성화, DB 초기화와 검증을 순서대로
+    실행할 수 있는 운영 안내서다. 상세 설계는 이 문서로 분리했다.
 - `docs/HANDOFF.md`
   - 이 문서다. 설계 결정, 공개 계약, 검증 결과와 다음 작업을 설명한다.
 - `code_summary.md`
@@ -51,9 +52,9 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
 ````
 ```
 
-- 최종 `code_summary.md` SHA-256: `32c0c8f1771ebd887b4bc2940d316d6fa4926ad023df38b2baabc103f5ddbbe6`
-- 포함 section 수: `68`
-- 고유 경로 수: `68`
+- 최종 `code_summary.md` SHA-256: `e8143eb0b702eb54c67de79909f1bfb61e87b2457a8d3aeed1f37f24c27c151d`
+- 포함 section 수: `69`
+- 고유 경로 수: `69`
 
 이 hash로 외부 전달 과정에서 코드 요약이 변형되지 않았는지 확인할 수 있다.
 
@@ -73,6 +74,7 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
 ├── requirements/
 │   └── constraints.txt
 ├── scripts/
+│   ├── activate.sh
 │   ├── build_code_summary.py
 │   ├── setup.sh
 │   └── check.sh
@@ -147,16 +149,14 @@ Windows `.venv`는 복사하지 않는다. MobaXterm SFTP로 소스만 올린 �
 ```bash
 cd ~/projects/cpv26-predictor
 bash scripts/setup.sh base
-source .venv/bin/activate
 cp .env.example .env
-set -a
-source .env
-set +a
+source scripts/activate.sh
 cpv26 db-init
 cpv26 db-check
 ```
 
-Python 명령이 `python3.10`이 아니면 다음처럼 지정한다.
+`setup.sh`는 기본적으로 `python3`를 사용하고 Python 3.10~3.12인지 검사한다. 서버의
+Python 명령이 다르면 다음처럼 지정한다.
 
 ```bash
 PYTHON_BIN=python3.11 bash scripts/setup.sh base
@@ -168,8 +168,8 @@ Profile은 네 개다.
 |---|---|---|
 | `base` | runtime만 | DB, feature, snapshot, CLI |
 | `dev` | runtime + Ruff/mypy/pytest/coverage | 개발·검증 |
-| `ml-cpu` | runtime + CatBoost + CPU PyTorch | CPU smoke/train |
-| `ml-cuda` | runtime + CatBoost, 기존 CUDA torch 검사 | GPU 서버 |
+| `ml-cpu` | runtime + dev + CatBoost + 공식 CPU PyTorch wheel | CPU smoke/train |
+| `ml-cuda` | runtime + dev + CatBoost, 기존 CUDA torch 검사 | GPU 서버 |
 
 `setup.sh`는 기존 `.venv`를 재사용한다. 개발 host에서는 `dev` 다음 `ml-cpu`를 실행해도
 된다.
@@ -178,7 +178,8 @@ GPU에서는 다음 순서를 사용한다.
 
 ```bash
 bash scripts/setup.sh base
-source .venv/bin/activate
+cp .env.example .env
+source scripts/activate.sh
 nvidia-smi
 # 공식 PyTorch selector에서 driver/runtime에 맞는 CUDA wheel 설치
 bash scripts/setup.sh ml-cuda

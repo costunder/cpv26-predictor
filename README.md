@@ -1,121 +1,129 @@
 # CPV26 Predictor
 
-컴프야 V26의 승부예측과 라이브 히트 의사결정을 연구하기 위한 KBO 확률 예측
-프레임워크입니다. 개인 능력, 타자-투수 관계, 라인업과 팀 상태를 시점 보존 데이터로
-구성하고, 관계 모델·순차 경기 시뮬레이션·게임 규칙 최적화를 분리합니다.
+컴프야 V26의 **승부예측**과 **라이브 히트**를 연구하기 위한 KBO 확률 예측
+프로젝트입니다.
 
-현재 버전은 `0.4.0`, DuckDB schema는 `v4`입니다. 이 저장소는 검증 가능한 핵심
-부품을 제공하지만, 데이터 수집부터 당일 추천까지 자동 실행되는 완성 서비스는
-아닙니다. 허가된 실제 데이터와 학습 산출물이 없으면 임의 예측을 만들지 않습니다.
+이 README는 처음 사용하는 사람이 MobaXterm으로 Linux 서버에 접속한 뒤 저장소를
+받고, 설치하고, 현재 구현된 기능을 검증하는 데 필요한 순서만 설명합니다. 모델 구조,
+데이터 계약, 테이블 정의의 상세 내용은 [docs/HANDOFF.md](docs/HANDOFF.md)에 있습니다.
 
-> 상태: 연구 프로토타입 · 독점 소프트웨어 · 비공식 프로젝트
-> KBO 또는 게임 개발·배급·운영사와 제휴하거나 이들의 보증을 받은 프로젝트가 아닙니다.
+> 현재 버전: 0.4.0 · DuckDB schema: v4
+> 상태: 연구용 기반 코드 · 비공식 프로젝트 · 독점 소프트웨어
 
-## 설계 원칙
+## 먼저 알아둘 점
 
-- 학습·예측 입력은 `available_at <= cutoff_at`을 만족해야 합니다.
-- 사건의 최근성은 `event_at`, 정보 사용 가능성은 `available_at`으로 계산합니다.
-- 관측된 과거 타석과 미래 경기의 선수 후보를 별도 테이블로 관리합니다.
-- 선수 공통 identity state와 타격·투구·포수·수비·주루 state를 분리합니다.
-- 야구 확률과 V26 점수·보너스 규칙을 분리합니다.
-- 예측 run ID는 한 번 생성하면 재사용하지 않고, 상태 변화는 별도 이벤트로 남깁니다.
-- 게임 계정 로그인, 선택 자동화, 비인가 대량 수집은 제공하지 않습니다.
+현재 저장소에서 바로 실행할 수 있는 범위는 다음과 같습니다.
 
-## 대상 환경
+- Python 환경 설치
+- 설정 확인
+- DuckDB schema 생성과 무결성 검사
+- 전체 단위 테스트
+- CatBoost·PyTorch·RelGNN 코드 로드와 테스트
+- 이미 적재된 prediction run의 시점 보존 snapshot 생성
 
-실제 실행 대상은 MobaXterm으로 접속하는 Linux 서버입니다.
+아직 바로 실행할 수 없는 범위는 다음과 같습니다.
 
-- Ubuntu 22.04 이상 권장
-- Bash
+- KBO 또는 V26 실제 데이터 자동 수집
+- 공급자 CSV/API를 DuckDB에 적재하는 adapter
+- 실제 시즌 데이터로 학습하는 단일 명령
+- 당일 승부예측·라이브 히트 추천을 만드는 단일 명령
+
+따라서 아래 빠른 시작을 완료하면 **프로젝트 설치와 기반 코드가 정상이라는 것**까지
+확인됩니다. 실제 예측값이 자동으로 만들어지는 단계는 아닙니다.
+
+## 1. MobaXterm으로 서버 접속
+
+MobaXterm에서 `Session` → `SSH`를 선택하고 Linux 서버 주소와 사용자 이름을 입력해
+접속합니다. 이후 이 문서의 명령은 모두 MobaXterm 오른쪽 터미널에서 실행합니다.
+왼쪽 SFTP 패널은 파일을 올리거나 내려받을 때만 사용합니다.
+
+지원 환경은 다음과 같습니다.
+
+- Linux, Bash
 - Python 3.10~3.12
-- RAM 32GB 이상 권장
-- 전체 graph 실험은 A6000 48GB 권장
+- Git
+- 인터넷 연결
+- GPU 학습 시 NVIDIA driver와 CUDA 지원 GPU
 
-A100 10GB MIG는 현재 주 학습 환경으로 가정하지 않습니다. 10GB에서 안정적으로
-학습하려면 target-game subgraph, temporal neighbor sampling, route mini-batch loader,
-BF16/AMP, gradient accumulation, activation checkpointing과 CPU→GPU streaming이 먼저
-필요합니다. 이 경량화 경로는 아직 구현되지 않았습니다.
-
-## MobaXterm에서 설치
-
-MobaXterm SFTP 패널로 프로젝트를 `~/projects/cpv26-predictor`에 전송합니다. 다음은
-전송하지 마세요.
-
-```text
-.venv/
-var/
-__pycache__/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-```
-
-Windows 가상환경은 Linux에서 재사용할 수 없습니다. 서버에서 새로 만듭니다.
-
-### 운영 최소 환경
+먼저 서버 상태를 확인합니다.
 
 ```bash
-cd ~/projects/cpv26-predictor
-bash scripts/setup.sh base
-source .venv/bin/activate
-cp .env.example .env
-set -a
-source .env
-set +a
-cpv26 db-init
-cpv26 db-check
+git --version
+python3 --version
+python3 -m venv --help >/dev/null
 ```
 
-서버의 Python 명령이 다르면 지정할 수 있습니다.
+Python 버전이 3.10보다 낮거나 3.13 이상이면 설치를 진행하지 말고 서버 관리자에게
+Python 3.10, 3.11 또는 3.12 설치를 요청합니다. Ubuntu에서 Git 또는 venv 모듈만
+없는 경우에는 권한이 있는 사용자가 다음처럼 설치할 수 있습니다.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3-venv
+```
+
+## 2. GitHub에서 프로젝트 받기
+
+저장소는 비공개이므로 GitHub 계정에 접근 권한이 있어야 합니다.
+
+### SSH key가 서버에 등록된 경우
+
+```bash
+ssh -T git@github.com
+mkdir -p ~/projects
+cd ~/projects
+git clone git@github.com:costunder/cpv26-predictor.git
+cd cpv26-predictor
+```
+
+`Permission denied (publickey)`가 나오면 서버의 SSH 공개키를 GitHub 계정에 먼저
+등록해야 합니다. 절차는
+[GitHub SSH 연결 문서](https://docs.github.com/en/authentication/connecting-to-github-with-ssh)를
+따릅니다.
+
+### HTTPS를 사용하는 경우
+
+```bash
+mkdir -p ~/projects
+cd ~/projects
+git clone https://github.com/costunder/cpv26-predictor.git
+cd cpv26-predictor
+```
+
+비공개 저장소 인증이 불가능한 서버에서는 Windows 브라우저로 저장소 ZIP을 받은 뒤
+압축을 풀고, MobaXterm 왼쪽 SFTP 패널로 `~/projects/cpv26-predictor`에 올려도 됩니다.
+`.venv`, `var`, cache 폴더는 Windows에서 복사하지 않습니다.
+
+현재 위치가 맞는지 확인합니다.
+
+```bash
+pwd
+ls
+```
+
+`README.md`, `pyproject.toml`, `scripts`, `src`, `tests`가 보여야 합니다.
+
+## 3. 기본 환경 설치
+
+프로젝트 루트에서 다음 명령을 실행합니다.
+
+```bash
+bash scripts/setup.sh base
+cp .env.example .env
+source scripts/activate.sh
+```
+
+`setup.sh`는 `.venv` 가상환경을 만들고 프로젝트를 editable mode로 설치합니다.
+서버의 기본 명령이 `python3`이 아니라면 설치된 Python을 직접 지정합니다.
 
 ```bash
 PYTHON_BIN=python3.11 bash scripts/setup.sh base
 ```
 
-### 개발 검사 환경
+`setup.sh`는 정상적인 기존 `.venv`를 재사용합니다. Python 버전을 바꾸려면 기존
+가상환경을 다른 이름으로 옮긴 뒤 원하는 `PYTHON_BIN`으로 다시 실행합니다.
 
-```bash
-bash scripts/setup.sh dev
-source .venv/bin/activate
-bash scripts/check.sh
-```
-
-### CPU ML 환경
-
-CatBoost와 CPU PyTorch를 설치합니다.
-
-```bash
-bash scripts/setup.sh ml-cpu
-source .venv/bin/activate
-bash scripts/check.sh
-```
-
-### NVIDIA CUDA 환경
-
-CUDA PyTorch wheel은 서버 드라이버와 CUDA runtime에 맞춰 공식 PyTorch 설치 선택기로
-고릅니다. 일반 PyPI torch로 덮어쓰지 않도록 `ml-cuda` 프로필은 CatBoost만 설치한
-뒤 이미 설치된 torch의 CUDA 가용성을 검사합니다.
-
-```bash
-cd ~/projects/cpv26-predictor
-bash scripts/setup.sh base
-source .venv/bin/activate
-nvidia-smi
-
-# 이 위치에서 서버에 맞는 공식 CUDA PyTorch wheel을 설치합니다.
-bash scripts/setup.sh ml-cuda
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-```
-
-`requirements/constraints.txt`는 Python 3.12에서 검증한 core·dev·CatBoost 버전을
-고정합니다. CUDA PyTorch는 target Linux host에서 결정하고, 버전을 바꿀 때 전체
-검사를 다시 실행합니다. `scikit-learn`은 직접 사용하지 않아 의존성에서 제외했습니다.
-`pytz`는 DuckDB `TIMESTAMPTZ`를 Python datetime으로 변환하는 실제 runtime 경로에서
-필요하므로 유지합니다.
-
-## 환경 설정
-
-`.env`는 저장소에 포함하지 않습니다. 기본 항목은 다음과 같습니다.
+`.env`의 기본값은 바로 사용할 수 있습니다.
 
 ```dotenv
 CPV26_HOME=./var
@@ -126,355 +134,288 @@ CPV26_RANDOM_SEED=2026
 CPV26_LOG_LEVEL=INFO
 ```
 
-상대 경로는 저장소 루트를 기준으로 해석됩니다. 실행 데이터베이스, snapshot,
-checkpoint와 로그는 `CPV26_HOME` 아래에 생성합니다.
+`.env`에는 나중에 추가될 비밀값을 넣을 수 있으므로 Git에 올리지 않습니다.
 
-## 코드 구조
+## 4. 첫 실행
 
-```text
-src/cpv26/
-├── data/          schema v4, PIT query, 데이터 계약·무결성 감사, Parquet snapshot
-├── features/      타격 상태, 베이지안 shrinkage, 시점별 상태 primitive
-├── graph/         atomic route registry와 누수 방지 graph snapshot
-├── models/        CatBoost, 역할별 encoder, RelGNN, direct heads, OOF stacker
-├── simulation/    10→14 PA adapter와 순차 야구 경기 시뮬레이션
-├── optimization/  승부예측 exhaustive search와 라이브 히트 exact/beam search
-├── training/      작업별 batch/loss, 공유 backbone 경계, alternating trainer
-├── cli.py         Linux 배치 명령
-├── config.py      환경변수 기반 설정
-├── domain.py      공통 도메인 타입
-└── evaluation.py  날짜순 walk-forward와 확률 평가 지표
-```
-
-빈 데이터 폴더나 가짜 CSV는 두지 않습니다.
-
-## 저장소 문서
-
-- [프로젝트 인수인계와 설계 상세](docs/HANDOFF.md)
-- [독점 라이선스와 비제휴 고지](LICENSE.md)
-
-외부 코드 검토가 필요하면 `python scripts/build_code_summary.py`를 실행해
-`code_summary.md`를 생성합니다. 이 파일은 전체 소스를 복제하는 전달용 산출물이므로
-Git에는 포함하지 않습니다.
-
-## 데이터와 재현성 계약
-
-변동 가능한 원천 행은 다음 다섯 시점을 갖습니다.
-
-- `event_at`: 실제 사건 또는 효력 발생 시각
-- `available_at`: 예측자가 그 정보를 사용할 수 있게 된 시각
-- `ingested_at`: 이 시스템이 행을 관측한 시각
-- `valid_from`, `valid_to`: 업무 버전의 반개구간 유효기간
-
-`current_only=True` as-of query는 다음 순서로 동작합니다.
-
-```text
-available_at / ingested_at eligibility
-  → natural identity + valid_from별 최신 correction
-  → cutoff에서 유효한 business version
-  → natural identity별 최신 valid_from
-```
-
-따라서 미리 발표된 미래 버전이 현재 행을 숨기지 않고, 최신 correction이 닫은 과거
-행도 다시 살아나지 않습니다. run-scoped 후보의 identity에는 `prediction_run_id`가
-포함됩니다.
-
-`prediction_run`은 `prediction_run_id UNIQUE` 단일 행이며 cutoff, knowledge,
-feature/model/simulator/ruleset 버전을 고정합니다. 상태는
-`prediction_run_status_event`에 append합니다. v1→v2 migration은 실제 v1 index를
-제거·재생성하며 중복 run ID가 있으면 전체 transaction을 rollback합니다.
-
-Schema v4는 라이브 히트 의사결정 상태와 순차 경기 재생에 필요한 데이터 원장을 야구
-feature와 분리해 저장합니다. Metadata를 포함해 36개 table입니다.
-
-```text
-game_status_snapshot               취소·순연·지연·중단·노게임의 발표 시점
-starter_announcement               예상·예고·확정·변경 선발의 발표 시점
-player_game_batting                공식 박스스코어 정합성 기준
-substitution_event                 대타·대주자·투수·수비 교체
-runner_event                       도루·도루실패·견제사·폭투·포일·보크
-fielding_assignment                경기 sequence별 수비 역할
-catcher_assignment                 경기 sequence별 포수 역할
-weather_forecast_snapshot          예측 시점에 사용 가능한 예보 revision
-weather_observation                사후 검증·oracle 실험용 실제 관측
-v26_live_hit_rule_set              규칙 JSON, 출처와 공식/관측/가정 구분
-v26_slate                          lock·규칙·Live 카드·자격 snapshot의 결합 단위
-v26_player_position_eligibility    slate·Live 카드 버전별 포지션 자격
-v26_selection_snapshot             phase·포지션별 선택률 snapshot
-user_collection_snapshot           사용자·Live 카드 버전별 도감 보유 상태
-v26_submission                     선택 선수·선택 시너지 팀이라는 실제 행동 결과
-```
-
-각 source-backed table은 시점 컬럼을 가지며 v1→v2→v3→v4, v2→v3→v4,
-v3→v4 migration을 지원합니다. `observed_plate_appearance`에는 타석 전후 점수,
-`outs_added`, `runners_after`, 동일 sequence 안의 `event_subsequence`와
-`transition_complete`를 추가했습니다. 과거 행의 전이 상태를 추측해 채우지 않고
-`transition_complete=false`로 남기며 simulator-ready 데이터 감사에서 제외합니다.
-
-`live_hit_snapshot_specs()`는 특정 사용자·슬레이트·규칙·선택률 snapshot만 Parquet
-fingerprint에 포함합니다. 사용자 도감 전체가 기본 snapshot에 섞이지 않도록 명시적인
-scope가 없으면 Live Hit 계정 snapshot을 만들지 않습니다. `v26_submission`은 모델 입력이
-아닌 optimizer 행동이므로 입력 snapshot에서 제외합니다.
-
-다중 행 `append()`도 원자적입니다. 중간 CHECK 실패가 나면 해당 호출의 앞선 행까지
-rollback하며, 명시적 transaction 안에서 실패를 잡아도 transaction 전체가 실패로
-표시됩니다.
-
-물리 foreign key는 공급자별 적재 순서를 막을 수 있어 강제하지 않습니다. 대신 다음
-감사를 snapshot·학습 전에 실행합니다.
-
-```python
-from cpv26.data import DuckDBStore
-
-with DuckDBStore("var/cpv26.duckdb", read_only=True) as store:
-    store.assert_referential_integrity()
-    store.assert_composite_referential_integrity()
-    violations = store.as_of_reference_violations(
-        cutoff_at=cutoff_at,
-        knowledge_at=knowledge_at,
-    )
-```
-
-단일 ID 존재 검사뿐 아니라 `(game_id, team_id, player_id)` 같은 composite 관계와, 물리
-row가 있더라도 예측 cutoff에는 아직 발표되지 않았던 부모를 구분합니다. `cpv26 db-check`도
-schema signature와 선수·팀·경기·source revision·prediction run 참조를 함께 검사합니다.
-
-Snapshot builder는 cutoff의 논리 입력을 Parquet으로 고정하고 table별 논리 SHA-256,
-파일 SHA-256과 전체 manifest fingerprint를 기록합니다. 같은 run ID에 다른 내용이
-생기면 기존 디렉터리를 덮어쓰지 않습니다.
-
-## 데이터셋 구성과 평가 경계
-
-이 저장소에는 실데이터 자체나 비어 있는 더미 파일을 넣지 않았습니다. 대신 공급자
-adapter가 채워야 할 schema와 적재 후 실행할 데이터 계약을 제공합니다.
-
-권장 야구 원천 범위는 다음과 같습니다.
-
-```text
-2018~2025 KBO 경기·타석·박스스코어
-  → PA 결과, 선수 안타 분포, 득점·승패, 관계 모델 학습·검증
-
-2026 shadow/live 수집
-  → 발표 당시 선발·라인업·경기 상태·예보 revision
-  → V26 early/starter_known/lineup_known/near_lock snapshot
-```
-
-엄격한 시즌 역할은 코드의 `DEFAULT_EXPANDING_TEMPORAL_POLICY`에 고정했습니다.
-
-| 시즌 | 역할 |
-|---|---|
-| 2018~2022 | base model 학습 |
-| 2023 | feature·route·hyperparameter 선택 |
-| 2024 | OOF stacking·확률 보정 |
-| 2025 | 구조를 바꾸지 않는 최종 holdout |
-| 2026 | 2018~2025 재학습 후 shadow/live |
-
-같은 `game_id`의 타석·선수·horizon 행은 반드시 같은 fold에 둡니다. PA와
-`player_game_batting` 및 `team_game` 집계, 타석 전후 점수·아웃·주자 연속성도 계약으로
-검사합니다. 명시적 `runner_event`가 두 PA 사이에 있으면 직접 주자 연속성 비교만
-건너뛰고, 이벤트 자체를 원인으로 보존합니다.
-
-날씨는 두 실험을 섞지 않습니다.
-
-```text
-forecast       forecast_issued_at·available_at <= cutoff인 예보만 입력
-oracle_weather 경기 시점 실제 관측을 사후 상한선 분석에만 사용
-```
-
-2018~2025 당시 예보 revision을 확보하지 못하면 날씨를 제외하거나
-`oracle_weather`라고 명시해야 합니다. 실제 관측을 당시 예보처럼 사용하면 누수입니다.
-
-V26도 가용성에 따라 평가 이름을 분리합니다.
-
-```text
-2018~2025  과거 선택률·자격·규칙 snapshot이 없으면 fixed_300 counterfactual
-2026~      수집 시작 이후 네 phase가 모두 있는 slate만 실제 replay 후보
-```
-
-`audit_v26_capture_consistency()`는 네 phase의 완전성·순서, slate/rule/Live 카드/자격의
-일치, 포지션별 중복, lock 이후 capture를 검사합니다. `selected_synergy_team_id`는 후보
-feature가 아니라 `v26_submission`에 기록되는 optimizer 출력입니다.
-
-## 관계 모델
-
-`AtomicRouteBatch`는 `event_at`과 `available_at`을 모두 보존합니다.
-
-- eligibility: `available_at <= cutoff_at`
-- recency encoding: `cutoff_at - event_at`
-- 선택 feature: `available_at - event_at` publication delay
-
-빈 node type은 `node_feature_dims`를 명시해 항상 `[0, feature_dim]` tensor로 변환합니다.
-
-선수 state channel은 다음과 같습니다.
-
-```text
-shared player core
-  ├── batting
-  ├── pitching
-  ├── catcher
-  ├── defense
-  └── baserunning
-```
-
-Route의 `source_role`과 `destination_role`이 실제 channel을 선택합니다. Backbone의 한
-layer는 다음을 수행합니다.
-
-```text
-source state + encoded event + event-time context
-  → destination state를 query로 쓰는 route-local multi-head attention
-  → route별 독립 summary
-  → destination별 learned route attention/gate
-  → GRU + LayerNorm update
-```
-
-따라서 unrelated route의 edge 수가 많아도 하나의 공통 degree denominator로 핵심
-matchup message를 희석하지 않습니다. 기본 whitelist에는 타자–타석–투수,
-투수–타석–포수, 타자–타석–경기, 홈팀–경기–원정팀,
-선수후보–player_game_candidate–경기 등이 포함됩니다.
-
-이 구현은 외부 검토에서 지적된 destination-query attention과 route-level 결합을
-반영한 RelGNN 계열 backbone입니다. 특정 논문의 공식 repository와 parameter-by-parameter
-동일하다고 주장하지 않으며, CatBoost·MLP·GraphSAGE와 동일 cutoff/feature/tuning budget의
-미래기간 비교가 끝나기 전에는 최고 모델로 간주하지 않습니다.
-
-## 타석 확률과 시뮬레이션
-
-Neural decoder의 10개 label은 다음 adapter를 통해 시뮬레이터의 14개 terminal event로
-변환됩니다.
-
-```text
-10-way neural probability
-  → fold/cutoff에서 추정한 BB:HBP, CI rate, BIP:DP:FC split
-  → outs/base-state legality normalization
-  → 14-way terminal probability
-```
-
-반대 방향의 학습 label 계약도 `neural_training_target()`으로 고정합니다. HBP는
-`walk_or_hbp`, DP와 FC는 `ball_in_play_out`, catcher interference는 별도 희귀-event
-rate 학습 대상으로 처리합니다. 최신 known revision을 먼저 고른 뒤 `event_at < cutoff`
-행만 학습해 정정본 때문에 오래된 행이 부활하지 않습니다.
-
-Simulator는 미래 타석만 순차 표본화하며 한 simulation path 안의 선수 안타와 경기
-득점 상관을 보존합니다. 비홈런 끝내기는 결승에 필요한 득점까지만 인정하고 결승
-주자의 시작 베이스에 따라 공식 `applied_event`와 `credited_total_bases`를 1B·2B·3B로
-조정하며, 원 표본은 `sampled_event`에 보존합니다. terminal base state는 비웁니다.
-홈런은 모든 주자 득점을 인정합니다. 무주자 또는 2아웃의 희생 번트, 불가능한
-병살·희생플라이는 합법 event로 변환합니다.
-
-이 simulator는 승패·득점·안타·끝내기 타자의 인정 루타용이며 공식 기록원의 타점,
-득점 주자 identity, 자책점까지 판정하지 않습니다. 해당 통계가 필요하면 별도
-scorekeeping 계층을 추가해야 합니다.
-
-## 직접 Head와 V26 최적화
-
-- `DirectPlayerGameHead`: 미출장=PA 0, PA/hit overflow bucket, `hits <= PA` mask와
-  PA bucket별 `P(H | PA, x)`를 가진 joint distribution입니다. 기대 안타와
-  `negative_log_likelihood()`는 같은 분포에서 계산됩니다.
-- `DirectRunDistributionHead`: 실제 loss가 있는 홈/원정 negative-binomial marginal만
-  출력합니다. 학습되지 않던 scalar correlation 출력은 제거했습니다.
-- `MatchPredictionOptimizer`: 가능한 일일 선택 조합을 전부 열거하고 기대점수,
-  variance와 올킬 보상을 계산합니다. 사용되지 않던 `selection_rate` 필드는 제거했습니다.
-- `LiveHitOptimizer`: joint Monte Carlo scenario로 포지션, 선수 중복, 포지션별 선택률,
-  도감과 선택 구단 배율을 계산합니다. 임의의 연속 선택률 함수, 최소 인원 시너지,
-  활성화 점수와 공식 포인트에 섞인 올 히트 점수는 제거했습니다.
-
-Live Hit ruleset은 세 모드입니다.
-
-```text
-pure_hits   모든 배율을 제거하고 야구 안타 예측만 비교
-fixed_300   전 선수 3배, 선택 구단 선수 4배인 provisional 비교 모드
-account     명시적 포지션별 선택률 구간표 + 실제 도감 + 선택 구단
-```
-
-`fixed_300`의 기본 규칙명과 기본 안타 점수표 출처는 명시적으로 `provisional`입니다.
-실제 게임 점수 상세 화면과 replay 사례를 확보하기 전에는 공식 ruleset으로 표시하지
-않습니다. `account` 모드는 선택률 구간표와 안타 점수표 출처를 호출자가 반드시
-제공해야 합니다.
-
-추천 결과의 `expected_hit_points`에는 공식 히트 포인트만 들어갑니다. 올 히트는
-`all_hit_probability`와 `all_hit_reward_id`로 분리되며, 사용자가 보상 가치를 평가하고
-싶을 때만 `custom_utility`에 반영됩니다.
-
-`search_mode="exact"`와 `"beam"`을 제공하고 slot/candidate 수, expanded/pruned state,
-beam width, exact 여부와 known optimality gap을 진단에 남깁니다.
-
-Beam은 전역 최적을 보장하지 않습니다. 작은 후보군이나 최종 검증에는 exact를 사용하고,
-큰 후보군에서는 beam 결과의 `diagnostics.is_exact`를 반드시 확인합니다.
-
-## 작업별 학습 계약
-
-승부예측과 라이브 히트는 관계형 backbone을 공유할 수 있지만 같은 라벨이나 같은
-batch로 학습하지 않습니다.
-
-```text
-PA loader          → shared backbone → PA adapter        → 10-way PA CE
-PlayerGame loader  → shared backbone → Live Hit adapter  → joint PA/hit NLL
-Game loader        → shared backbone → Match adapter     → WDL CE + run NB NLL
-```
-
-`TaskSeparatedModel`은 하나의 등록된 backbone과 세 작업별 adapter/head를 연결합니다.
-`AlternatingMultiTaskTrainer`는 서로 다른 row granularity의 세 finite loader를 결정적인
-순서로 번갈아 소비하며, 하나의 batch로 억지로 합치지 않습니다. Checkpoint에는 모델,
-optimizer, RNG, epoch/step과 feature·route·label·model lineage가 들어가며 lineage가 다른
-실행으로는 복구되지 않습니다.
-
-Live Hit target은 `game_played`, `started`, `label_observed`를 별도로 갖습니다. 취소·노게임은
-관측된 `game_played=false`이며 정상 경기의 벤치·0 PA와 같은 0으로 학습하지 않습니다.
-승부예측 target도 `completed`, `result_observed` mask를 요구하고, 미완료 경기의 점수·WDL은
-`-1` sentinel로 강제해 가짜 0:0 무승부를 만들지 않습니다. 각 loss의 `sample_count`는
-원시 배치 크기가 아니라 실제 감독 신호에 사용된 행 수입니다.
-
-이 계층은 실제 학습 루프이지 데이터 공급자 구현은 아닙니다. Parquet→tensor/subgraph
-loader와 실제 KBO 학습 job은 별도로 연결해야 합니다.
-
-## 명령
+설정과 데이터베이스를 순서대로 확인합니다.
 
 ```bash
 cpv26 show-config
 cpv26 db-init
 cpv26 db-check
-cpv26 snapshot-build <prediction-run-id>
 ```
 
-`snapshot-build`는 기존 `prediction_run`을 읽어
-`CPV26_HOME/snapshots/<prediction-run-id>/`에 Parquet과 `manifest.json`을 만듭니다.
+정상이면 마지막 두 명령에 다음 내용이 표시됩니다.
 
-## 검증
+```text
+Database ready: .../var/cpv26.duckdb (schema=4, tables=36)
+Database schema and references are current: version 4, 36 tables
+```
+
+생성된 파일도 확인합니다.
 
 ```bash
-source .venv/bin/activate
+ls -lh var/cpv26.duckdb
+cpv26 --help
+```
+
+여기까지 오류 없이 끝나면 기본 설치가 완료된 것입니다.
+
+## 5. 서버에 다시 접속했을 때
+
+새 SSH 세션에서는 가상환경과 `.env`가 자동으로 로드되지 않습니다. 매번 다음 두
+명령을 실행합니다.
+
+```bash
+cd ~/projects/cpv26-predictor
+source scripts/activate.sh
+```
+
+프롬프트 앞에 `(.venv)`가 표시되고 `CPV26 environment activated`가 출력되면
+준비된 상태입니다.
+
+## 6. 전체 코드 검사
+
+코드를 수정하거나 서버에서 전체 동작을 검증하려면 개발 의존성을 설치합니다.
+
+```bash
+cd ~/projects/cpv26-predictor
+bash scripts/setup.sh dev
+source scripts/activate.sh
 bash scripts/check.sh
 ```
 
-개별 명령은 다음과 같습니다.
+검사는 다음 순서로 실행됩니다.
+
+1. Python compile
+2. Ruff 정적 검사
+3. strict mypy 타입 검사
+4. pytest
+5. 설치된 패키지 충돌 검사
+
+모두 통과하면 명령이 exit code 0으로 끝납니다. `dev` 환경에 PyTorch나 CatBoost가
+없으면 해당 선택 기능의 테스트는 skip될 수 있습니다. GitHub CI는 README 빠른 시작과
+모든 shell script의 문법도 Linux에서 함께 검사합니다.
+
+## 7. ML 의존성 설치
+
+데이터베이스와 설정만 확인할 때는 `base`면 충분합니다. CatBoost 또는 RelGNN 코드를
+실행할 때만 아래 프로필을 사용합니다.
+
+### CPU
 
 ```bash
-ruff check src tests scripts/build_code_summary.py
-mypy --no-incremental src/cpv26
-pytest
+cd ~/projects/cpv26-predictor
+bash scripts/setup.sh ml-cpu
+source scripts/activate.sh
+python -c "import catboost, torch; print(catboost.__version__, torch.__version__, torch.cuda.is_available())"
+bash scripts/check.sh
 ```
 
-Windows CPU 검증 환경에서는 Python 3.12, DuckDB 1.5.5, PyTorch 2.13.0+cpu,
-CatBoost 1.2.10으로 compileall, Ruff, strict mypy 42개 source, 117개 pytest, neural
-forward/backward, CatBoost fit/predict와 `cpv26_predictor-0.4.0-py3-none-any.whl` 빌드를
-통과했습니다. CUDA/A6000/A100 peak-memory 검증은
-Linux GPU host에서 별도로 수행해야 합니다.
+마지막 값이 `False`인 것이 CPU 환경에서는 정상입니다.
 
-평가는 random row split이 아니라 game/cutoff 단위 날짜순 walk-forward를 전제로 하며,
-정확도보다 log loss, Brier score, calibration과 실제 snapshot이 존재하는 기간의 V26
-replay 효용을 우선합니다.
+### NVIDIA GPU
 
-## 아직 구현하지 않은 범위
+먼저 GPU와 driver를 확인합니다.
 
-- 허가된 KBO 공급자별 CSV/API adapter와 안정적인 내부 ID mapping
-- 투수·불펜·포수·수비·구장·날씨·부상 전체 feature pipeline
-- Parquet→temporal subgraph mini-batch loader
-- AMP, gradient accumulation, distributed training과 model registry
-- 실제 시즌 dataset을 사용하는 학습·calibration·fold artifact job
-- CatBoost·MLP·GraphSAGE·RelGNN 동일 조건 walk-forward benchmark
-- empirical runner advancement fitting과 공식 기록원 수준 scorekeeping
-- V26 실제 시즌 ruleset replay 자료와 당일 추천 orchestrator
-- 운영 API, dashboard, scheduler와 게임 계정 연동
+```bash
+nvidia-smi
+cd ~/projects/cpv26-predictor
+bash scripts/setup.sh dev
+source scripts/activate.sh
+```
 
-따라서 지금 단계의 올바른 용도는 실제 데이터를 연결하기 전 correctness가 검증된 연구
-기반이며, 실전 추천기라고 부르기에는 아직 이릅니다.
+[PyTorch 공식 설치 선택기](https://pytorch.org/get-started/locally/)에서 다음 조건을
+선택하고 표시되는 명령을 **활성화된 `.venv` 안에서** 실행합니다.
+
+- OS: Linux
+- Package: Pip
+- Language: Python
+- Compute Platform: 서버 driver에 맞는 CUDA
+
+그다음 CatBoost를 설치하고 CUDA 인식을 검사합니다.
+
+```bash
+bash scripts/setup.sh ml-cuda
+source scripts/activate.sh
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+bash scripts/check.sh
+```
+
+`torch.cuda.is_available()`이 `True`여야 합니다.
+
+## 목표 파이프라인과 현재 연결 상태
+
+아래는 프로젝트가 완성됐을 때의 **목표 흐름**입니다. 현재 한 명령으로 이어지는
+end-to-end 파이프라인이 아니며, 각 상자의 구현 상태가 다릅니다.
+
+```text
+[미구현] 공급자 adapter + 선수·팀·경기 ID 통합
+    ↓
+[구현] DuckDB schema + 시점 보존 query + 물리 참조 무결성 검사
+    ↓
+[일부 구현] prediction run 기반 Parquet snapshot
+    ↓
+[미구현] feature build job + Parquet→tensor/subgraph loader
+    ↓
+[부품 구현] 개인 능력 feature + 관계 graph + 공유 RelGNN backbone
+    ├─ PA task: 타석 결과 분포
+    ├─ Match task: 승/무/패 + 홈·원정 득점 marginal
+    └─ Live Hit task: 선수별 출장·PA·안타 수 분포
+    ↓
+[미구현] 학습·calibration·추론·walk-forward orchestration
+```
+
+세 task는 관계형 backbone을 공유할 수 있지만 row 단위와 label이 다릅니다. 따라서
+PA·경기·선수경기 loader와 Head/loss를 분리하고, 학습 시에는 별도 batch를 번갈아
+처리하도록 구현했습니다.
+
+### 승부예측 목표 경로
+
+PA Head의 10개 결과 확률은 adapter를 거쳐 simulator의 14개 terminal event 확률이
+됩니다. Simulator는 정규 9이닝부터 설정된 최대 12회까지 타석을 순서대로 표본화해
+승패·득점·선수 안타를 만듭니다. Match Head의 승/무/패와 홈·원정 득점 marginal은
+별도 직접 예측이며 simulator 입력이 아닙니다. 둘을 비교하거나 보정해 최종 market을
+만드는 job은 아직 없습니다.
+
+`MatchPredictionOptimizer`는 호출자가 만든 경기별 option 확률과 보상 점수를
+입력받습니다. 모든 경기에서 정확히 하나씩 선택하고, 올킬 보상·최소 올킬 확률·위험
+회피를 포함한 expected utility로 전체 조합을 정렬합니다.
+
+### 라이브 히트 목표 경로
+
+`DirectPlayerGameHead`는 선수별 `P(PA 수, 안타 수 | 경기 진행)`를 예측합니다. 이
+Head 자체가 같은 경기 선수들의 결합 상관을 학습하는 것은 아닙니다. 같은 simulation
+path에서 만든 joint `HitScenario`를 사용한 경우에만 `LiveHitOptimizer`가 입력에 들어
+있는 선수 간 상관을 보존해 계산합니다. 두 경로를 결합하는 production job은 아직
+없습니다.
+
+Optimizer에는 포지션, 중복 금지, 선택률, 도감, 선택 구단 보너스를 계산하는 부품이
+있습니다. 다만 내장 `fixed_300`과 기본 안타 점수표는 provisional 비교 규칙이며 공식
+V26 ruleset이 아닙니다. 실제 account 모드는 당시의 포지션별 선택률 구간표·도감·점수표를
+호출자가 제공해야 합니다.
+
+## 실제 데이터를 연결하려면
+
+저장소에는 라이선스 문제가 없는 실제 KBO/V26 데이터가 포함되어 있지 않습니다.
+실전 학습 전에는 다음 구현이 추가되어야 합니다.
+
+1. 데이터 공급자별 adapter와 안정적인 내부 ID mapping을 구현합니다.
+2. 변동 행에 `event_at`, `available_at`, `ingested_at`, `valid_from`, `valid_to`를
+   기록합니다.
+3. Python `DuckDBStore.append()` API로 원천 table을 적재하고 `cpv26 db-check`를
+   실행합니다. ingest CLI는 아직 없습니다.
+4. Python append API로 prediction run과 후보를 만듭니다. run-create CLI는 아직
+   없습니다.
+5. 일반 야구 입력은 `cpv26 snapshot-build RUN_ID`로 고정합니다. 이 기본 CLI는
+   V26 ruleset·slate·선택률·도감 table을 포함하지 않습니다.
+6. Live Hit 계정 snapshot은 명시적 scope와 `live_hit_snapshot_specs()`를 사용하는
+   Python 코드가 필요합니다. 이를 위한 CLI 옵션은 아직 없습니다.
+7. Feature/graph build job과 Parquet→tensor/subgraph loader를 구현합니다.
+8. Train·evaluate·predict·optimize job과 CLI를 각각 연결합니다.
+
+현재 ingest, run-create, feature-build, graph-build, train, evaluate, predict,
+optimize 명령은 없습니다. 테스트 fixture를 실제 예측값으로 오해하지 마세요. 필요한
+column, 무결성 규칙과 학습 경계는 [docs/HANDOFF.md](docs/HANDOFF.md)를 참고합니다.
+
+## CLI 명령
+
+| 명령 | 용도 | 선행 조건 |
+|---|---|---|
+| `cpv26 show-config` | 적용된 경로·device·timezone 확인 | 환경 활성화 |
+| `cpv26 db-init` | DuckDB 생성 또는 schema migration | 환경 활성화 |
+| `cpv26 db-check` | schema와 단일·복합 물리 참조 무결성 검사 | `db-init` 완료 |
+| `cpv26 snapshot-build RUN_ID` | 기본 야구 table의 시점 보존 snapshot | 실제 prediction run 적재 |
+
+`snapshot-build` 결과는 `var/snapshots/RUN_ID/`에 생성됩니다. 같은 run ID의 내용을
+바꾸어 기존 snapshot을 덮어쓰지 않습니다.
+
+## 생성되는 로컬 파일과 폴더
+
+```text
+.venv/                 서버용 Python 가상환경
+.env                   서버별 설정
+var/cpv26.duckdb       실행 데이터베이스
+var/snapshots/         prediction snapshot
+```
+
+이 파일들은 Git에 올라가지 않습니다. Windows의 `.venv`를 Linux 서버에 복사하지
+말고 서버에서 다시 설치합니다.
+
+## 자주 발생하는 오류
+
+### `Python executable not found`
+
+```bash
+python3 --version
+PYTHON_BIN=python3.12 bash scripts/setup.sh base
+```
+
+실제로 설치된 3.10~3.12 명령으로 바꿉니다.
+
+### `The existing .venv is incomplete`
+
+중간에 venv 설치가 실패해 불완전한 폴더가 남은 경우입니다. 기존 폴더를 보존한 채
+이름을 바꾸고 다시 설치합니다.
+
+```bash
+mv .venv .venv.broken
+bash scripts/setup.sh base
+```
+
+### `cpv26: command not found` 또는 `ModuleNotFoundError`
+
+```bash
+cd ~/projects/cpv26-predictor
+source scripts/activate.sh
+```
+
+### `.env file not found`
+
+```bash
+cp .env.example .env
+source scripts/activate.sh
+```
+
+### `Database not found`
+
+```bash
+cpv26 db-init
+cpv26 db-check
+```
+
+### `CUDA-enabled PyTorch is missing`
+
+활성화된 `.venv` 안에 서버 driver와 맞는 CUDA PyTorch를 먼저 설치한 뒤
+`bash scripts/setup.sh ml-cuda`를 다시 실행합니다.
+
+## 코드 업데이트
+
+Git으로 받은 저장소라면 다음처럼 최신 코드를 적용합니다.
+
+```bash
+cd ~/projects/cpv26-predictor
+git pull --ff-only
+bash scripts/setup.sh base
+source scripts/activate.sh
+cpv26 db-init
+cpv26 db-check
+```
+
+개발 또는 ML 프로필을 사용했다면 `base` 대신 기존 프로필을 다시 실행합니다.
+
+## 문서와 라이선스
+
+- 상세 설계·데이터 계약·구현 상태: [docs/HANDOFF.md](docs/HANDOFF.md)
+- 독점 라이선스와 비제휴 고지: [LICENSE.md](LICENSE.md)
+
+외부 코드 검토용 전체 소스 문서가 필요할 때만 다음 명령으로 로컬
+`code_summary.md`를 생성합니다.
+
+```bash
+python scripts/build_code_summary.py
+```
+
+`code_summary.md`는 Git에서 제외됩니다. 이 프로젝트는 KBO 또는 게임
+개발·배급·운영사와 제휴하거나 이들의 보증을 받은 프로젝트가 아닙니다.
