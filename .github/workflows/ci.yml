@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements/constraints.txt
+
+      - name: Install development dependencies
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip install -c requirements/constraints.txt -e '.[dev]'
+
+      - name: Compile
+        run: python -m compileall -q src tests scripts/build_code_summary.py
+
+      - name: Lint
+        run: python -m ruff check src tests scripts/build_code_summary.py
+
+      - name: Type check
+        run: python -m mypy --no-incremental src/cpv26
+
+      - name: Test core contracts
+        run: python -m pytest
+
+      - name: Check dependency consistency
+        run: python -m pip check
+
+      - name: Build wheel
+        run: python -m pip wheel . --no-deps -w dist

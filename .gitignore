@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments and local configuration
+.venv/
+.env
+.env.*
+!.env.example
+.tox/
+.nox/
+
+# Runtime state and generated artifacts
+var/
+logs/
+artifacts/
+checkpoints/
+/data/
+/datasets/
+*.log
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.arrow
+*.feather
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.joblib
+
+# Build and review artifacts
+build/
+dist/
+*.whl
+code_summary.md
+
+# Editors and operating systems
+.idea/
+.vscode/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# Test and coverage by-products
+.hypothesis/
+coverage.xml
+.coverage.*
