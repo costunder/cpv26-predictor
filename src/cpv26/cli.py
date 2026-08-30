@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
@@ -389,6 +389,181 @@ def kbo_live_hit_evaluate(
     )
     console.print(f"[green]Evaluation report ready[/green]: {output}")
     console.print(f"Models and archived report: {model_directory}")
+
+
+@app.command("gpu-check")
+def gpu_check(
+    device: Annotated[
+        str, typer.Option(help="Explicit CUDA device; no automatic CPU fallback.")
+    ] = "cuda:0",
+    amp: Annotated[str, typer.Option(help="auto, off, fp16, or bf16.")] = "auto",
+) -> None:
+    """Verify the actual GPU runtime with forward/backward kernels."""
+    try:
+        from cpv26.training.kbo_runner import check_gpu
+
+        result = check_gpu(device, amp=amp)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        error_console.print(f"[red]Device verification failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
+@app.command("kbo-graph-build")
+def kbo_graph_build(
+    output: Annotated[
+        Path | None, typer.Option(help="Default: CPV26_HOME/datasets/kbo_graph.")
+    ] = None,
+    rolling_days: Annotated[int, typer.Option(min=1, help="Past-only graph history window.")] = 90,
+    start_date: Annotated[
+        str, typer.Option(help="First prediction date (YYYY-MM-DD).")
+    ] = "2023-01-01",
+    end_date: Annotated[
+        str, typer.Option(help="Last prediction date (YYYY-MM-DD).")
+    ] = "2025-12-31",
+) -> None:
+    """Materialize actual KBO history into leakage-resistant day graphs."""
+    settings = _settings()
+    _require_database(settings.database_path)
+    directory = (output or settings.home / "datasets" / "kbo_graph").expanduser().resolve()
+    try:
+        from cpv26.data.kbo_graph_dataset import build_kbo_graph_dataset
+
+        dataset = build_kbo_graph_dataset(
+            settings.database_path,
+            directory,
+            rolling_days=rolling_days,
+            start_day=date.fromisoformat(start_date),
+            end_day=date.fromisoformat(end_date),
+        )
+    except (DuckDBError, ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        error_console.print(f"[red]KBO graph preparation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Graph dataset ready[/green]: {directory}")
+    console.print(f"Days: {len(dataset.days())}; fingerprint: {dataset.manifest['fingerprint']}")
+
+
+@app.command("relgnn-train")
+def relgnn_train(
+    dataset: Annotated[
+        Path | None, typer.Option(help="Default: CPV26_HOME/datasets/kbo_graph.")
+    ] = None,
+    run_dir: Annotated[
+        Path | None, typer.Option(help="New run directory; keep models out of Git.")
+    ] = None,
+    resume: Annotated[Path | None, typer.Option(help="Resume from this run's last.pt.")] = None,
+    device: Annotated[
+        str, typer.Option(help="CUDA device; CPU is only an explicit validation mode.")
+    ] = "cuda:0",
+    epochs: Annotated[
+        int, typer.Option(min=1, help="Total target epochs, including resumed epochs.")
+    ] = 30,
+    batch_days: Annotated[int, typer.Option(min=1, help="Disjoint day graphs per minibatch.")] = 2,
+    hidden_dim: Annotated[int, typer.Option(min=4)] = 64,
+    layers: Annotated[int, typer.Option(min=1)] = 2,
+    heads: Annotated[int, typer.Option(min=1)] = 4,
+    dropout: Annotated[float, typer.Option(min=0.0, max=0.99)] = 0.1,
+    learning_rate: Annotated[float, typer.Option(min=1e-10)] = 0.0003,
+    weight_decay: Annotated[float, typer.Option(min=0.0)] = 0.0001,
+    amp: Annotated[str, typer.Option(help="auto selects GPU bf16/fp16; off uses fp32.")] = "auto",
+    workers: Annotated[int, typer.Option(min=0, help="CPU graph-loading worker processes.")] = 2,
+    accumulate_steps: Annotated[int, typer.Option(min=1)] = 1,
+    max_pa_per_day: Annotated[
+        int, typer.Option(min=1, help="Training auxiliary PA queries only.")
+    ] = 128,
+    patience: Annotated[
+        int, typer.Option(min=0, help="Validation early stopping; 0 disables it.")
+    ] = 6,
+    max_days_per_split: Annotated[
+        int | None, typer.Option(min=1, help="Explicit smoke test limit; not a full-season result.")
+    ] = None,
+) -> None:
+    """Train real role-aware RelGNN on 2023 and select checkpoints with 2024 validation."""
+    settings = _settings()
+    directory = (dataset or settings.home / "datasets" / "kbo_graph").expanduser().resolve()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    output = (
+        (
+            run_dir
+            or (
+                resume.expanduser().resolve().parent
+                if resume
+                else settings.home / "runs" / "relgnn" / f"{stamp}-{uuid4().hex[:8]}"
+            )
+        )
+        .expanduser()
+        .resolve()
+    )
+    try:
+        from cpv26.training.kbo_runner import KBOTrainingConfig, train_kbo_relgnn
+
+        config = KBOTrainingConfig(
+            device=device,
+            epochs=epochs,
+            batch_days=batch_days,
+            hidden_dim=hidden_dim,
+            layers=layers,
+            heads=heads,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            amp=amp,
+            workers=workers,
+            accumulate_steps=accumulate_steps,
+            max_pa_per_day=max_pa_per_day,
+            patience=patience,
+            seed=settings.random_seed,
+            max_days_per_split=max_days_per_split,
+        )
+        report = train_kbo_relgnn(
+            directory, output, config=config, resume=resume, progress=console.print
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]RelGNN training failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]RelGNN training finished[/green]: {output}")
+    console.print(f"Epochs: {report['completed_epochs']}; best: {report['best_epoch']}")
+    if report["smoke_test_only"]:
+        console.print("[yellow]Limited-date verification only, not a full-season result.[/yellow]")
+    console.print("2025 test was not used; evaluate best.pt explicitly with relgnn-evaluate.")
+
+
+@app.command("relgnn-evaluate")
+def relgnn_evaluate(
+    checkpoint: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+    dataset: Annotated[
+        Path | None, typer.Option(help="Defaults to the checkpoint's dataset.")
+    ] = None,
+    split: Annotated[
+        str, typer.Option(help="test (2025), validation (2024), or train (2023).")
+    ] = "test",
+    device: Annotated[str, typer.Option()] = "cuda:0",
+    amp: Annotated[str, typer.Option()] = "auto",
+    batch_days: Annotated[int, typer.Option(min=1)] = 2,
+    workers: Annotated[int, typer.Option(min=0)] = 2,
+    output: Annotated[Path | None, typer.Option(help="New evaluation output directory.")] = None,
+) -> None:
+    """Reload a checkpoint and evaluate held-out data with per-query Parquet predictions."""
+    try:
+        from cpv26.training.kbo_runner import evaluate_kbo_relgnn
+
+        report = evaluate_kbo_relgnn(
+            checkpoint,
+            dataset_directory=dataset,
+            split=split,
+            device=device,
+            amp=amp,
+            batch_days=batch_days,
+            workers=workers,
+            output_directory=output,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]RelGNN evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=report["metrics"])
+    console.print(f"[green]Evaluation ready[/green]: {report['output_directory']}")
+    if report["smoke_test_only"]:
+        console.print("[yellow]Checkpoint came from a limited-date smoke test.[/yellow]")
 
 
 if __name__ == "__main__":

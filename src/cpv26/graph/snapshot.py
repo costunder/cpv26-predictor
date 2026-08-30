@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Hashable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any
@@ -61,6 +61,18 @@ class TorchAtomicRouteBatch:
 
         return self.event_age_seconds
 
+    def pin_memory(self) -> TorchAtomicRouteBatch:
+        """Let PyTorch's DataLoader pin nested route tensors for asynchronous CUDA copies."""
+        return replace(
+            self,
+            source_index=self.source_index.pin_memory(),
+            destination_index=self.destination_index.pin_memory(),
+            event_features=self.event_features.pin_memory(),
+            event_age_seconds=self.event_age_seconds.pin_memory(),
+            publication_delay_seconds=self.publication_delay_seconds.pin_memory(),
+            weights=self.weights.pin_memory(),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class AtomicRouteBatch:
@@ -82,14 +94,9 @@ class AtomicRouteBatch:
         event_at = tuple(_as_utc(value, "event_at") for value in self.event_at)
         available_at = tuple(_as_utc(value, "available_at") for value in self.available_at)
         count = len(source_index)
-        if (
-            len(destination_index) != count
-            or len(event_at) != count
-            or len(available_at) != count
-        ):
+        if len(destination_index) != count or len(event_at) != count or len(available_at) != count:
             raise ValueError(
-                "source_index, destination_index, event_at, and available_at "
-                "must have equal length"
+                "source_index, destination_index, event_at, and available_at must have equal length"
             )
         if any(index < 0 for index in source_index + destination_index):
             raise ValueError("route indices must be non-negative")
@@ -184,8 +191,7 @@ class AtomicRouteBatch:
         if not include_publication_delay:
             return tuple((age,) for age in ages)
         return tuple(
-            (age, delay)
-            for age, delay in zip(ages, self.publication_delays_seconds, strict=True)
+            (age, delay) for age, delay in zip(ages, self.publication_delays_seconds, strict=True)
         )
 
     def validate(
@@ -307,8 +313,7 @@ class GraphSnapshot:
         frozen_ids: dict[str, tuple[Hashable, ...]] = {}
         frozen_features: dict[str, tuple[tuple[float, ...], ...]] = {}
         explicit_dims = {
-            node_type: int(width)
-            for node_type, width in self.node_feature_dims.items()
+            node_type: int(width) for node_type, width in self.node_feature_dims.items()
         }
         if any(width < 0 for width in explicit_dims.values()):
             raise ValueError("node feature dimensions must be non-negative")

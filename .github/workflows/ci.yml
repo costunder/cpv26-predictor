@@ -15,7 +15,7 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Check out source
@@ -35,20 +35,30 @@ jobs:
       - name: Validate shell syntax
         run: bash -n scripts/*.sh
 
-      - name: Follow the README quick start
+      - name: Verify the base installation and CLI entry points
         run: |
-          bash scripts/setup.sh tabular
+          bash scripts/setup.sh base
           cp .env.example .env
           source scripts/activate.sh
           cpv26 show-config
           cpv26 db-init
           cpv26 db-check
+          cpv26 gpu-check --help
           cpv26 kbo-fetch --help
           cpv26 kbo-import --help
+          cpv26 kbo-graph-build --help
+          cpv26 relgnn-train --help
+          cpv26 relgnn-evaluate --help
           cpv26 kbo-match-evaluate --help
           cpv26 kbo-live-hit-evaluate --help
 
-      - name: Run the complete validation suite
+      - name: Install CPU PyTorch for neural tests
+        run: |
+          bash scripts/setup.sh ml-cpu
+          source scripts/activate.sh
+          python -c "import torch; print(torch.__version__); assert torch.version.cuda is None"
+
+      - name: Run the validation suite including neural tests
         run: |
           source scripts/activate.sh
           bash scripts/check.sh

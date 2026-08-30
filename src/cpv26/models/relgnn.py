@@ -127,9 +127,7 @@ class _CompositeRouteAttention(ModuleBase):
         features = [signed_log_age, age_decay]
         if self.include_publication_delay:
             delay_hours = batch.publication_delay_seconds / 3600.0
-            signed_log_delay = torch.sign(delay_hours) * torch.log1p(
-                torch.abs(delay_hours)
-            )
+            signed_log_delay = torch.sign(delay_hours) * torch.log1p(torch.abs(delay_hours))
             features.append(signed_log_delay)
         return self.temporal_encoder(torch.stack(features, dim=-1))
 
@@ -163,9 +161,7 @@ class _CompositeRouteAttention(ModuleBase):
             output_projection = self.forward_output
 
         if batch.num_edges == 0:
-            empty_messages = destination_state.new_zeros(
-                (destination_count, self.hidden_dim)
-            )
+            empty_messages = destination_state.new_zeros((destination_count, self.hidden_dim))
             empty_mask = torch.zeros(
                 destination_count,
                 dtype=torch.bool,
@@ -194,7 +190,15 @@ class _CompositeRouteAttention(ModuleBase):
             self.num_heads,
             self.head_dim,
         )
-        scores = (query * key).sum(dim=-1) / math.sqrt(self.head_dim)
+        # Autocast projections may be fp16/bf16 while edge weights remain
+        # fp32. Keep softmax and scatter accumulators in fp32 to avoid both
+        # overflow and index_add dtype mismatches under CUDA/CPU autocast.
+        attention_dtype = (
+            torch.float32 if query.dtype in (torch.float16, torch.bfloat16) else query.dtype
+        )
+        scores = (query.to(attention_dtype) * key.to(attention_dtype)).sum(dim=-1) / math.sqrt(
+            self.head_dim
+        )
 
         positive_weight = batch.weights > 0
         weighted_scores = scores.masked_fill(~positive_weight.unsqueeze(-1), -torch.inf)
@@ -215,23 +219,21 @@ class _CompositeRouteAttention(ModuleBase):
             scores - gathered_max,
             torch.zeros_like(scores),
         )
-        numerator = torch.exp(centered_scores) * batch.weights.unsqueeze(-1)
+        numerator = torch.exp(centered_scores) * batch.weights.to(attention_dtype).unsqueeze(-1)
         denominator = scores.new_zeros((destination_count, self.num_heads))
         denominator.index_add_(0, destination_index, numerator)
         attention = numerator / denominator[destination_index].clamp_min(
             torch.finfo(scores.dtype).tiny
         )
 
-        aggregated_heads = value.new_zeros(
-            (destination_count, self.num_heads, self.head_dim)
-        )
+        aggregated_heads = scores.new_zeros((destination_count, self.num_heads, self.head_dim))
         aggregated_heads.index_add_(
             0,
             destination_index,
-            attention.unsqueeze(-1) * value,
+            attention.unsqueeze(-1) * value.to(attention_dtype),
         )
         aggregate = output_projection(
-            aggregated_heads.reshape(destination_count, self.hidden_dim)
+            aggregated_heads.reshape(destination_count, self.hidden_dim).to(value.dtype)
         )
         route_mask = denominator.sum(dim=-1) > 0
         return aggregate, route_mask
@@ -275,15 +277,11 @@ class _CompositeRouteLayer(ModuleBase):
                 self.route_gates[_gate_key(route_name, True)] = self._new_route_gate()
 
         channel_names = set(node_types)
-        channel_names.update(
-            f"{_PLAYER_CHANNEL_PREFIX}{role}" for role in PLAYER_ROLE_NAMES
-        )
+        channel_names.update(f"{_PLAYER_CHANNEL_PREFIX}{role}" for role in PLAYER_ROLE_NAMES)
         self.updaters = nn.ModuleDict(
             {channel: nn.GRUCell(hidden_dim, hidden_dim) for channel in channel_names}
         )
-        self.norms = nn.ModuleDict(
-            {channel: nn.LayerNorm(hidden_dim) for channel in channel_names}
-        )
+        self.norms = nn.ModuleDict({channel: nn.LayerNorm(hidden_dim) for channel in channel_names})
 
     def _new_route_gate(self) -> Any:
         return nn.Sequential(
@@ -308,9 +306,7 @@ class _CompositeRouteLayer(ModuleBase):
         if node_type == "player" and not strict_player_roles:
             return "player"
         endpoint = "source" if source else "destination"
-        raise ValueError(
-            f"route {route.name!r} requires {endpoint} player role state {role!r}"
-        )
+        raise ValueError(f"route {route.name!r} requires {endpoint} player role state {role!r}")
 
     @staticmethod
     def _validate_tensor_batch(
@@ -340,8 +336,7 @@ class _CompositeRouteLayer(ModuleBase):
             batch.weights,
         )
         malformed_temporal = any(
-            column.ndim != 1 or int(column.numel()) != edge_count
-            for column in temporal_columns
+            column.ndim != 1 or int(column.numel()) != edge_count for column in temporal_columns
         )
         if malformed_temporal:
             raise ValueError("route time and weight tensors must have one value per edge")
@@ -367,24 +362,20 @@ class _CompositeRouteLayer(ModuleBase):
         if batch.num_edges:
             if int(batch.source_index.max().item()) >= int(source_state.shape[0]):
                 raise IndexError(f"source index exceeds {route.source_type!r} node count")
-            if int(batch.destination_index.max().item()) >= int(
-                destination_state.shape[0]
-            ):
-                raise IndexError(
-                    f"destination index exceeds {route.destination_type!r} node count"
-                )
+            if int(batch.destination_index.max().item()) >= int(destination_state.shape[0]):
+                raise IndexError(f"destination index exceeds {route.destination_type!r} node count")
 
     def forward(
         self,
         state: RelGNNState,
         route_batches: tuple[TorchAtomicRouteBatch, ...],
+        *,
+        validate_routes: bool = True,
     ) -> RelGNNState:
         torch, _ = require_torch()
         channels = state.channels()
         strict_player_roles = bool(state.player_role_states)
-        incoming: dict[str, list[tuple[Any, Any, str]]] = {
-            channel: [] for channel in channels
-        }
+        incoming: dict[str, list[tuple[Any, Any, str]]] = {channel: [] for channel in channels}
 
         for batch in route_batches:
             route = self.registry.require(batch.route_name)
@@ -404,7 +395,8 @@ class _CompositeRouteLayer(ModuleBase):
             )
             source_state = channels[source_channel]
             destination_state = channels[destination_channel]
-            self._validate_tensor_batch(route, batch, source_state, destination_state)
+            if validate_routes:
+                self._validate_tensor_batch(route, batch, source_state, destination_state)
 
             message, mask = self.messages[batch.route_name].aggregate(
                 source_state,
@@ -460,9 +452,7 @@ class _CompositeRouteLayer(ModuleBase):
                 previous,
             )
 
-        node_states = {
-            node_type: updated_channels[node_type] for node_type in state.node_states
-        }
+        node_states = {node_type: updated_channels[node_type] for node_type in state.node_states}
         player_role_states = {
             role: updated_channels[f"{_PLAYER_CHANNEL_PREFIX}{role}"]
             for role in state.player_role_states
@@ -512,12 +502,10 @@ class CompositeRelGNNBackbone(ModuleBase):
             raise ValueError("dropout must be in [0, 1)")
 
         normalized_node_dims = {
-            node_type: int(feature_dim)
-            for node_type, feature_dim in configured_node_dims.items()
+            node_type: int(feature_dim) for node_type, feature_dim in configured_node_dims.items()
         }
         normalized_route_dims = {
-            route_name: int(feature_dim)
-            for route_name, feature_dim in route_feature_dims.items()
+            route_name: int(feature_dim) for route_name, feature_dim in route_feature_dims.items()
         }
         if any(feature_dim <= 0 for feature_dim in normalized_node_dims.values()):
             raise ValueError("node feature dimensions must be positive")
@@ -529,8 +517,7 @@ class CompositeRelGNNBackbone(ModuleBase):
             route = self.registry.require(route_name)
             if route.source_type not in normalized_node_dims:
                 raise ValueError(
-                    f"route {route_name!r} source type {route.source_type!r} "
-                    "has no node encoder"
+                    f"route {route_name!r} source type {route.source_type!r} has no node encoder"
                 )
             if route.destination_type not in normalized_node_dims:
                 raise ValueError(
@@ -667,15 +654,11 @@ class CompositeRelGNNBackbone(ModuleBase):
             encoded_nodes["player"] = shared_player
         else:
             if player_role_features is not None:
-                raise ValueError(
-                    "player_role_features require a configured RoleAwarePlayerEncoder"
-                )
+                raise ValueError("player_role_features require a configured RoleAwarePlayerEncoder")
             for raw_role, role_state in (player_role_states or {}).items():
                 role = normalize_player_role(raw_role)
                 if role in encoded_roles:
-                    raise ValueError(
-                        f"duplicate player state after role normalization: {role}"
-                    )
+                    raise ValueError(f"duplicate player state after role normalization: {role}")
                 if role_state.ndim != 2 or int(role_state.shape[-1]) != self.hidden_dim:
                     raise ValueError(
                         f"player role state {role!r} must have shape [N, {self.hidden_dim}]"
@@ -703,8 +686,14 @@ class CompositeRelGNNBackbone(ModuleBase):
         cutoff_at: datetime | None = None,
         player_role_features: Mapping[str | PlayerRole, Any | None] | None = None,
         player_role_states: Mapping[str | PlayerRole, Any] | None = None,
+        validate_routes: bool = True,
     ) -> RelGNNState:
-        """Return entity and player-role states after relational propagation."""
+        """Return entity and player-role states after relational propagation.
+
+        Set ``validate_routes=False`` only for batches already validated on
+        CPU before their immutable device transfer (for example KBO collate).
+        This avoids synchronizing the GPU for every route in every layer.
+        """
 
         first_features = next(iter(node_features.values()), None)
         if first_features is None:
@@ -721,7 +710,7 @@ class CompositeRelGNNBackbone(ModuleBase):
             dtype=first_features.dtype,
         )
         for layer in self.layers:
-            state = layer(state, tensor_batches)
+            state = layer(state, tensor_batches, validate_routes=validate_routes)
         return state
 
     def forward(

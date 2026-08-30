@@ -43,6 +43,10 @@ def test_kbo_commands_are_available_without_loading_catboost() -> None:
         "kbo-import",
         "kbo-match-evaluate",
         "kbo-live-hit-evaluate",
+        "gpu-check",
+        "kbo-graph-build",
+        "relgnn-train",
+        "relgnn-evaluate",
     ):
         result = runner.invoke(app, [command, "--help"])
         assert result.exit_code == 0, result.output
@@ -123,9 +127,7 @@ def test_evaluation_reruns_preserve_models_and_archived_reports(
     assert first.exit_code == 0, first.output
     first_report = json.loads((runtime / "reports" / f"{task}.json").read_text())
     second_report_path = runtime / "reports" / "comparison.json"
-    second = runner.invoke(
-        app, [command, "--iterations", "3", "--report", str(second_report_path)]
-    )
+    second = runner.invoke(app, [command, "--iterations", "3", "--report", str(second_report_path)])
     assert second.exit_code == 0, second.output
     second_report = json.loads(second_report_path.read_text())
     assert first_report["model_directory"] != second_report["model_directory"]

@@ -24,18 +24,25 @@
 - PA·선수경기·경기 단위 별도 loss와 alternating multi-task trainer
 - 시간순 OOF stacking과 calibration primitive
 - revision·SHA-256을 고정한 공개 KBO Parquet 다운로드와 canonical DB importer
+- 날짜별 과거 90일 관계 그래프를 만드는 safe NPZ cache와 hash manifest
+- 공유 role-aware RelGNN의 Match WDL/득점, 조건부 Live Hit, PA10 학습·평가 CLI
+- CUDA 검사, AMP, 날짜별 mini-batch, atomic checkpoint와 중단 후 재개
 - 실제 2023~2025 시즌의 경기 승/무/패 CatBoost 학습·평가·모델 저장
 - 별도 선수-경기 1안타 이상 CatBoost 학습·평가·모델 저장
 
 다만 이것은 아직 당일 데이터를 받아 자동으로 추천을 내는 운영 서비스가 아니다.
-공개 데이터 adapter와 실제 시즌 baseline 실행은 연결했다. 남아 있는 것은 RelGNN용
-Parquet graph loader와 실제 학습 job, 당일 후보·출전 확률 입력, 실제 V26 ruleset replay와
-scheduler다. 정확한 표현은 다음과 같다.
+공개 데이터 adapter→날짜별 graph cache→RelGNN 학습·평가 job을 연결했고 실제 데이터의
+축소 CPU 학습을 확인했다. 주 실행 경로는 Linux 단일 GPU RelGNN이다. 현재 host에는
+NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료를 확인하지 못했다.
+당일 후보·출전 확률 입력, 실제 V26 ruleset replay와 scheduler도 남아 있다.
+정확한 표현은 다음과 같다.
 
-> 실제 KBO 데이터로 두 작업을 따로 학습·평가할 수 있는 baseline과, 시점·관계·야구
-> 규칙을 검증하는 연구 프레임워크다. 학습 완료된 RelGNN이나 완성된 당일 추천기는 아니다.
+> 실제 KBO 데이터로 공유 RelGNN과 작업별 head를 학습·평가·재개할 수 있는 연구
+> 프레임워크다. GPU 전체 학습이나 성능 우위를 입증한 모델, 완성된 당일 추천기는 아니다.
 
-실행 결과는 [KBO_BASELINE.md](KBO_BASELINE.md)에 기록했다. 2025 test에서 경기 모델은
+설치부터 GPU 학습·재개·평가까지는 [README](../README.md)와
+[GPU_TRAINING.md](GPU_TRAINING.md)를 따른다. 선택적 CatBoost baseline의 과거 실행
+결과는 [KBO_BASELINE.md](KBO_BASELINE.md)에 기록했다. 2025 test에서 경기 모델은
 정확도 46.53%로 학습 빈도 기준선 49.72%보다 낮다. 선수 안타 모델은 출전 선수 조건부
 정확도 59.80%이며 기준선 53.80%보다 높지만, 2024 validation에서는 기준선보다 낮았다.
 성능 개선이나 실전 일반화를 입증했다고 해석하지 않는다.
@@ -43,8 +50,10 @@ scheduler다. 정확한 표현은 다음과 같다.
 ## 2. 전달 파일
 
 - `README.md`
-  - 초보자가 MobaXterm에서 clone, 설치, 데이터 다운로드·적재, 두 모델 학습·평가를
-    순서대로 실행할 수 있는 안내서다. 상세 설계는 이 문서로 분리했다.
+  - 초보자가 MobaXterm에서 clone, CUDA 설치·검사, 데이터 적재·graph 생성,
+    RelGNN 학습·재개·평가를 순서대로 실행하는 안내서다. CatBoost는 선택적 baseline이다.
+- `docs/GPU_TRAINING.md`
+  - Linux 단일 GPU 학습, 메모리 조절, checkpoint 재개와 검증 범위의 상세 안내다.
 - `docs/KBO_BASELINE.md`
   - 원본 출처·revision·hash, adapter 정책, 데이터 결함, 실제 시즌 평가 결과다.
 - `docs/HANDOFF.md`
@@ -52,7 +61,7 @@ scheduler다. 정확한 표현은 다음과 같다.
 - `code_summary.md`
   - Git에 포함하지 않는 외부 검토용 생성물이다. `code_summary.md`와 별도 문서인
     `docs/HANDOFF.md`, 실행 데이터·모델·캐시를 제외한 소스·설정·테스트·README와
-    `docs/KBO_BASELINE.md`를 다음 형식으로 이어 붙인다.
+    실행 안내 문서를 다음 형식으로 이어 붙인다.
 - `scripts/build_code_summary.py`
   - README와 handoff 수정 후 `code_summary.md`를 같은 형식으로 재생성한다.
 
@@ -64,11 +73,12 @@ scheduler다. 정확한 표현은 다음과 같다.
 ````
 ```
 
-- 최종 `code_summary.md` SHA-256: `95bc40093d775de393ad6886a67fd5c90ea9e0a0b4a714fc90002e102d56ed18`
-- 포함 section 수: `79`
-- 고유 경로 수: `79`
+- 최신 `code_summary.md` SHA-256: `25f446a2d313e2e6159fdfa387980f8c3fd5fbd994c371a589d68459a94341ee`
+- 포함 section 수: `86`
+- 고유 경로 수: `86`
 
-이 hash로 외부 전달 과정에서 코드 요약이 변형되지 않았는지 확인할 수 있다.
+이 hash는 GPU RelGNN 구현과 `docs/GPU_TRAINING.md`를 포함해 다시 생성한 전달본의 값이다.
+`docs/HANDOFF.md` 자체는 자기참조를 피하기 위해 summary에서 제외한다.
 
 ## 3. 저장소 구조
 
@@ -82,6 +92,7 @@ scheduler다. 정확한 표현은 다음과 같다.
 ├── pyproject.toml
 ├── README.md
 ├── docs/
+│   ├── GPU_TRAINING.md
 │   ├── HANDOFF.md
 │   └── KBO_BASELINE.md
 ├── requirements/
@@ -96,6 +107,7 @@ scheduler다. 정확한 표현은 다음과 같다.
 │   │   ├── dataset_contracts.py
 │   │   ├── kbo_playbyplay.py
 │   │   ├── kbo_ingest.py
+│   │   ├── kbo_graph_dataset.py
 │   │   ├── schema.py
 │   │   ├── schema_v4.py
 │   │   ├── store.py
@@ -111,6 +123,7 @@ scheduler다. 정확한 표현은 다음과 같다.
 │   ├── models/
 │   │   ├── _torch.py
 │   │   ├── baseline.py
+│   │   ├── kbo_relgnn.py
 │   │   ├── player_encoder.py
 │   │   ├── relgnn.py
 │   │   ├── interaction.py
@@ -132,6 +145,7 @@ scheduler다. 정확한 표현은 다음과 같다.
 │   │   └── kbo_live_hit_baseline.py
 │   ├── training/
 │   │   ├── contracts.py
+│   │   ├── kbo_runner.py
 │   │   ├── losses.py
 │   │   ├── model.py
 │   │   └── trainer.py
@@ -148,10 +162,13 @@ scheduler다. 정확한 표현은 다음과 같다.
     ├── test_domain.py
     ├── test_evaluation.py
     ├── test_graph_models.py
+    ├── test_kbo_graph_dataset.py
     ├── test_kbo_ingest.py
     ├── test_kbo_live_hit_baseline.py
     ├── test_kbo_match_baseline.py
     ├── test_kbo_playbyplay_source.py
+    ├── test_kbo_relgnn.py
+    ├── test_kbo_runner.py
     ├── test_live_hit_point_in_time.py
     ├── test_live_hit_rules.py
     ├── test_model_output_contracts.py
@@ -166,26 +183,38 @@ scheduler다. 정확한 표현은 다음과 같다.
 
 ## 4. Linux 설치와 profile
 
-Windows `.venv`는 복사하지 않는다. MobaXterm SFTP로 소스만 올린 뒤 Linux에서 새로
-만든다.
+Windows `.venv`는 복사하지 않는다. Linux에서 clone하거나 MobaXterm SFTP로 소스만
+올린 뒤 새로 만든다. 전체 초보자 안내는 [README](../README.md), GPU 운용은
+[GPU_TRAINING.md](GPU_TRAINING.md)를 따른다. 아래 명령은 Bash에서 실행한다.
 
 ```bash
 cd ~/projects/cpv26-predictor
-bash scripts/setup.sh tabular
+nvidia-smi
+# 공식 PyTorch 설치 화면에서 이 서버에 맞게 선택한 --index-url 값을 붙여 넣는다.
+read -r -p '공식 PyTorch CUDA index URL: ' TORCH_INDEX_URL
+TORCH_INDEX_URL="$TORCH_INDEX_URL" bash scripts/setup.sh ml-cuda
 test -f .env || cp .env.example .env
+chmod 600 .env
 source scripts/activate.sh
+cpv26 gpu-check --device cuda:0
+cpv26 db-init
+cpv26 db-check
 cpv26 kbo-fetch
 cpv26 kbo-import
 cpv26 db-check
-cpv26 kbo-match-evaluate
-cpv26 kbo-live-hit-evaluate
+cpv26 kbo-graph-build
+cpv26 relgnn-train --device cuda:0 --epochs 30 --batch-days 2 --amp auto \
+  --run-dir var/runs/relgnn/kbo_2023_2024_v1
+cpv26 relgnn-evaluate --checkpoint var/runs/relgnn/kbo_2023_2024_v1/best.pt \
+  --split test --device cuda:0
 ```
 
 `setup.sh`는 기본적으로 `python3`를 사용하고 Python 3.10~3.12인지 검사한다. 서버의
-Python 명령이 다르면 다음처럼 지정한다.
+Python 명령이 다르면 `PYTHON_BIN`을 지정한다. CUDA wheel 선택은
+[공식 PyTorch 설치 화면](https://pytorch.org/get-started/locally/)에서 확인한다.
 
 ```bash
-PYTHON_BIN=python3.11 bash scripts/setup.sh tabular
+PYTHON_BIN=python3.12 TORCH_INDEX_URL="$TORCH_INDEX_URL" bash scripts/setup.sh ml-cuda
 ```
 
 Profile은 다섯 개다.
@@ -195,24 +224,21 @@ Profile은 다섯 개다.
 | `base` | runtime만 | DB, feature, snapshot, CLI |
 | `dev` | runtime + Ruff/mypy/pytest/coverage | 개발·검증 |
 | `tabular` | runtime + dev + CatBoost | 실제 KBO baseline; PyTorch 불필요 |
-| `ml-cpu` | runtime + dev + CatBoost + 공식 CPU PyTorch wheel | CPU smoke/train |
-| `ml-cuda` | runtime + dev + CatBoost, 기존 CUDA torch 검사 | GPU 서버 |
+| `ml-cpu` | runtime + dev + CatBoost + 공식 CPU PyTorch wheel | 별도 CPU 검증 환경 |
+| `ml-cuda` | runtime + dev, 작동하는 CUDA torch 유지 또는 명시적 공식 CUDA wheel 설치 | 주 실행 경로: GPU RelGNN |
 
-`setup.sh`는 기존 `.venv`를 재사용한다. 개발 host에서는 `dev` 다음 `ml-cpu`를 실행해도
-된다.
+`setup.sh`는 기존 `.venv`를 재사용하되 Python·pip가 빠진 불완전 환경은 거부한다.
+`ml-cuda`는 CatBoost를 설치하지 않는다. CPU 검증용 `ml-cpu`를 GPU 환경에 다시 실행하면
+CPU torch로 바뀔 수 있으므로 두 용도를 구분한다.
 
-GPU에서는 다음 순서를 사용한다.
+기존 CUDA torch가 실제 forward/backward 검사까지 통과하면 변경하지 않고 재사용한다.
+그렇지 않으면 사용자가 선택한 `TORCH_INDEX_URL`이 필요하다. 공식 `cu숫자` index만
+허용하며 CPU torch나 불완전 CUDA 설치는 upgrade/재설치 후 constraints를 다시 적용한다.
+CUDA wheel을 임의 추측하지 않는다. 설치 후 실제 CUDA 연산·gradient 검사가 실패하면
+exit code 3으로 실패한다. 학습 시에도 CUDA 실패를 CPU로 조용히 대체하지 않는다.
 
-```bash
-bash scripts/setup.sh base
-cp .env.example .env
-source scripts/activate.sh
-nvidia-smi
-# 공식 PyTorch selector에서 driver/runtime에 맞는 CUDA wheel 설치
-bash scripts/setup.sh ml-cuda
-```
-
-`ml-cuda`는 `torch.cuda.is_available()`이 false면 exit code 3으로 실패한다.
+오래 걸리는 실행은 README의 `tmux` 절차를 따른다. `last.pt`는 재개용,
+`best.pt`는 validation 최적 checkpoint 평가용이다.
 
 ## 5. 의존성 결정
 
@@ -238,7 +264,7 @@ import하지 않지만 DuckDB `TIMESTAMPTZ`→Python timezone datetime 변환 �
 `requirements/constraints.txt`는 Python 3.12에서 검증한 core/dev와 CatBoost 버전을
 고정한다. CUDA PyTorch wheel만 GPU host의 driver/runtime에 맞춰 선택한다.
 
-현재 실제 데이터 CPU 검증 버전:
+이전 tabular 실제 데이터 CPU 검증 버전:
 
 ```text
 Python    3.12.13
@@ -250,9 +276,10 @@ Ruff      0.16.5
 mypy      1.20.2
 ```
 
-이번 `.venv`는 `tabular` 환경이므로 PyTorch를 설치하지 않았다. 이전 프레임워크
-검증에서는 별도 full-ML 환경의 PyTorch `2.13.0+cpu`로 neural 테스트를 실행했다.
-그 결과를 이번 실제 데이터 RelGNN 학습 결과로 간주하면 안 된다.
+위 표는 CatBoost 검증 당시 환경 기록이다. 이후 별도 CPU PyTorch 환경에서 실제
+KBO graph cache를 읽는 RelGNN 축소 학습을 추가로 실행했다. 예전 neural 단위 테스트와
+실제 데이터 CPU 실행, 아직 하지 못한 NVIDIA GPU 학습을 구분한다. GPU host에서는
+`gpu-check` 출력의 PyTorch/CUDA 버전·장치 capability를 실행 기록과 함께 보존한다.
 
 ## 6. 환경 설정
 
@@ -265,8 +292,9 @@ CPV26_RANDOM_SEED=2026
 CPV26_LOG_LEVEL=INFO
 ```
 
-`Settings.from_environment()`는 naive path나 잘못된 timezone/device/log level을
-검증한다. 상대 경로는 repository root 기준으로 해석한다.
+`Settings.from_environment()`는 timezone/device/seed를 검증하고 log level을 대문자로
+정규화한다. 상대 경로는 repository root 기준으로 해석한다. `relgnn-train`의 기본
+장치는 설정의 `auto`와 별개로 `cuda:0`이며 CPU 검증은 `--device cpu`를 명시해야 한다.
 
 ## 7. 의도한 전체 흐름과 현재 연결 상태
 
@@ -285,18 +313,29 @@ CPV26_LOG_LEVEL=INFO
   → recommendation artifact
 ```
 
-현재 실제 데이터로 끝까지 실행한 구간:
+현재 실제 데이터로 연결된 주 학습 경로(CPU 축소 학습 확인, GPU 실행은 서버 검증 필요):
 
 ```text
 공개 KBO Parquet(revision + SHA-256 고정)
   → pitch를 PA·경기 단위로 축약하고 품질 보고
   → canonical DuckDB
-  ├→ 과거 팀 성적·Elo → 승/무/패 CatBoost → 시즌 평가 JSON + .cbm
-  └→ 과거 선수·상대팀 성적 → 1안타 이상 CatBoost → 시즌 평가 JSON + .cbm
+  → 과거 90일 관계·역할 feature → 날짜별 NPZ graph cache + manifest
+  → 여러 날짜의 disjoint graph batch → 공유 role-aware RelGNN
+  ├→ Match: 경기 승/무/패 + 양 팀 NB2 득점 분포
+  ├→ Conditional Live Hit: 관측 PA≥1 선수의 PA/안타 joint 분포
+  └→ PA: 별도 pre-PA context를 쓰는 10종 타석 결과
+  → 2023 train / 2024 validation → best.pt + last.pt + 학습 기록
+  → 명시적 relgnn-evaluate → 2025 test metrics + 작업별 prediction Parquet
 ```
 
-두 모델은 label·feature·loss·모델 파일이 별도다. 안타 모델은 실제 PA가 관측된
-선수만 평가하므로, 후보 중 미출전까지 포함한 Live Hit 추천 확률과 같지 않다.
+공유 graph 표현을 사용하되 작업별 query·label·loss·출력을 분리한다. 같은 날짜 결과는
+과거 관계 feature에 넣지 않고 label로만 사용한다. 현재 타석 직전 상태는 PA 보조 작업에만
+주며 경기 전 Match/Live Hit head로 넘기지 않는다. Live Hit는 실제 PA가 관측된 선수
+조건부이므로 후보 중 미출전까지 포함한 추천 확률과 같지 않다.
+
+선택적 CatBoost 경로는 과거 팀 성적·Elo→WDL, 과거 선수·상대팀 성적→any-hit의 두
+별도 모델이다. 이 경로의 전체 시즌 실행 결과와 `.cbm` 기록은 유지하지만 GPU 주경로가
+아니며 RelGNN 성적과 혼동하지 않는다.
 
 기존 연구 프레임워크에서 단위 테스트로 연결한 구간:
 
@@ -311,15 +350,16 @@ append-only DB
 
 당일 RelGNN 추천기로 연결하려면 남은 구간:
 
-- snapshot Parquet→mini-batch graph tensor
-- 실제 시즌 fold dataset/job→multi-task neural trainer 입력
+- NVIDIA 서버에서 전체 시즌 GPU 학습·메모리·재개 검증
 - 학습 산출물→당일 inference orchestration
+- 동일 조건의 시간순 OOF 학습·calibration과 모델 비교
 - 출전 확률·라인업·포지션 자격·선택률을 포함한 실제 후보 입력
 - 공식 V26 점수표·구간표 replay→verified scoring configuration
 
-`kbo-match-evaluate`와 `kbo-live-hit-evaluate`는 실제 학습도 수행한다. 단일 RelGNN
-`train`이나 `predict-today` 명령은 아직 없다. 또한 이번 공개 파일에는 당시 게시 시각이
-없어 날짜 기준 보수적 이력 재구성을 사용한다. 엄밀한 과거 공개시각 replay는 아니다.
+`kbo-graph-build`, `relgnn-train`, `relgnn-evaluate`가 실제 KBO neural 경로다.
+`predict-today`는 아직 없다. 선택적 `kbo-match-evaluate`와 `kbo-live-hit-evaluate`도
+실제 학습을 수행한다. 공개 파일에는 당시 게시 시각이 없어 날짜 기준 보수적 이력
+재구성을 사용한다. 엄밀한 과거 공개시각 replay는 아니다.
 
 ## 8. 시간 계약
 
@@ -861,7 +901,9 @@ loss에서 gradient가 없던 `score_correlation`은 제거했다.
 
 ### 19.1 작업별 학습 경계
 
-`src/cpv26/training/`은 서로 다른 row granularity를 하나의 batch로 섞지 않는다.
+범용 `TaskSeparatedModel`/`AlternatingMultiTaskTrainer`는 서로 다른 row granularity를
+하나의 task batch로 섞지 않는다. 아래 계약과 별개로 실제 KBO runner는 날짜별 graph를
+공유하면서 작업별 query·label·loss를 분리한다(§19.2).
 
 | task | 한 행 | label | loss |
 |---|---|---|---|
@@ -890,8 +932,56 @@ Checkpoint에 포함:
 - loss weights와 task order
 - feature, route, label schema, model version lineage
 
-Lineage가 현재 trainer와 다르면 resume를 거부한다. 이 패키지는 in-memory tensor batch
-이후의 학습 계약이며 provider나 Parquet loader를 구현했다고 주장하지 않는다.
+Lineage가 현재 trainer와 다르면 resume를 거부한다. 이 범용 trainer는 in-memory tensor
+batch 이후의 계약이며, 실제 KBO data loader·파일 checkpoint·실행 CLI는 다음 계층이다.
+
+### 19.2 실제 KBO RelGNN 학습 경로
+
+- `data/kbo_graph_dataset.py`: DB에서 날짜별 과거 90일 관계를 구성해
+  `days/YYYY-MM-DD.npz`와 sidecar, `manifest.json`을 만든다. `allow_pickle=False`로
+  읽고 파일 hash를 검사한다. 해당 날짜 전의 event만 사용하며 availability/validity
+  cutoff를 적용한다. 같은 날 경기는 순서에 상관없이 그날 graph의 과거 이력에 넣지 않는다.
+- `models/kbo_relgnn.py`: `RoleAwarePlayerEncoder`를 쓰는 공유
+  `CompositeRelGNNBackbone` 뒤에 Match WDL, 조건부 Live Hit joint PA/hit, PA10 head와
+  보조 NB2 양 팀 득점 head를 연결한다. 과거 타자↔투수, 타자/투수↔팀, 홈↔원정팀
+  관계를 사용하며 실제 당일 라인업·선발을 사전에 알려진 feature로 위장하지 않는다.
+- `training/kbo_runner.py`: graph mini-batch, GPU 전송, 학습·validation, checkpoint,
+  재개, 별도 holdout 평가를 연결한다. 실제 KBO data loader는 generic snapshot Parquet를
+  직접 받는 대신 위 전용 NPZ cache를 읽는다.
+
+세 작업은 다음과 같이 분리된다.
+
+| 작업 | 예측 시점·대상 | 학습 출력 |
+|---|---|---|
+| Match | 해당 날짜 전 이력, home/away team query | away/draw/home CE + 보조 양 팀 NB2 득점 NLL |
+| Conditional Live Hit | 해당 날짜 전 이력, 실제 완료 관측 PA≥1 선수-경기 | PA/안타 joint NLL와 `P(H≥1 | 관측 PA≥1)` |
+| PA | 같은 과거 graph와 별도의 현재 pre-PA context | 10-way CE |
+
+조건부 Live Hit는 범용 `DirectPlayerGameHead`의 미출전·0 PA 예측과 다르다.
+최대 count를 넘는 bucket의 기대값은 lower bound로 보고한다. 포수 타격방해는 PA10에서
+제외한다. 점수 전이가 불완전한 PA는 라벨을 보존하되 직전 양 팀 점수를 unknown으로
+마스킹해 현재 타석의 결과 점수가 context로 새지 않게 한다. cache version 변경 후에는
+`kbo-graph-build`를 다시 실행하며 이전 cache/checkpoint를 서로 섞지 않는다.
+
+기본 모델은 hidden dimension 64, 2 layers, 4 attention heads다. 기본 runner는
+단일 `cuda:0`, 2일/batch, DataLoader workers 2, pinned-memory/non-blocking 전송,
+날짜·route별 edge 상한 20,000, 훈련 PA query 128개/일을 사용한다. validation/test의
+PA query는 전부 평가한다. graph edge 상한은 평가에도 적용되므로 무제한 전체 관계
+graph라고 주장하지 않는다. AMP `auto`는 장치에 따라 BF16/FP16을 선택하며 `off`도
+가능하다. AdamW, gradient clipping, gradient accumulation을 지원한다.
+
+2023만 train, 2024만 validation으로 사용한다. `--patience 6`은 validation loss가
+개선되지 않는 epoch가 연속 6개면 조기 종료하며 0이면 비활성화한다. 2025 test는
+학습에서 평가하지 않고 `relgnn-evaluate --split test`로 명시적으로 실행한다.
+`best.pt`는 validation 최적 모델, `last.pt`는 마지막 완료 epoch의 재개용 상태다.
+atomic checkpoint에는 모델·optimizer·AMP scaler·CPU/CUDA RNG·설정·dataset fingerprint가
+포함된다. 재개는 같은 run directory의 `last.pt`만 허용하며 호환되지 않는 데이터나
+모델 설정은 거부한다. `--epochs`는 추가 횟수가 아니라 전체 목표 epoch다.
+
+`--device cpu --amp off --workers 0 --epochs 1 --max-days-per-split 3`은 별도 축소 검증이다.
+각 시즌 전체 날짜 범위에서 균등하게 3일을 고르며 첫 3일만 쓰는 방식이 아니다. 이를
+전체 시즌 모델 성적이나 GPU 메모리 검증으로 해석하면 안 된다. 실행 절차·산출물은
+[GPU_TRAINING.md](GPU_TRAINING.md)를 따른다.
 
 ## 20. 14 terminal event와 10 neural target 계약
 
@@ -1114,8 +1204,9 @@ Stacking/calibration primitive:
 - binary isotonic calibration
 - OOF stacking pipeline
 
-Meta prediction은 이전 OOF stage만 사용하도록 설계한다. 실제 model training
-orchestrator가 없으므로 base prediction 생성과 artifact 저장은 호출자가 연결해야 한다.
+Meta prediction은 이전 OOF stage만 사용하도록 설계한다. 개별 CatBoost/RelGNN의 실제
+학습·평가·artifact 저장은 연결했지만, 이 산출물로 시간순 OOF stage와 calibration을
+자동 fitting하는 통합 orchestrator는 아직 없다.
 
 ## 25. 평가 계약
 
@@ -1141,7 +1232,8 @@ train/validation 양쪽에 섞이지 않게 해야 한다.
 동일 future holdout
 ```
 
-비교 순서:
+GPU 학습 실행 경로는 RelGNN이며 CatBoost는 선택적 baseline이다. 성능 주장에 필요한
+비교 순서는 별개다.
 
 1. empirical baseline
 2. CatBoost
@@ -1160,9 +1252,16 @@ RelGNN을 미리 우승 모델로 정하지 않는다. KBO의 제한된 시즌 �
 cpv26 show-config
 cpv26 db-init
 cpv26 db-check
-cpv26 snapshot-build <prediction-run-id>
+# 기존 prediction run이 있을 때만 실제 ID로 실행: cpv26 snapshot-build RUN_ID
 cpv26 kbo-fetch
 cpv26 kbo-import
+cpv26 gpu-check --device cuda:0
+cpv26 kbo-graph-build
+cpv26 relgnn-train --device cuda:0 --epochs 30 --batch-days 2 --amp auto \
+  --run-dir var/runs/relgnn/kbo_2023_2024_v1
+cpv26 relgnn-evaluate --checkpoint var/runs/relgnn/kbo_2023_2024_v1/best.pt \
+  --split test --device cuda:0
+# 아래 두 명령만 선택적 CatBoost baseline이다.
 cpv26 kbo-match-evaluate
 cpv26 kbo-live-hit-evaluate
 ```
@@ -1191,6 +1290,39 @@ cpv26 kbo-live-hit-evaluate
 - importer는 schema 초기화, deterministic ID 적재, 참조 감사와 품질 보고를 수행한다.
 - 기본 경로는 `var/datasets/kbo_playbyplay/v0/`와 `var/reports/kbo_import.json`이다.
 
+`gpu-check`:
+
+- 기본 `cuda:0`에서 실제 matrix 연산 forward/backward와 finite gradient를 검사한다.
+- 장치 이름, capability, PyTorch/CUDA 버전, AMP 선택과 메모리를 보고한다.
+- 성공은 exit code 0, CUDA 사용 불가·연산 실패는 exit code 1이다. CPU로 fallback하지 않는다.
+
+`kbo-graph-build`:
+
+- 기본 2023~2025 날짜를 대상으로 과거 90일의 safe NPZ graph cache를 생성한다.
+- 기본 위치는 `var/datasets/kbo_graph`, `--output`으로 변경한다.
+- 기존 날짜별 cache는 입력 fingerprint와 파일 hash가 맞을 때만 재사용한다.
+- 494일·2,160경기·49,091 Live Hit query·169,477 PA10 label을 생성 확인했다.
+  포수 타격방해 4건은 PA10에서 제외된다. 전이 불완전 PA 11건의 직전 점수 unknown
+  mask가 포함된 cache version으로 재생성하여 사용한다.
+
+`relgnn-train`:
+
+- 기본 dataset은 위 graph cache다. `--dataset`/`--run-dir`로 경로를 지정한다.
+- 기본 `--device cuda:0 --epochs 30 --batch-days 2 --amp auto --workers 2`다.
+- 2023 train/2024 validation만 사용하며 2025 test를 학습 중 들여다보지 않는다.
+- `config.json`, `history.jsonl`, `best.pt`, `last.pt`, `training_report.json`을 저장한다.
+- `--resume .../last.pt`와 전체 목표 `--epochs`로 재개한다. `--run-dir` 생략 시
+  해당 checkpoint의 부모 경로를 사용하며 dataset fingerprint/config 호환성을 검사한다.
+- `--batch-days 1`, `--accumulate-steps`로 메모리·유효 batch를 조절한다.
+  `--max-pa-per-day`는 훈련 PA query에만 적용된다.
+
+`relgnn-evaluate`:
+
+- 저장된 checkpoint와 동일 fingerprint의 dataset을 읽고 명시한 split을 평가한다.
+- 기본 출력은 checkpoint 폴더의 `evaluations/test-<run-id>/metrics.json` 및
+  `match_predictions.parquet`, `live_hit_predictions.parquet`, `pa_predictions.parquet`이다.
+- 학습 날짜를 제한한 CPU smoke checkpoint는 평가 결과에도 `smoke_test_only`로 표시한다.
+
 `kbo-match-evaluate` / `kbo-live-hit-evaluate`:
 
 - `tabular` 설치가 필요하다. 각각 2023→2024, 2023~2024→2025 두 fold를 학습한다.
@@ -1203,12 +1335,12 @@ cpv26 kbo-live-hit-evaluate
 - 평가 JSON에는 학습 기간, parameter, feature 목록, log loss/Brier/ECE/accuracy,
   학습 구간 빈도 기준선과 조건부 모집단 한계를 함께 기록한다.
 
-아직 없는 CLI는 범용 provider ingest, graph tensor 생성, RelGNN 실제 시즌 학습,
-당일 inference와 `optimize-today`다. 데이터 적재나 baseline 평가 전체가 없는 것은 아니다.
+아직 없는 CLI는 범용 provider ingest, 당일 inference, `optimize-today`, 통합 OOF
+calibration이다. 실제 KBO graph 생성·RelGNN 학습·재개·holdout 평가 CLI는 구현되어 있다.
 
 ## 27. 테스트와 검증 결과
 
-최종 CPU 검증 명령:
+검증 명령:
 
 ```bash
 python -m compileall -q src tests scripts
@@ -1219,7 +1351,25 @@ python -m pip check
 python -m pip wheel . --no-deps -w /tmp/cpv26-wheel
 ```
 
-결과:
+최신 RelGNN 구현 검증 결과(Windows CPU, Python 3.12.13 / PyTorch 2.13.0+cpu):
+
+```text
+compileall: passed
+Ruff:       all checks passed
+mypy:       50 source files, no issues
+pytest:     193 passed, 1 skipped (CUDA unavailable)
+pip check:  no broken requirements
+shell:      setup/activate/check syntax passed
+wheel:      cpv26_predictor-0.4.0-py3-none-any.whl built
+```
+
+새 테스트는 graph 10개, RelGNN model 15개, runner 7개다. CUDA 전용 테스트 1개만
+skip됐으며 CPU mixed-precision, 실제 graph 연결, DataLoader worker, checkpoint 재개와
+held-out 평가를 포함한다. 연속 2 epoch와 1 epoch 후 재개한 2 epoch의 CPU 가중치가
+정확히 동일함을 검증했다. CUDA가 없으면 기본 명령이 명시적으로 실패하고 CPU로
+전환하지 않는 것도 확인했다. Wheel에 신규 dataset/model/runner 세 모듈이 포함된다.
+
+이전 tabular 단계 검증 결과(아래 숫자는 GPU RelGNN 추가 전 기록):
 
 ```text
 compileall: passed
@@ -1230,15 +1380,17 @@ pip check:  no broken requirements
 wheel:      cpv26_predictor-0.4.0-py3-none-any.whl built
 ```
 
-현재 검증 환경은 Python 3.12.13, DuckDB 1.5.5, CatBoost 1.2.10의 `tabular` 환경이다.
-17개 neural 테스트는 PyTorch 미설치로 skip된다. 이전 변경 시점의 별도 full-ML 환경에서는
-당시 117개 테스트가 skip 없이 통과했으나, 이는 이번 실제 데이터 RelGNN 학습 검증이 아니다.
+이전 검증 환경은 Python 3.12.13, DuckDB 1.5.5, CatBoost 1.2.10의 `tabular` 환경이었다.
+이때 17개 neural 테스트는 PyTorch 미설치로 skip됐다. 더 이전의 별도 full-ML 환경에서는
+당시 117개 테스트가 skip 없이 통과했다. 어느 숫자도 새 KBO graph/model/runner 테스트의
+최종 집계가 아니며, 전체 GPU 검증 결과도 아니다.
 
 Windows 실행 중 native 의존성 검사·import 경로에서 `Windows fatal exception: access violation`
 진단이 출력되었지만 pytest는 계속 실행되어 exit code 0으로 종료했다. 원인을 해결했다고
 주장하지 않는다. Linux가 실제 실행 대상이며 동일 suite와 필요한 CUDA 검증을 수행해야 한다.
 
-Test file별 수:
+이전 tabular 단계 test file별 수(새 `test_kbo_graph_dataset.py`, `test_kbo_relgnn.py`,
+`test_kbo_runner.py` 추가 전):
 
 | file | tests |
 |---|---:|
@@ -1263,7 +1415,7 @@ Test file별 수:
 | `test_task_training.py` | 11 |
 | 합계 | 162 |
 
-이번 실제 데이터 실행:
+이전 tabular 실제 데이터 실행:
 
 - 2023~2026 원본 805,960 pitches 다운로드·SHA-256 검증
 - 2,630경기·206,583 완료 라벨 PA의 DB 적재와 재적재 중복 방지
@@ -1272,6 +1424,28 @@ Test file별 수:
 - 같은 기간 선수-경기 49,091개로 안타 모델 두 fold 학습·평가
 - fold별 학습 빈도 기준선 비교와 네 개의 CatBoost `.cbm` 파일 저장
 - 모델 재로드 후 보고서 log loss 일치, 모델 SHA-256·실행별 평가 JSON 보존
+
+추가된 실제 데이터 RelGNN 검증:
+
+- 기본 2023~2025의 날짜별 graph 494개, Match 2,160개, 조건부 Live Hit 49,091개,
+  PA10 169,477개를 생성했다. 최초 cache 크기는 약 45.6 MiB였다.
+- dataset version 2 fingerprint:
+  `9eb9ea4b538e83a3fb83d3566cde17ed1cb0bc6cdddbc41678641b586fd473ed`.
+  전이 불완전 PA 11건만 context 점수를 unknown으로 마스크했고 다른 모든 배열은
+  v1과 동일함을 494일 전체에서 비교했다.
+- 2023 train 3일/2024 validation 3일을 시즌 전체에서 균등 선정해 CPU 1 epoch를
+  수행한 뒤 `last.pt`에서 총 2 epoch까지 재개했다. 모델 구조는 README 기본값인
+  hidden 64 / 2 layers / 4 heads, 1,154,640 parameters이고 batch-days 1을 사용했다.
+- 최종 optimizer step 6, AMP skipped step 0, best epoch 2. validation selection loss는
+  6.005682 → 5.645183이었다. 이후 별도로 2025의 균등 선정 3일만 평가했다.
+- 테스트 예측 Parquet는 Match 12행, 조건부 Live Hit 286행, PA10 970행으로 저장됐다.
+  이 소표본의 정확도를 전체 시즌 모델의 성능 수치로 제시하지 않는다.
+- 실행 위치는 `var/runs/relgnn/cpu_validation/`이고 최신 `best.pt` SHA-256은
+  `d7f9b8d36fbbc3bc97e85f592f1cc8697e0581a0fe66d9c4c6e6e7468e1b3275`이다.
+  `training_report.json`과 `evaluations/test-20260830T013137942015Z-5141e8b6/metrics.json`에
+  실행 설정·데이터 fingerprint·정확한 평가 지표가 있다. 실행물은 Git에 포함하지 않는다.
+- 이 축소 실행은 데이터/graph/model/runner 연결 검증이며 전체 시즌 학습 성적이 아니다.
+  `smoke_test_only=true`, `test_used_during_training=false`를 보고서에 기록한다.
 
 이전 full-ML 환경에서 실행한 optional neural runtime 검증:
 
@@ -1292,7 +1466,8 @@ Test file별 수:
 - A6000 48GB peak memory
 - A100 10GB MIG peak memory/OOM boundary
 - Linux driver별 CUDA wheel compatibility
-- 실제 KBO RelGNN/multi-task 학습 및 당일 V26 추천 replay
+- NVIDIA GPU의 실제 KBO RelGNN 전체 시즌 학습·재개·holdout 성능
+- 당일 V26 추천 replay
 
 Windows CPU 통과를 GPU production 검증으로 해석하면 안 된다.
 
@@ -1363,14 +1538,18 @@ Windows CPU 통과를 GPU production 검증으로 해석하면 안 된다.
 
 ### 모델
 
-- in-memory alternating trainer는 있으나 snapshot/Parquet data loader와 production job이 없다.
+- 전용 safe NPZ graph loader와 실제 KBO RelGNN 학습·평가·재개 job은 있다. 범용
+  snapshot Parquet를 직접 받는 loader, 당일 inference와 production orchestrator는 없다.
+- 실제 데이터 축소 CPU 학습은 확인했지만 NVIDIA GPU 전체 시즌 학습·성능·메모리는
+  미검증이다. graph를 공유하는 것만으로 CatBoost보다 좋다고 주장하지 않는다.
 - 실제 CatBoost 모델은 학습했으나 승부예측이 빈도 기준선보다 낮고, Live Hit는 연도별
   성능이 일관되지 않는다. 두 모델의 calibration은 아직 fitting하지 않았다.
-- 안타 baseline은 관측 PA가 있는 선수 조건부다. 미출전 확률이나 실제 V26 후보·보너스
-  최적화 전체를 학습한 모델이 아니다.
+- CatBoost 안타 baseline과 KBO RelGNN Live Hit head는 관측 PA가 있는 선수 조건부다.
+  미출전 확률이나 실제 V26 후보·보너스 최적화 전체를 학습한 모델이 아니다.
 - GraphSAGE benchmark가 없다.
 - hyperparameter tuning budget contract가 없다.
-- AMP, distributed training, gradient accumulation과 model registry가 없다.
+- AMP, gradient accumulation, atomic checkpoint 재개는 있다. distributed training,
+  activation checkpointing과 model registry는 없다.
 
 ### 시뮬레이션
 
@@ -1391,31 +1570,37 @@ Windows CPU 통과를 GPU production 검증으로 해석하면 안 된다.
 - scheduler/API/dashboard가 없다.
 - concurrent writer process coordination이 없다.
 - raw connection을 사용하면 application immutability를 우회할 수 있다.
-- GPU memory profile이 없다.
+- CUDA 장치 검사와 학습 peak-memory 보고 경로는 있다. 실제 NVIDIA 서버별 GPU memory
+  profile과 OOM 경계는 아직 측정하지 못했다.
 
 ## 30. 다음 구현 우선순위
 
-### P0 — 실제 데이터 baseline에서 남은 과제
+### P0 — GPU 실행 검증과 실제 데이터에서 남은 과제
 
 공개 source 선택, checksum 다운로드, namespaced ID adapter, 실제 DB 참조 감사,
-WDL·조건부 player-hit 학습/평가/저장은 완료했다.
+WDL·조건부 player-hit CatBoost 학습/평가/저장과 KBO RelGNN graph cache·학습·평가 CLI는
+구현했다. RelGNN의 실제 데이터 축소 CPU 실행까지 확인했으며 다음은 별도 과제다.
 
-1. 원본 누락·점수·교체 상태를 공식 기록과 대조하여 simulator용 데이터 품질을 확보한다.
-2. 선발·라인업·출전 후보와 발표 시각을 확보하고 당일 출전 확률을 별도로 모델링한다.
-3. 시간순 validation에서 feature·regularization·calibration을 검증한다.
-4. 실제 PA 다중분류 baseline을 연결한다. 현재 결과는 WDL과 player-hit 두 작업이다.
+1. Linux GPU에서 `gpu-check`, 실제 graph 학습, 재개, 2025 test를 실행하고 시간·메모리·
+   성능을 기록한다. 전체 test 결과로 hyperparameter를 되돌려 조정하지 않는다.
+2. 원본 누락·점수·교체 상태를 공식 기록과 대조하여 simulator용 데이터 품질을 확보한다.
+3. 선발·라인업·출전 후보와 발표 시각을 확보하고 당일 출전 확률을 별도로 모델링한다.
+4. 시간순 validation에서 feature·regularization·calibration을 검증한다. PA10 head도
+   실제 학습 경로에 있으나 모델 성능과 simulator 활용 적합성은 별도 평가해야 한다.
 5. 2026 V26 네 phase capture와 weather forecast revision 수집 정책을 확정한다.
 6. 과거 weather는 확인 가능한 발표 revision만 forecast 실험에 넣는다.
 
 ### P1 — 학습 infrastructure
 
-1. snapshot Parquet loader
-2. target-game temporal subgraph builder
-3. fold artifact directory contract
-4. 현재 alternating trainer에 AMP / gradient accumulation 연결
-5. checkpoint 파일 저장·atomic resume orchestration
-6. fold prediction writer
-7. calibration/stacking artifact writer
+날짜별 temporal graph cache, disjoint mini-batch, AMP/gradient accumulation, atomic
+best/last checkpoint, optimizer/scaler/RNG 재개, 작업별 prediction writer는 구현되어 있다.
+
+1. 현재 전용 KBO NPZ cache와 별개로 범용 snapshot/provider 입력 확장
+2. 여러 temporal fold의 비교 가능한 학습/OOF orchestrator
+3. calibration/stacking fitting과 artifact writer 연결
+4. 실제 GPU 측정에 근거한 route/PA sampling과 batch 기본값 검증
+5. 필요성이 확인된 경우 activation checkpointing·분산 학습
+6. model registry와 production inference artifact 계약
 
 ### P2 — feature 확장
 
@@ -1489,9 +1674,39 @@ V26의 `selected_synergy_team_id`는 수집된 후보 속성이 아니라 submis
 
 Source별 availability policy를 문서화하고 replay test를 만들어야 한다.
 
-## 32. 권장 artifact layout
+## 32. 현재 artifact와 향후 권장 layout
 
-아직 code로 고정되지 않았지만 다음 구조를 권장한다.
+현재 KBO RelGNN 경로가 실제 생성하는 기본 구조:
+
+```text
+var/
+├── cpv26.duckdb
+├── datasets/kbo_graph/
+│   ├── manifest.json
+│   └── days/
+│       ├── YYYY-MM-DD.npz
+│       └── YYYY-MM-DD.json
+└── runs/relgnn/<run-id>/
+    ├── config.json
+    ├── history.jsonl
+    ├── best.pt
+    ├── last.pt
+    ├── training_report.json
+    └── evaluations/test-<evaluation-id>/
+        ├── metrics.json
+        ├── match_predictions.parquet
+        ├── live_hit_predictions.parquet
+        └── pa_predictions.parquet
+```
+
+Evaluation directory는 `relgnn-evaluate`를 별도로 실행할 때 생성한다. 학습이 test까지
+자동 평가한 것처럼 해석하지 않는다. `--dataset`, `--run-dir`, 평가 `--output`으로
+위치를 변경할 수 있다. cache fingerprint가 checkpoint와 다르면 재개·평가를 거부한다.
+`best.pt`/`last.pt`가 존재한다는 사실만으로 GPU 실행을 입증하지 않으며 `config.json`과
+학습 보고서의 device/smoke 표시를 함께 확인한다.
+
+아래는 기존 snapshot을 포함한 향후 prediction-run 통합 layout 제안이다. fold와
+recommendation 부분을 모두 구현한 것은 아니다.
 
 ```text
 var/
@@ -1518,28 +1733,30 @@ hash를 참조해야 한다.
 
 ## 33. GPU 인계 체크리스트
 
-A6000 host에서:
+A6000 등 실제 Linux GPU host에서([GPU_TRAINING.md](GPU_TRAINING.md) 실행 절차 참고):
 
 1. `nvidia-smi`
-2. CUDA wheel 설치
-3. `torch.cuda.is_available()`
-4. CPU test 전체
-5. neural test CUDA device variant
-6. small graph forward/backward
-7. actual subgraph peak allocation 기록
-8. batch size 증가 OOM boundary 기록
-9. checkpoint save/load 동일 output 검사
+2. 공식 selector로 CUDA index를 선택하고 `setup.sh ml-cuda` 실행
+3. `cpv26 gpu-check --device cuda:0`의 실제 forward/backward 통과
+4. 동일 환경의 전체 test 실행
+5. `kbo-graph-build`의 날짜 수·label 품질·cache fingerprint 확인
+6. 실제 데이터 RelGNN 짧은 GPU 실행 후 전체 목표 epoch 학습
+7. 학습 보고서의 peak allocated/reserved memory와 epoch 시간 기록
+8. `--batch-days 1`부터 필요한 크기까지 GPU별 OOM 경계 확인
+9. `last.pt` 재개와 별도 `best.pt --split test` 평가 산출물 확인
 
 A100 10GB MIG에서는 위와 별도로:
 
 - BF16 지원 확인
-- neighbor/route sampling 활성화
-- gradient accumulation
-- activation checkpointing
+- route 상한·훈련 PA query 상한과 `--batch-days 1`에서 시작
+- 필요한 경우 `--accumulate-steps`로 유효 batch 조절
+- activation checkpointing은 아직 미구현이므로 지원한다고 가정하지 않기
 - max allocated/reserved memory
 - fragmentation/OOM recovery
 
-현재 subgraph loader와 memory-control 경로가 없어 10GB 검증을 시작할 단계는 아니다.
+현재 날짜별 graph loader, route/훈련 PA 상한, AMP, gradient accumulation 경로는 있다.
+이것이 10GB 장치에서의 성공을 보장하지는 않는다. 실제 장치에서 데이터·설정·AMP mode와
+peak memory를 함께 측정해야 하며 A6000/A100 MIG 수치를 추정해 기재하지 않는다.
 
 ## 34. ChatGPT 교차검증 요청 방법
 
@@ -1597,7 +1814,7 @@ correctness / leakage / migration / baseball rule
 - Ruff/mypy/pytest/wheel 검증
 - README/code summary/hand-off 일치
 
-실제 데이터 baseline 단계에서 추가로 완료한 항목:
+이전 실제 데이터 CatBoost baseline 단계에서 추가로 완료한 항목:
 
 - 고정 revision 다운로드·hash·출처 manifest
 - pitch→경기/PA 정규화와 source 품질 보고
@@ -1605,13 +1822,24 @@ correctness / leakage / migration / baseball rule
 - 2024 validation / 2025 test 및 학습 빈도 기준선 비교
 - 평가 JSON과 fold별 학습 모델 파일 저장
 
+실제 데이터 RelGNN 경로에서 추가로 구현·확인한 항목:
+
+- 과거 날짜·availability·validity를 적용한 날짜별 safe NPZ graph와 hash manifest
+- 공유 role-aware backbone + Match WDL/NB2, 조건부 Live Hit joint, PA10의 작업별 loss
+- 실제 데이터 축소 CPU 학습·validation·checkpoint 저장
+- CUDA 검사, AMP, DataLoader mini-batch, gradient clipping/accumulation 실행 코드
+- atomic best/last checkpoint와 optimizer/scaler/RNG·dataset lineage 재개 계약
+- 2025 holdout을 분리한 명시적 평가 CLI와 작업별 prediction Parquet writer
+
+마지막 세 항목은 실행 경로의 구현을 뜻하며 NVIDIA GPU에서 검증 완료했다는 뜻은 아니다.
+
 실전 추천기 완료 기준은 아직 충족하지 않았다.
 
 - licensed production data
 - provider replay
-- 기준선 우위와 calibration이 확인된 모델(학습 자체는 완료)
+- 기준선 우위와 calibration이 확인된 모델(CatBoost 전체 실행·RelGNN 축소 CPU 실행과 구분)
 - comparable graph benchmark
-- GPU training artifacts
+- 실제 NVIDIA 전체 시즌 GPU training artifacts와 재개·성능·메모리 검증
 - actual V26 ruleset replay
 - daily orchestrator
 - monitoring and operational security
