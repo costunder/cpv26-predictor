@@ -73,7 +73,7 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
 ````
 ```
 
-- 최신 `code_summary.md` SHA-256: `25f446a2d313e2e6159fdfa387980f8c3fd5fbd994c371a589d68459a94341ee`
+- 최신 `code_summary.md` SHA-256: `b35c137e1540b35e6301871dc9d3e2ad35550e2c118468e84121c29fdc9b6ed7`
 - 포함 section 수: `86`
 - 고유 경로 수: `86`
 
@@ -183,11 +183,16 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
 
 ## 4. Linux 설치와 profile
 
-Windows `.venv`는 복사하지 않는다. Linux에서 clone하거나 MobaXterm SFTP로 소스만
-올린 뒤 새로 만든다. 전체 초보자 안내는 [README](../README.md), GPU 운용은
-[GPU_TRAINING.md](GPU_TRAINING.md)를 따른다. 아래 명령은 Bash에서 실행한다.
+Windows `.venv`는 복사하지 않는다. 저장소가 public인 동안 Linux에서 익명 HTTPS로
+clone한 뒤 새로 만든다. GitHub 로그인·토큰·SSH 키는 필요하지 않다. 전체 초보자
+안내는 [README](../README.md), GPU 운용은 [GPU_TRAINING.md](GPU_TRAINING.md)를 따른다.
+아래 명령은 Bash에서 실행한다. 이미 clone한 폴더가 있다면 README의 업데이트
+절차를 사용한다.
 
 ```bash
+mkdir -p ~/projects
+cd ~/projects
+git clone https://github.com/costunder/cpv26-predictor.git
 cd ~/projects/cpv26-predictor
 nvidia-smi
 # 공식 PyTorch 설치 화면에서 이 서버에 맞게 선택한 --index-url 값을 붙여 넣는다.
@@ -239,6 +244,12 @@ exit code 3으로 실패한다. 학습 시에도 CUDA 실패를 CPU로 조용히
 
 오래 걸리는 실행은 README의 `tmux` 절차를 따른다. `last.pt`는 재개용,
 `best.pt`는 validation 최적 checkpoint 평가용이다.
+
+서버 실행을 마치면 소유자가 GitHub 설정에서 저장소를 private으로 직접 전환한다.
+자동 전환 작업은 없다. 이미 받은 소스·설치 환경·데이터·checkpoint를 사용하는
+학습·재개·평가는 계속 가능하지만, 이후 새 clone과 pull에는 저장소 접근 권한과
+인증이 필요하다. public인 동안 다른 사람이 받은 복제본은 비공개 전환으로 회수할
+수 없다. 원본 데이터·모델·인증 정보는 계속 Git에서 제외한다.
 
 ## 5. 의존성 결정
 

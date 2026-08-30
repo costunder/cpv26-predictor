@@ -43,26 +43,17 @@ CUDA wheel은 서버 driver에 맞게 직접 선택해야 하며, 설치 스크�
 
 ## 2. 프로젝트 받기
 
-이 비공개 GitHub 저장소에 대한 접근 권한이 필요합니다. 서버의 SSH 공개키가 GitHub
-계정에 등록돼 있다면 다음처럼 받습니다.
+저장소를 public으로 공개한 동안에는 GitHub 로그인, 토큰, SSH 키 없이 HTTPS로
+받을 수 있습니다. 다음 명령을 그대로 실행합니다.
 
 ~~~bash
 mkdir -p ~/projects
 cd ~/projects
-git clone git@github.com:costunder/cpv26-predictor.git
+git clone https://github.com/costunder/cpv26-predictor.git
 cd cpv26-predictor
 ~~~
 
-HTTPS 인증을 사용하는 서버에서는 clone 명령만 다음으로 바꿉니다.
-
-~~~bash
-git clone https://github.com/costunder/cpv26-predictor.git
-~~~
-
-HTTPS는 GitHub 계정 비밀번호가 아니라 저장소 읽기 권한이 있는 personal access token
-또는 설정된 credential helper로 인증합니다. 토큰을 clone URL에 넣거나 문서에 저장하지
-않습니다. 인증 설정이 어렵다면 GitHub에서 ZIP을 받고 압축을 푼 소스를 MobaXterm
-SFTP로 ~/projects/cpv26-predictor에 올려도 됩니다. .venv와 var는 올리지 않습니다.
+이미 이 폴더에 clone했다면 다시 clone하지 않고 11절의 업데이트 절차를 따릅니다.
 
 프로젝트 폴더에 다음 파일이 있는지 확인합니다.
 
@@ -373,6 +364,20 @@ Python compile, Ruff, strict mypy, pytest, 패키지 충돌 검사를 실행합�
 GitHub CI는 Linux Python 3.12에서 base 설치·CLI 도움말과 CPU PyTorch가 있는 neural
 테스트를 검사합니다. CI에서 전체 원천 데이터를 다운로드하거나 NVIDIA GPU 학습을
 수행하지는 않습니다.
+
+### 서버 실행 후 저장소를 private으로 되돌리기
+
+서버에서 필요한 설치·학습·평가를 마친 뒤 저장소 소유자가 GitHub 저장소의
+Settings → General → Danger Zone → Change repository visibility에서 private으로
+직접 바꿉니다. 이 프로젝트가 자동으로 비공개 전환하지는 않습니다.
+
+private으로 바꿔도 서버에 이미 받은 소스·설치 환경·데이터·checkpoint는 그대로이며,
+이 파일들을 사용하는 학습·재개·평가를 계속할 수 있습니다. 이후 새 clone이나
+git pull에는 저장소 접근 권한과 GitHub 인증이 필요합니다. HTTPS에서는 저장소 읽기
+권한이 있는 personal access token 또는 설정된 credential helper를 사용하고,
+토큰을 clone URL이나 문서에 넣지 않습니다.
+
+주의: public인 동안 다른 사람이 받은 복제본은 private으로 되돌려도 회수되지 않습니다.
 
 ## 선택 사항: CPU에서 작은 동작 검사만 하기
 
