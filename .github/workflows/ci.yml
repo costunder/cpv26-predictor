@@ -16,6 +16,10 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    defaults:
+      run:
+        # Conda initialization and cpv26 activation must run in every step.
+        shell: bash -el {0}
 
     steps:
       - name: Check out source
@@ -23,23 +27,35 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - name: Create the dedicated Conda environment
+        uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5 # v4.0.1
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            requirements/constraints.txt
+          miniforge-version: latest
+          environment-file: environment.yml
+          activate-environment: cpv26
+          auto-activate: false
+          channels: conda-forge
+          channel-priority: strict
+          conda-remove-defaults: true
+
+      - name: Verify the active Conda Python
+        run: |
+          test "$CONDA_DEFAULT_ENV" = cpv26
+          python -c "import os, sys; from pathlib import Path; assert Path(sys.prefix).resolve() == Path(os.environ['CONDA_PREFIX']).resolve(); assert sys.prefix == sys.base_prefix; print(sys.executable)"
 
       - name: Validate shell syntax
-        run: bash -n scripts/*.sh
+        run: |
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
 
       - name: Verify the base installation and CLI entry points
         run: |
           bash scripts/setup.sh base
           cp .env.example .env
+          chmod 600 .env
           source scripts/activate.sh
+          test ! -e .venv
           cpv26 show-config
           cpv26 db-init
           cpv26 db-check
@@ -56,6 +72,7 @@ jobs:
         run: |
           bash scripts/setup.sh ml-cpu
           source scripts/activate.sh
+          test ! -e .venv
           python -c "import torch; print(torch.__version__); assert torch.version.cuda is None"
 
       - name: Run the validation suite including neural tests

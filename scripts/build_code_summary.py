@@ -13,6 +13,7 @@ ROOT_FILES = (
     ".gitattributes",
     ".gitignore",
     "LICENSE.md",
+    "environment.yml",
     "pyproject.toml",
     "README.md",
     "docs/GPU_TRAINING.md",
@@ -32,6 +33,8 @@ LANGUAGE_BY_SUFFIX = {
     ".sh": "bash",
     ".txt": "text",
     ".toml": "toml",
+    ".yml": "yaml",
+    ".yaml": "yaml",
 }
 LANGUAGE_BY_NAME = {
     ".env.example": "dotenv",

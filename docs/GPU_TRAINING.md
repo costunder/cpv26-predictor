@@ -1,9 +1,29 @@
 # KBO RelGNN GPU 학습 기술 설명
 
 이 문서는 구현된 학습 경로의 데이터 계약·모델·재현성·한계를 설명합니다.
-설치와 처음부터 실행하는 순서는 `README.md`를 따릅니다.
+설치와 처음부터 실행하는 순서는 [README](../README.md)를 따릅니다.
 핵심 구현은 `src/cpv26/data/kbo_graph_dataset.py`,
 `src/cpv26/models/kbo_relgnn.py`, `src/cpv26/training/kbo_runner.py`입니다.
+
+## 실행 환경
+
+환경은 `environment.yml`로 만든 Python 3.12 **Conda `cpv26` 환경**을 사용합니다.
+생성 후 `conda activate cpv26`로 활성화하고 Python 경로를 확인한 다음 CUDA 설치를
+진행합니다. `setup.sh`는 활성화된 환경에 패키지를 설치하며 환경을 대신 생성하지 않습니다.
+Conda `base`에는 설치하지 않으며, 예전 `.venv`를 활성화하거나 재사용하지 않습니다.
+
+처음 설치가 끝난 후 SSH 재접속·새 tmux Bash·학습 재개 때마다 다음 순서를 사용합니다.
+
+```bash
+cd ~/projects/cpv26-predictor
+conda activate cpv26
+source scripts/activate.sh
+cpv26 gpu-check --device cuda:0
+```
+
+`source scripts/activate.sh`는 Conda 활성화가 아니라 `.env`의 프로젝트 설정 로드입니다.
+CPU smoke는 CUDA 패키지를 바꾸지 않도록 README의 별도 Conda `cpv26-cpu` 환경에서
+실행합니다. 데이터·DB·checkpoint 경로와 학습 계약은 환경 전환으로 바뀌지 않습니다.
 
 ## 데이터 출처와 고정 스냅샷
 

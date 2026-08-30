@@ -172,8 +172,22 @@ match loss=MultiClass, live-hit loss=Logloss
 
 ## 6. 산출물과 재현
 
+먼저 [README 3절](../README.md)의 `environment.yml`로 전용 Conda 환경 `cpv26`을
+생성하고 `.env`를 준비한다. 이미 있다면 재생성하지 않는다. Conda `base`에는 설치하지
+않는다. 다음은 해당 환경에 CatBoost를 추가하는 경로이며 CUDA PyTorch를 CPU용으로
+교체하는 명령이 아니다.
+
 ```bash
+conda activate cpv26
+which python
+python --version
 bash scripts/setup.sh tabular
+```
+
+`Conda environment ready: ...`를 확인한 뒤 실행한다. `source scripts/activate.sh`는 Conda
+활성화가 아니라 `.env`의 프로젝트 설정 로드다.
+
+```bash
 source scripts/activate.sh
 cpv26 kbo-fetch
 cpv26 kbo-import

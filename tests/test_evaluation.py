@@ -111,7 +111,7 @@ def test_catboost_baseline_reports_missing_optional_dependency(
     monkeypatch.setattr(baseline_module, "import_module", missing_catboost)
     baseline = CatBoostClassifierBaseline(parameters={"iterations": 2})
 
-    with pytest.raises(RuntimeError, match=r"pip install -e '.\[tabular\]'"):
+    with pytest.raises(RuntimeError, match=r"conda activate cpv26.*python -m pip install"):
         baseline.fit(np.array([[0.0], [1.0]]), np.array([0, 1]))
 
 

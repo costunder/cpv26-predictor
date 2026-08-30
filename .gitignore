@@ -9,7 +9,11 @@ __pycache__/
 htmlcov/
 
 # Environments and local configuration
+# Keep legacy virtual environments out of Git; project scripts do not use them.
 .venv/
+.conda/
+environment.local*.yml
+environment.local*.yaml
 .env
 .env.*
 !.env.example

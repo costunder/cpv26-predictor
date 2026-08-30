@@ -1,0 +1,10 @@
+# Create once with: conda env create -f environment.yml
+# Activate before running any project scripts: conda activate cpv26
+# CUDA PyTorch is installed separately for the target NVIDIA driver.
+name: cpv26
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip

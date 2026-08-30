@@ -63,7 +63,7 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
     `docs/HANDOFF.md`, 실행 데이터·모델·캐시를 제외한 소스·설정·테스트·README와
     실행 안내 문서를 다음 형식으로 이어 붙인다.
 - `scripts/build_code_summary.py`
-  - README와 handoff 수정 후 `code_summary.md`를 같은 형식으로 재생성한다.
+  - 외부 검토용 전달본이 필요할 때 `code_summary.md`를 같은 형식으로 재생성한다.
 
 ```text
 # `파일경로`
@@ -73,11 +73,12 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
 ````
 ```
 
-- 최신 `code_summary.md` SHA-256: `b35c137e1540b35e6301871dc9d3e2ad35550e2c118468e84121c29fdc9b6ed7`
-- 포함 section 수: `86`
-- 고유 경로 수: `86`
+- 이전 GPU RelGNN 전달본 `code_summary.md` SHA-256: `b35c137e1540b35e6301871dc9d3e2ad35550e2c118468e84121c29fdc9b6ed7`
+- 당시 포함 section 수: `86`
+- 당시 고유 경로 수: `86`
 
-이 hash는 GPU RelGNN 구현과 `docs/GPU_TRAINING.md`를 포함해 다시 생성한 전달본의 값이다.
+이 hash는 Conda 전환 전 GPU RelGNN 구현과 `docs/GPU_TRAINING.md`를 포함한 전달본의
+기록이며 현재 소스와 일치한다는 뜻이 아니다. 새 전달본은 생성 시 hash를 다시 계산한다.
 `docs/HANDOFF.md` 자체는 자기참조를 피하기 위해 summary에서 제외한다.
 
 ## 3. 저장소 구조
@@ -88,6 +89,7 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
 ├── .gitattributes
 ├── .gitignore
 ├── .github/workflows/ci.yml
+├── environment.yml
 ├── LICENSE.md
 ├── pyproject.toml
 ├── README.md
@@ -100,6 +102,8 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
 ├── scripts/
 │   ├── activate.sh
 │   ├── build_code_summary.py
+│   ├── conda_guard.py
+│   ├── conda_guard.sh
 │   ├── setup.sh
 │   └── check.sh
 ├── src/cpv26/
@@ -155,6 +159,8 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
 │   └── evaluation.py
 └── tests/
     ├── test_cli.py
+    ├── test_conda_environment.py
+    ├── test_conda_shell.py
     ├── test_config.py
     ├── test_dataset_contracts.py
     ├── test_dataset_integrity_v4.py
@@ -183,24 +189,61 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
 
 ## 4. Linux 설치와 profile
 
-Windows `.venv`는 복사하지 않는다. 저장소가 public인 동안 Linux에서 익명 HTTPS로
-clone한 뒤 새로 만든다. GitHub 로그인·토큰·SSH 키는 필요하지 않다. 전체 초보자
-안내는 [README](../README.md), GPU 운용은 [GPU_TRAINING.md](GPU_TRAINING.md)를 따른다.
-아래 명령은 Bash에서 실행한다. 이미 clone한 폴더가 있다면 README의 업데이트
-절차를 사용한다.
+Linux에서 **전용 Conda 환경 `cpv26`**을 생성·활성화한 뒤 설치한다. Conda `base`에
+설치하지 않는다. Windows의 Python 환경을 복사하지 않는다. 저장소가 public인 동안
+익명 HTTPS clone에는 GitHub 로그인·토큰·SSH 키가 필요하지 않다. 전체 초보자 안내는
+[README](../README.md), GPU 운용은 [GPU_TRAINING.md](GPU_TRAINING.md)를 따른다.
+아래 명령은 Bash에서 블록별로 성공을 확인하면서 실행한다. 이미 clone한 폴더가 있다면
+README의 업데이트 절차를 사용한다.
 
 ```bash
+conda --version
 mkdir -p ~/projects
 cd ~/projects
 git clone https://github.com/costunder/cpv26-predictor.git
 cd ~/projects/cpv26-predictor
 nvidia-smi
-# 공식 PyTorch 설치 화면에서 이 서버에 맞게 선택한 --index-url 값을 붙여 넣는다.
-read -r -p '공식 PyTorch CUDA index URL: ' TORCH_INDEX_URL
+conda env list
+```
+
+`cpv26`이 없을 때만 `environment.yml`로 Python 3.12와 pip를 설치한다. 기존 환경이
+있다면 재생성·삭제하지 않고 활성화와 Python 확인부터 한다.
+
+```bash
+conda env create -f environment.yml
+```
+
+```bash
+conda activate cpv26
+echo "$CONDA_DEFAULT_ENV"
+which python
+python --version
+python -m pip --version
+```
+
+Python 경로는 `…/envs/cpv26/bin/python`, 버전은 이 명세 기준 `3.12.x`여야 한다.
+서버의 `/tools/anaconda3/bin/python`이나 `(base)`가 남아 있으면 설치로 넘어가지 않는다.
+`setup.sh`는 Conda 환경을 만들거나 활성화하는 명령이 아니다.
+
+다음 CUDA index는 확인된 **A100 MIG 10GB / driver 535.104.05** 서버용 예시다.
+다른 서버는 [공식 PyTorch 설치 선택기](https://pytorch.org/get-started/locally/) 또는
+[공식 이전 버전 안내](https://pytorch.org/get-started/previous-versions/)에서 driver에 맞게
+선택한다. 이 서버의 `cu121` 선택은
+[NVIDIA CUDA 12.1 드라이버 조건](https://docs.nvidia.com/cuda/archive/12.1.0/cuda-toolkit-release-notes/)에
+맞지만, 실제 CUDA 연산·10GB 메모리 적합성은 별도 검증 대상이다.
+
+```bash
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
 TORCH_INDEX_URL="$TORCH_INDEX_URL" bash scripts/setup.sh ml-cuda
+```
+
+**`Conda environment ready: ...`**가 나온 뒤에만 설정과 GPU·DB 검사를 진행한다.
+
+```bash
 test -f .env || cp .env.example .env
 chmod 600 .env
 source scripts/activate.sh
+cpv26 show-config
 cpv26 gpu-check --device cuda:0
 cpv26 db-init
 cpv26 db-check
@@ -214,13 +257,22 @@ cpv26 relgnn-evaluate --checkpoint var/runs/relgnn/kbo_2023_2024_v1/best.pt \
   --split test --device cuda:0
 ```
 
-`setup.sh`는 기본적으로 `python3`를 사용하고 Python 3.10~3.12인지 검사한다. 서버의
-Python 명령이 다르면 `PYTHON_BIN`을 지정한다. CUDA wheel 선택은
-[공식 PyTorch 설치 화면](https://pytorch.org/get-started/locally/)에서 확인한다.
+Conda가 Python 버전과 환경을 관리하며 `setup.sh`는 활성화된 환경의 `python -m pip`로
+프로젝트 패키지를 설치한다. 지원 Python은 3.10~3.12이며 `environment.yml`은 3.12를
+선택한다. `scripts/conda_guard.py`와 `scripts/conda_guard.sh`는 Conda 활성화 여부,
+`base` 사용, 중첩된 가상환경, 실제 Python과 Conda prefix 일치 여부, pip 유무를 검사한다.
+`PYTHON_BIN`으로 다른 환경의 Python을 우회 지정하지 않는다.
 
-```bash
-PYTHON_BIN=python3.12 TORCH_INDEX_URL="$TORCH_INDEX_URL" bash scripts/setup.sh ml-cuda
-```
+`conda activate cpv26`과 `source scripts/activate.sh`의 역할은 다르다. 앞 명령은
+Python 환경을 활성화하고 뒤 명령은 환경 검사 후 `.env`의 프로젝트 설정만 로드한다.
+SSH 재접속, 새 tmux Bash, 업데이트 후에도 이 순서로 실행한다. Conda 명령은 있지만
+활성화 함수가 없는 Bash에서는 먼저 `source "$(conda info --base)/etc/profile.d/conda.sh"`로
+현재 셸에 Conda를 로드한다. 셸 설정 파일을 자동 변경하지 않는다.
+
+`.env`는 `CPV26_[A-Z0-9_]+` 형식의 프로젝트 키만 허용한다. `PATH`, `PYTHONPATH`,
+`CONDA_PREFIX` 등으로 검증된 환경을 덮어쓸 수 없다. 모든 줄을 먼저 검사한 후 설정을
+적용하므로 잘못된 줄이 있으면 일부만 적용하지 않는다. `TORCH_INDEX_URL`은 `.env`가
+아니라 설치 명령의 인자로 지정한다.
 
 Profile은 다섯 개다.
 
@@ -232,9 +284,15 @@ Profile은 다섯 개다.
 | `ml-cpu` | runtime + dev + CatBoost + 공식 CPU PyTorch wheel | 별도 CPU 검증 환경 |
 | `ml-cuda` | runtime + dev, 작동하는 CUDA torch 유지 또는 명시적 공식 CUDA wheel 설치 | 주 실행 경로: GPU RelGNN |
 
-`setup.sh`는 기존 `.venv`를 재사용하되 Python·pip가 빠진 불완전 환경은 거부한다.
-`ml-cuda`는 CatBoost를 설치하지 않는다. CPU 검증용 `ml-cpu`를 GPU 환경에 다시 실행하면
-CPU torch로 바뀔 수 있으므로 두 용도를 구분한다.
+profile 이름 `base`는 runtime만 설치한다는 뜻이지 Conda `(base)`에 설치한다는 뜻이
+아니다. 모든 profile과 `check.sh`는 활성화된 별도 Conda 환경을 요구한다.
+`ml-cuda`는 CatBoost를 설치하지 않는다. CPU 검증은 README처럼 별도 `cpv26-cpu` 환경에서
+`ml-cpu`를 실행한다. GPU 환경에 `ml-cpu`를 실행하면 CPU torch로 바뀔 수 있다.
+CatBoost만 추가할 때는 `conda activate cpv26` 후 `setup.sh tabular`를 실행한다.
+
+기존 `.venv`는 생성·활성화·재사용·삭제하지 않는다. 새 Conda 환경은 별도로 설치하고
+기존 `.env`, `var/`의 데이터·DB·checkpoint는 그대로 보존한다. 환경을 옮긴다는 이유만으로
+원본을 다시 다운로드하거나 checkpoint를 새로 만들지 않는다.
 
 기존 CUDA torch가 실제 forward/backward 검사까지 통과하면 변경하지 않고 재사용한다.
 그렇지 않으면 사용자가 선택한 `TORCH_INDEX_URL`이 필요하다. 공식 `cu숫자` index만
@@ -1354,6 +1412,8 @@ calibration이다. 실제 KBO graph 생성·RelGNN 학습·재개·holdout 평�
 검증 명령:
 
 ```bash
+conda activate cpv26
+source scripts/activate.sh
 python -m compileall -q src tests scripts
 ruff check src tests scripts/build_code_summary.py
 mypy --no-incremental src/cpv26
@@ -1362,7 +1422,7 @@ python -m pip check
 python -m pip wheel . --no-deps -w /tmp/cpv26-wheel
 ```
 
-최신 RelGNN 구현 검증 결과(Windows CPU, Python 3.12.13 / PyTorch 2.13.0+cpu):
+Conda 전환 전 RelGNN 구현 검증 결과(Windows CPU, Python 3.12.13 / PyTorch 2.13.0+cpu):
 
 ```text
 compileall: passed
@@ -1744,10 +1804,11 @@ hash를 참조해야 한다.
 
 ## 33. GPU 인계 체크리스트
 
-A6000 등 실제 Linux GPU host에서([GPU_TRAINING.md](GPU_TRAINING.md) 실행 절차 참고):
+A6000 등 실제 Linux GPU host에서([README](../README.md)의 Conda 설치 순서 참고):
 
-1. `nvidia-smi`
-2. 공식 selector로 CUDA index를 선택하고 `setup.sh ml-cuda` 실행
+1. `conda --version`과 `nvidia-smi` 확인
+2. 전용 Conda 환경 생성·활성화와 Python 경로 확인 후, driver에 맞는 공식 CUDA index로
+   `setup.sh ml-cuda` 실행; `Conda environment ready: ...` 확인 후 `.env` 준비·로드
 3. `cpv26 gpu-check --device cuda:0`의 실제 forward/backward 통과
 4. 동일 환경의 전체 test 실행
 5. `kbo-graph-build`의 날짜 수·label 품질·cache fingerprint 확인

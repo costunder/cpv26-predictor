@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
+
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  echo "Run this script with: bash scripts/setup.sh [profile]" >&2
+  return 1
+fi
 set -euo pipefail
 
 profile="${1:-base}"
-python_bin="${PYTHON_BIN:-python3}"
 constraints="requirements/constraints.txt"
 
 case "${profile}" in
@@ -18,46 +22,14 @@ if [[ ! -f pyproject.toml || ! -f "${constraints}" ]]; then
   exit 1
 fi
 
-if [[ ! -x .venv/bin/python ]]; then
-  if ! command -v "${python_bin}" >/dev/null 2>&1; then
-    echo "Python executable not found: ${python_bin}" >&2
-    echo "Set PYTHON_BIN to an installed Python 3.10-3.12 executable." >&2
-    exit 1
-  fi
-  if ! "${python_bin}" -c 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)'; then
-    cpv26_python_version="$("${python_bin}" --version 2>&1)"
-    echo "Unsupported Python: ${cpv26_python_version}" >&2
-    echo "CPV26 requires Python 3.10-3.12." >&2
-    exit 1
-  fi
-  if ! "${python_bin}" -m venv .venv; then
-    echo "Virtual environment creation failed; any partial .venv was preserved." >&2
-    echo "Install the matching Python venv package, move .venv aside, and rerun setup." >&2
-    exit 1
-  fi
-fi
-if [[ ! -f .venv/bin/activate ]]; then
-  echo "The existing .venv is incomplete because bin/activate is unavailable." >&2
-  echo "Move the incomplete .venv aside and rerun setup." >&2
-  exit 1
-fi
-source .venv/bin/activate
+cpv26_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${cpv26_script_dir}/conda_guard.sh"
+cpv26_require_conda || exit 1
 
-if ! python -c 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 13) else 1)'; then
-  echo "The existing .venv does not use Python 3.10-3.12." >&2
-  echo "Move the stale .venv aside and rerun setup." >&2
-  exit 1
-fi
-if ! python -m pip --version >/dev/null 2>&1; then
-  echo "The existing .venv is incomplete because pip is unavailable." >&2
-  echo "Move the incomplete .venv aside and rerun setup." >&2
-  exit 1
-fi
-
-python -m pip install --upgrade pip wheel
+"${cpv26_python}" -m pip install --upgrade pip wheel
 
 cuda_torch_ready() {
-  python - <<'PY'
+  "${cpv26_python}" - <<'PY'
 import torch
 from packaging.version import Version
 
@@ -80,21 +52,21 @@ PY
 
 case "${profile}" in
   base)
-    python -m pip install -c "${constraints}" -e .
+    "${cpv26_python}" -m pip install -c "${constraints}" -e .
     ;;
   dev)
-    python -m pip install -c "${constraints}" -e '.[dev]'
+    "${cpv26_python}" -m pip install -c "${constraints}" -e '.[dev]'
     ;;
   tabular)
-    python -m pip install -c "${constraints}" -e '.[dev,tabular]'
+    "${cpv26_python}" -m pip install -c "${constraints}" -e '.[dev,tabular]'
     ;;
   ml-cpu)
-    python -m pip install -c "${constraints}" -e '.[dev,tabular]'
-    python -m pip install 'torch>=2.4,<3' \
+    "${cpv26_python}" -m pip install -c "${constraints}" -e '.[dev,tabular]'
+    "${cpv26_python}" -m pip install 'torch>=2.4,<3' \
       --index-url https://download.pytorch.org/whl/cpu
     ;;
   ml-cuda)
-    python -m pip install -c "${constraints}" -e '.[dev]'
+    "${cpv26_python}" -m pip install -c "${constraints}" -e '.[dev]'
     if cuda_torch_ready >/dev/null 2>&1; then
       echo "Existing CUDA PyTorch passed a forward/backward check; leaving it unchanged."
     else
@@ -115,11 +87,11 @@ case "${profile}" in
       fi
       # An explicit index authorizes replacing an unusable/CPU build, even when
       # that installed build has a newer public version than the CUDA index.
-      python -m pip install --upgrade --force-reinstall 'torch>=2.4,<3' \
+      "${cpv26_python}" -m pip install --upgrade --force-reinstall 'torch>=2.4,<3' \
         --index-url "${torch_index_url}"
       # Restore this project's pinned core/dev dependencies after torch's
       # dependency resolution, then fail if the selected wheel conflicts.
-      python -m pip install -c "${constraints}" -e '.[dev]'
+      "${cpv26_python}" -m pip install -c "${constraints}" -e '.[dev]'
       if ! cuda_torch_ready; then
         echo "CUDA PyTorch still cannot execute a forward/backward kernel on this GPU." >&2
         echo "Check the selected CUDA build, NVIDIA driver, and GPU visibility." >&2
@@ -129,6 +101,6 @@ case "${profile}" in
     ;;
 esac
 
-python -m pip check
-echo "Environment ready."
+"${cpv26_python}" -m pip check
+echo "Conda environment ready: ${CONDA_PREFIX}"
 echo "Create .env if needed, then run: source scripts/activate.sh"

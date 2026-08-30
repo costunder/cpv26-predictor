@@ -129,8 +129,9 @@ def _load_catboost_classifier() -> Any:
     except (ImportError, ModuleNotFoundError) as exc:
         raise RuntimeError(
             "CatBoost is required to fit the tabular baseline; "
+            "activate the project's Conda environment with `conda activate cpv26`, then "
             "install it with `bash scripts/setup.sh tabular` or "
-            "`pip install -e '.[tabular]'`."
+            "`python -m pip install -e '.[tabular]'`."
         ) from exc
     classifier_type = getattr(module, "CatBoostClassifier", None)
     if classifier_type is None:
