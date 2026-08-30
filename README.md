@@ -434,6 +434,8 @@ bash scripts/check.sh
 ~~~
 
 Python compile, Ruff, strict mypy, pytest, 패키지 충돌 검사를 실행합니다.
+검사에서 만드는 임시 DB·모델·입력 파일은 실제 학습 데이터가 아니며, pytest가 종료되면
+보관하지 않도록 설정되어 있습니다. `--basetemp var/...`로 테스트 출력을 실행 데이터 폴더에 두지 않습니다.
 GitHub CI도 전용 Conda 환경의 Python 3.12에서 `base` profile 설치·CLI 도움말과
 CPU PyTorch가 있는 neural 테스트를 검사합니다. CI에서 전체 원천 데이터를 다운로드하거나 NVIDIA GPU 학습을
 수행하지는 않습니다.

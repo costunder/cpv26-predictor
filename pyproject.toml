@@ -47,6 +47,8 @@ packages = ["src/cpv26"]
 addopts = "-q --strict-markers"
 pythonpath = ["src"]
 testpaths = ["tests"]
+tmp_path_retention_count = 0
+tmp_path_retention_policy = "none"
 
 [tool.ruff]
 target-version = "py310"

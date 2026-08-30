@@ -184,8 +184,10 @@ NVIDIA GPU가 없어 CUDA 학습 성능·메모리·전체 시즌 학습 완료�
     └── test_task_training.py
 ```
 
-가짜 데이터 파일이나 fixture CSV용 빈 폴더는 없다. 원본·DB·모델·보고서는
-`CPV26_HOME` 아래에 생성하며 기본값은 Git에서 제외되는 `var/`다.
+추적되는 더미 데이터 파일이나 fixture CSV용 빈 폴더는 없다. 단위 테스트는 메모리나
+pytest 임시 폴더에 검사용 입력을 만들지만, 테스트 종료 후 임시 파일을 보관하지 않는다
+(`tmp_path_retention_policy = "none"`). `--basetemp var/...`로 이를 실행 데이터와 섞지 않는다.
+실제 원본·DB·모델·보고서는 `CPV26_HOME` 아래에 생성하며 기본값은 Git에서 제외되는 `var/`다.
 
 ## 4. Linux 설치와 profile
 
