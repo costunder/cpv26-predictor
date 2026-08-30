@@ -4,49 +4,44 @@
 프로젝트입니다. 공유 관계 그래프 모델에서 타석 결과, 경기 승무패, 선수별 PA·안타
 분포를 학습합니다.
 
-이 문서의 명령은 MobaXterm으로 접속한 Linux 서버에서 순서대로 실행합니다.
-Python 환경은 서버에 별도 Conda 환경 `cpv26`으로 만듭니다. Conda `base`에 설치하지
-않으며, Windows에서 만든 Python 환경, DB, 모델 파일을 서버로 복사해 시작하지 않습니다.
+아래 설치 명령과 `scripts/*.sh`는 **Linux + Bash 기준**입니다. 특정 호스트명이나
+접속 프로그램을 전제하지 않으며, 실제 학습할 환경의 터미널에서 실행합니다.
+Windows PowerShell에서 아래 Bash 명령을 그대로 실행하는 절차는 아닙니다.
+Python 환경은 실제 실행 환경에 별도 Conda 환경 `cpv26`으로 만듭니다. Conda `base`에
+설치하지 않으며, 다른 컴퓨터의 Python 환경을 복사해 사용하지 않습니다.
 CatBoost는 주 학습 경로가 아니며, 맨 아래의 선택적 비교 실험으로 분리했습니다.
 
 이 과정을 마쳐도 V26 계정의 당일 추천이 자동 생성되는 것은 아닙니다. 당일 후보,
 포지션 자격, 도감, 선택률, 공식 점수 규칙을 연결한 계정 추천은 별도 작업입니다.
-아래는 단일 GPU 학습 경로이며, 사용자 서버의 학습 시간·최대 VRAM 사용량은 아직
+아래는 단일 GPU 학습 경로이며, 사용자 실행 환경의 학습 시간·최대 VRAM 사용량은 아직
 확인되지 않았습니다.
 
-## 1. MobaXterm으로 서버에 접속하기
+## 1. 실제 실행 환경 확인하기
 
-MobaXterm에서 Session → SSH를 선택하고 서버 주소와 사용자 이름으로 접속합니다.
-이후 명령은 오른쪽 터미널에 입력합니다. 왼쪽 SFTP 패널은 파일 전송용입니다.
-
-먼저 Bash로 들어가 서버를 확인합니다.
+학습할 환경에서 Linux와 Bash를 사용할 수 있는지 먼저 확인합니다.
+아래 명령은 그 환경의 Bash 터미널에서 실행합니다.
 
 ~~~bash
-bash
+uname -s
 git --version
 conda --version
-python3 --version
 nvidia-smi
 ~~~
 
 필요한 환경은 Linux, Bash, Conda, Git, 인터넷 연결, NVIDIA GPU와 동작하는 NVIDIA
 driver입니다. 프로젝트 Python은 3절에서 Conda로 3.12를 설치합니다(지원 범위 3.10~3.12).
-지금 보이는 `(base)`와 Python 3.10.9는 기존 서버 환경이며 그대로 프로젝트에 쓰지 않습니다.
-Conda가 없거나 nvidia-smi가 실패하면 서버 관리자에게 환경 구성을 요청합니다.
+현재 터미널이 `(base)` 상태여도 프로젝트 패키지는 그곳에 설치하지 않습니다.
+필수 도구가 없다면 해당 실행 환경의 설치·사용 정책에 따라 먼저 준비합니다.
+관리형 환경에서 도구나 GPU를 사용할 수 없다면 담당자에게 확인합니다.
+관리 권한이나 특정 OS 패키지 관리자를 사용할 수 있다고 가정하지 않습니다.
 
-Ubuntu에서 Git이나 tmux만 없다면 관리 권한이 있는 사용자가 설치합니다.
-
-~~~bash
-sudo apt-get update
-sudo apt-get install -y git tmux
-~~~
-
-CUDA wheel은 서버 driver에 맞게 직접 선택해야 하며, 설치 스크립트가 추측하지 않습니다.
+CUDA wheel은 실제 실행 환경의 driver에 맞게 직접 선택해야 하며, 설치 스크립트가 추측하지 않습니다.
 
 ## 2. 프로젝트 받기
 
-저장소를 public으로 공개한 동안에는 GitHub 로그인, 토큰, SSH 키 없이 HTTPS로
-받을 수 있습니다. 다음 명령을 그대로 실행합니다.
+저장소를 public으로 공개한 동안에는 GitHub 로그인이나 토큰 없이 HTTPS로
+받을 수 있습니다. 아래는 `~/projects/cpv26-predictor`에 받는 예시입니다.
+다른 작업 폴더를 사용하면 이후 `cd` 명령도 실제 clone 경로로 바꿉니다.
 
 ~~~bash
 mkdir -p ~/projects
@@ -93,19 +88,20 @@ conda env create -f environment.yml
 ~~~bash
 conda activate cpv26
 echo "$CONDA_DEFAULT_ENV"
-which python
+echo "$CONDA_PREFIX"
+command -v python
 python --version
 python -m pip --version
 ~~~
 
-환경 이름이 `cpv26`, Python 경로가 `…/envs/cpv26/bin/python`, 버전이 `Python 3.12.x`
-인지 확인합니다. `/tools/anaconda3/bin/python`이 그대로 나오거나 `(base)` 상태라면
+환경 이름이 `cpv26`, Python 경로가 활성 환경의 `$CONDA_PREFIX/bin/python`, 버전이
+`Python 3.12.x`인지 확인합니다. Python 경로가 다른 환경을 가리키거나 `(base)` 상태라면
 패키지를 설치하지 말고 아래의 Conda 활성화 오류 항목부터 확인합니다.
 
 ### 3-3. 활성화된 Conda 환경 안에 CUDA PyTorch와 프로젝트 설치하기
 
-확인된 서버 **A100 MIG 10GB / driver 535.104.05 / nvidia-smi CUDA 12.2 표시**에서는
-아래의 공식 CUDA 12.1 wheel index를 사용합니다. 이는 모든 서버에 공통인 기본값이
+**A100 MIG 10GB / driver 535.104.05 / nvidia-smi CUDA 12.2 표시**에 해당하는 경우
+아래의 공식 CUDA 12.1 wheel index를 사용합니다. 이는 모든 실행 환경에 공통인 기본값이
 아닙니다. [PyTorch 공식 이전 버전 안내](https://pytorch.org/get-started/previous-versions/)와
 [NVIDIA CUDA 12.1 드라이버 조건](https://docs.nvidia.com/cuda/archive/12.1.0/cuda-toolkit-release-notes/)을
 기준으로 선택한 예시이며, 실제 CUDA 연산 확인은 설치 중과 4절에서 별도로 합니다.
@@ -115,10 +111,10 @@ TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
 TORCH_INDEX_URL="$TORCH_INDEX_URL" bash scripts/setup.sh ml-cuda
 ~~~
 
-다른 서버에서는 [공식 설치 선택기](https://pytorch.org/get-started/locally/) 또는
+다른 환경에서는 [공식 설치 선택기](https://pytorch.org/get-started/locally/) 또는
 위 이전 버전 안내에서 driver에 맞는 CUDA wheel을 선택하고 `--index-url` 뒤의 URL을
 `TORCH_INDEX_URL`에 넣습니다. 최신 선택기에 `cu121`이 없다고 임의로 `cu128` 등으로
-바꾸지 않습니다. 어떤 버전이 맞는지 모르면 nvidia-smi 결과로 서버 관리자에게 확인합니다.
+바꾸지 않습니다. 어떤 버전이 맞는지 모르면 nvidia-smi 결과와 공식 드라이버 조건을 먼저 확인합니다.
 
 `ml-cuda`는 현재 활성화한 Conda 환경에 프로젝트와 개발 검사 도구를 설치하며
 CatBoost는 설치하지 않습니다. Conda로 Python을 관리하고, 패키지는 **그 환경의 pip**로
@@ -217,15 +213,10 @@ kbo-graph-build는 대상 날짜 이전의 최대 90일 관계를 사용해 날�
 ls -lah var/datasets/kbo_graph
 ~~~
 
-## 6. SSH가 끊겨도 학습이 계속되게 하기
+## 6. 학습 실행 전 확인하기
 
-장시간 학습은 tmux 안에서 실행합니다. 다음 명령으로 Bash 세션을 만듭니다.
-
-~~~bash
-tmux new -s cpv26-train bash
-~~~
-
-tmux 화면 안에서 프로젝트 환경을 다시 활성화합니다.
+실제 학습 명령을 실행할 Bash 터미널에서 프로젝트 폴더와 Conda 환경을 확인합니다.
+새 터미널에서는 앞선 터미널의 환경 활성화 상태가 그대로 적용된다고 가정하지 않습니다.
 
 ~~~bash
 cd ~/projects/cpv26-predictor
@@ -234,19 +225,13 @@ source scripts/activate.sh
 cpv26 gpu-check --device cuda:0
 ~~~
 
-`conda activate`를 찾지 못하면 아래의 Conda 활성화 오류 항목처럼 이 Bash에 Conda를
-먼저 로드합니다. tmux 안에서도 `base`나 다른 Python으로 학습을 시작하지 않습니다.
+`conda activate`가 동작하지 않으면 아래의 Conda 활성화 오류 항목을 확인합니다.
+기존 학습 프로세스가 실행 중인지 확인하고 같은 run을 두 번 실행하지 마세요.
+공유 GPU나 관리형 실행 환경에서는 할당된 자원과 실행 정책을 따릅니다.
 
-이제 다음 절의 학습 명령을 실행합니다. 학습을 남겨두고 나가려면 Ctrl+B를 누른 뒤
-손을 떼고 D를 누릅니다. 다시 SSH로 접속한 뒤에는 다음으로 돌아옵니다.
-
-~~~bash
-tmux attach -t cpv26-train
-~~~
-
-기존 학습이 살아 있는지 먼저 확인하고 같은 run을 두 번 실행하지 마세요.
-tmux는 SSH 연결 종료를 견디게 해 주지만 서버 재부팅이나 프로세스 오류까지 막지는
-않습니다. 프로세스가 종료됐다면 9절의 checkpoint 재개를 사용합니다.
+다음 절의 명령은 학습 프로세스를 직접 실행합니다. 터미널을 닫거나 실행 세션이
+끝난 뒤에도 프로세스가 유지되는지는 해당 환경의 동작에 달려 있으며, 프로젝트가
+이를 보장하지 않습니다. 프로세스가 종료됐다면 9절의 checkpoint 재개를 사용합니다.
 
 ## 7. RelGNN GPU 학습하기
 
@@ -338,7 +323,7 @@ evaluations/test-<run-id>/
 
 학습 프로세스가 종료됐다면 마지막으로 저장된 last.pt에서 재개합니다.
 best.pt는 재개용으로 사용하지 않습니다.
-새 SSH/tmux 셸이라면 먼저 11절처럼 `conda activate cpv26` 후 프로젝트 설정을 로드합니다.
+새 Bash 터미널이라면 먼저 11절처럼 `conda activate cpv26` 후 프로젝트 설정을 로드합니다.
 
 ~~~bash
 cpv26 relgnn-train \
@@ -352,9 +337,9 @@ cpv26 relgnn-train \
 
 --run-dir를 생략하면 checkpoint의 부모 폴더를 사용합니다. --epochs 50은 추가
 50 epoch가 아니라 전체 목표 50 epoch입니다. 30 epoch까지 저장됐다면 최대 20 epoch를
-더 실행합니다. 재개할 때는 같은 데이터셋과 모델 설정을 유지합니다. 저장되지 않은
-진행 중 batch는 복구되지 않을 수 있으므로 SSH 연결만 끊을 때는 Ctrl+C 대신 tmux
-detach를 사용하세요.
+더 실행합니다. 재개할 때는 같은 데이터셋과 모델 설정을 유지합니다.
+재개는 마지막 checkpoint에 저장된 지점부터이며, 이후 저장되지 않은 batch의 진행은
+복구하지 않습니다. 기존 프로세스가 종료됐는지 확인한 뒤 재개합니다.
 
 ## 10. VRAM이 부족할 때
 
@@ -382,13 +367,12 @@ A100 MIG 10GB도 전체 A100이 아니라 할당된 MIG 장치를 사용하며, 
 10GB 내 학습 성공 여부는 아직 측정하지 않았습니다. 해당 환경은 `--batch-days 1`부터
 시험하고 학습·평가 각각의 peak memory를 확인합니다.
 
-## 11. 다시 접속하거나 코드 업데이트하기
+## 11. 새 터미널에서 작업하거나 코드 업데이트하기
 
-3절의 Conda 설치를 마쳤다면 새 SSH 세션에서 매번 환경을 활성화합니다.
+3절의 Conda 설치를 마쳤다면 새 Bash 터미널에서 매번 환경을 활성화합니다.
 아직 Conda로 전환하지 않은 기존 checkout은 아래의 코드 업데이트부터 합니다.
 
 ~~~bash
-bash
 cd ~/projects/cpv26-predictor
 conda activate cpv26
 source scripts/activate.sh
@@ -441,13 +425,13 @@ CPU PyTorch가 있는 neural 테스트를 검사합니다. CI에서 전체 원�
 수행하지는 않습니다.
 여기서 `base`는 runtime만 설치하는 스크립트 profile 이름이며 **Conda의 `(base)` 환경이 아닙니다.**
 
-### 서버 실행 후 저장소를 private으로 되돌리기
+### 설치·실행 후 저장소를 private으로 되돌리기
 
-서버에서 필요한 설치·학습·평가를 마친 뒤 저장소 소유자가 GitHub 저장소의
+실행 환경에서 필요한 설치·학습·평가를 마친 뒤 저장소 소유자가 GitHub 저장소의
 Settings → General → Danger Zone → Change repository visibility에서 private으로
 직접 바꿉니다. 이 프로젝트가 자동으로 비공개 전환하지는 않습니다.
 
-private으로 바꿔도 서버에 이미 받은 소스·설치 환경·데이터·checkpoint는 그대로이며,
+private으로 바꿔도 실행 환경에 이미 받은 소스·설치 환경·데이터·checkpoint는 그대로이며,
 이 파일들을 사용하는 학습·재개·평가를 계속할 수 있습니다. 이후 새 clone이나
 git pull에는 저장소 접근 권한과 GitHub 인증이 필요합니다. HTTPS에서는 저장소 읽기
 권한이 있는 personal access token 또는 설정된 credential helper를 사용하고,
@@ -465,7 +449,7 @@ GPU용 `cpv26`의 CUDA PyTorch를 바꾸지 않도록 별도 Conda 환경 `cpv26
 ~~~bash
 conda env create -f environment.yml -n cpv26-cpu
 conda activate cpv26-cpu
-which python
+command -v python
 python --version
 bash scripts/setup.sh ml-cpu
 ~~~
@@ -525,9 +509,9 @@ source scripts/activate.sh
 
 ### CUDA-enabled PyTorch is missing / CUDA kernel check failed
 
-nvidia-smi를 확인하고 3절에서 서버에 맞는 공식 CUDA index를 다시 선택합니다.
+nvidia-smi를 확인하고 3절에서 실행 환경에 맞는 공식 CUDA index를 다시 선택합니다.
 CPU wheel을 그대로 둔 채 반복 실행하지 않습니다. driver 권한이나 GPU 할당 문제는
-서버 관리자에게 확인합니다. 설치 후에는 반드시 다음을 통과해야 합니다.
+관리형 환경이라면 담당자에게 확인합니다. 설치 후에는 반드시 다음을 통과해야 합니다.
 
 ~~~bash
 cpv26 gpu-check --device cuda:0
@@ -551,8 +535,8 @@ cpv26 kbo-graph-build
 
 ### Conda가 없거나 conda activate가 동작하지 않음
 
-`conda --version`부터 확인합니다. 명령이 없다면 서버 관리자가 제공한 Conda 초기화
-방법을 사용합니다. Conda 명령은 있지만 Bash 활성화 오류가 나면 현재 셸에서만 다음을 실행합니다.
+`conda --version`부터 확인합니다. 명령이 없다면 해당 실행 환경의 Conda 설치·초기화
+방법부터 확인합니다. Conda 명령은 있지만 Bash 활성화 오류가 나면 현재 셸에서만 다음을 실행합니다.
 
 ~~~bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -564,8 +548,8 @@ Conda 설치 경로 자체인 `base`에는 프로젝트 패키지를 설치하�
 
 ### Python 경로가 다름 / 중첩된 환경 / 지원하지 않는 Python
 
-기존 Python 가상환경을 활성화한 셸이라면 새 SSH 세션에서 시작하고 Conda `cpv26`만
-활성화합니다. `which python`, `python --version`, `echo "$CONDA_PREFIX"`로 경로와 버전을
+기존 Python 가상환경이 중첩되지 않은 Bash 터미널에서 시작하고 Conda `cpv26`만
+활성화합니다. `command -v python`, `python --version`, `echo "$CONDA_PREFIX"`로 경로와 버전을
 확인합니다. 스크립트는 중첩된 가상환경이나 Conda 환경과 다른 Python을 거부합니다.
 `PYTHON_BIN`으로 다른 Python을 강제로 지정하지 말고, 3절처럼 올바른 Conda 환경을 선택합니다.
 기존 환경을 삭제하거나 base의 Python을 교체하는 방식으로 해결하지 않습니다.
