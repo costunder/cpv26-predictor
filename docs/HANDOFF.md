@@ -3,7 +3,7 @@
 - 작성 기준일: 2026-08-30 KST
 - 프로젝트 버전: `0.4.0`
 - DuckDB schema version: `4`
-- 실행 대상: Linux Bash와 활성화된 전용 Conda 환경(접속 방식은 가정하지 않음)
+- 실행 대상: Linux Bash와 활성화된 전용 Conda 환경
 - 현재 검증 host: Windows CPU / Python 3.12.13
 
 ## 1. 최종 판정
@@ -191,12 +191,10 @@ pytest 임시 폴더에 검사용 입력을 만들지만, 테스트 종료 후 �
 
 ## 4. Linux 설치와 profile
 
-Linux에서 **전용 Conda 환경 `cpv26`**을 생성·활성화한 뒤 설치한다. Conda `base`에
-설치하지 않는다. 다른 컴퓨터의 Python 환경을 복사하지 않는다. 저장소가 public인 동안
-익명 HTTPS clone에는 GitHub 로그인이나 토큰이 필요하지 않다. 전체 초보자 안내는
+Linux Bash에서 **전용 Conda 환경 `cpv26`**을 생성·활성화한 뒤 패키지를 설치한다.
+저장소가 public이면 GitHub 로그인 없이 HTTPS로 clone할 수 있다. 처음부터 실행하는 순서는
 [README](../README.md), GPU 운용은 [GPU_TRAINING.md](GPU_TRAINING.md)를 따른다.
-아래 명령은 Bash에서 블록별로 성공을 확인하면서 실행한다. 이미 clone한 폴더가 있다면
-README의 업데이트 절차를 사용한다.
+이미 clone했다면 README의 업데이트 절차를 사용한다.
 
 ```bash
 conda --version
@@ -227,8 +225,7 @@ python -c "import os, sys; from pathlib import Path; assert Path(sys.prefix).res
 
 `CONDA_DEFAULT_ENV`가 `cpv26`이고 실제 Python의 prefix가 `CONDA_PREFIX`와 일치해야 한다.
 Python 버전은 이 명세 기준 `3.12.x`다. 경로 검사가 실패하거나 `(base)` 상태라면
-설치로 넘어가지 않는다. Conda 설치 위치나 특정 서버의 Python 경로는 가정하지 않는다.
-`setup.sh`는 Conda 환경을 만들거나 활성화하는 명령이 아니다.
+환경을 다시 활성화한 뒤 설치한다.
 
 다음 CUDA index는 **A100 MIG 10GB / driver 535.104.05**에 해당하는 환경용 예시다.
 다른 서버는 [공식 PyTorch 설치 선택기](https://pytorch.org/get-started/locally/) 또는
@@ -268,12 +265,9 @@ Conda가 Python 버전과 환경을 관리하며 `setup.sh`는 활성화된 환�
 `base` 사용, 중첩된 가상환경, 실제 Python과 Conda prefix 일치 여부, pip 유무를 검사한다.
 `PYTHON_BIN`으로 다른 환경의 Python을 우회 지정하지 않는다.
 
-`conda activate cpv26`과 `source scripts/activate.sh`의 역할은 다르다. 앞 명령은
-Python 환경을 활성화하고 뒤 명령은 환경 검사 후 `.env`의 프로젝트 설정만 로드한다.
-접속 방식과 무관하게 새 터미널·Bash 실행 환경을 열거나 업데이트한 뒤에도 이 순서로
-실행한다. Conda 명령은 있지만 활성화 함수가 없는 Bash에서는 먼저
-`source "$(conda info --base)/etc/profile.d/conda.sh"`로
-현재 셸에 Conda를 로드한다. 셸 설정 파일을 자동 변경하지 않는다.
+새 Bash 터미널에서는 `conda activate cpv26`로 환경을 활성화한 뒤
+`source scripts/activate.sh`로 `.env` 설정을 읽는다. Conda 명령은 있지만 활성화 함수가
+없다면 먼저 `source "$(conda info --base)/etc/profile.d/conda.sh"`를 실행한다.
 
 `.env`는 `CPV26_[A-Z0-9_]+` 형식의 프로젝트 키만 허용한다. `PATH`, `PYTHONPATH`,
 `CONDA_PREFIX` 등으로 검증된 환경을 덮어쓸 수 없다. 모든 줄을 먼저 검사한 후 설정을
@@ -308,7 +302,7 @@ exit code 3으로 실패한다. 학습 시에도 CUDA 실패를 CPU로 조용히
 
 `last.pt`는 마지막으로 저장한 완료 epoch 지점부터 재개하는 용도이며,
 `best.pt`는 validation 최적 checkpoint 평가용이다. 프로세스가 종료되면 저장되지 않은
-진행 중 batch는 복구되지 않는다. 실행 환경이 프로세스를 계속 유지한다고 가정하지 않는다.
+진행 중 batch는 복구되지 않는다.
 
 필요한 설치·실행을 마치면 소유자가 GitHub 설정에서 저장소를 private으로 직접 전환한다.
 자동 전환 작업은 없다. 이미 받은 소스·설치 환경·데이터·checkpoint를 사용하는
