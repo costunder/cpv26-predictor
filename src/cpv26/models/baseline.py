@@ -129,7 +129,7 @@ def _load_catboost_classifier() -> Any:
     except (ImportError, ModuleNotFoundError) as exc:
         raise RuntimeError(
             "CatBoost is required to fit the tabular baseline; "
-            "install it with `bash scripts/setup.sh ml-cpu` or "
+            "install it with `bash scripts/setup.sh tabular` or "
             "`pip install -e '.[tabular]'`."
         ) from exc
     classifier_type = getattr(module, "CatBoostClassifier", None)

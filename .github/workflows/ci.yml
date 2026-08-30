@@ -37,12 +37,16 @@ jobs:
 
       - name: Follow the README quick start
         run: |
-          bash scripts/setup.sh dev
+          bash scripts/setup.sh tabular
           cp .env.example .env
           source scripts/activate.sh
           cpv26 show-config
           cpv26 db-init
           cpv26 db-check
+          cpv26 kbo-fetch --help
+          cpv26 kbo-import --help
+          cpv26 kbo-match-evaluate --help
+          cpv26 kbo-live-hit-evaluate --help
 
       - name: Run the complete validation suite
         run: |

@@ -46,6 +46,9 @@ case "${profile}" in
   dev)
     python -m pip install -c "${constraints}" -e '.[dev]'
     ;;
+  tabular)
+    python -m pip install -c "${constraints}" -e '.[dev,tabular]'
+    ;;
   ml-cpu)
     python -m pip install -c "${constraints}" -e '.[dev,tabular]'
     python -m pip install 'torch>=2.4,<3' \
@@ -61,7 +64,7 @@ case "${profile}" in
     fi
     ;;
   *)
-    echo "Usage: bash scripts/setup.sh [base|dev|ml-cpu|ml-cuda]" >&2
+    echo "Usage: bash scripts/setup.sh [base|dev|tabular|ml-cpu|ml-cuda]" >&2
     exit 2
     ;;
 esac

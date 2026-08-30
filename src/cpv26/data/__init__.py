@@ -52,6 +52,20 @@ from .integrity import (
     find_composite_reference_violations,
     find_reference_violations,
 )
+from .kbo_ingest import (
+    KBOImportFile,
+    KBOImportReport,
+    KBOIngestError,
+    import_kbo_playbyplay,
+    write_import_report,
+)
+from .kbo_playbyplay import (
+    KBO_PLAYBYPLAY_FILES,
+    KBO_PLAYBYPLAY_REVISION,
+    KBO_PLAYBYPLAY_SOURCE,
+    ChecksumMismatchError,
+    download_kbo_playbyplay,
+)
 from .schema import (
     DOMAIN_TIMESTAMP_COLUMNS,
     SCHEMA_VERSION,
@@ -89,6 +103,12 @@ __all__ = [
     "ExpandingTemporalSplit",
     "GameGroupAssignment",
     "GameSample",
+    "KBOImportFile",
+    "KBOImportReport",
+    "KBOIngestError",
+    "KBO_PLAYBYPLAY_FILES",
+    "KBO_PLAYBYPLAY_REVISION",
+    "KBO_PLAYBYPLAY_SOURCE",
     "PlateAppearanceRow",
     "PlayerGameBattingRow",
     "REFERENCE_RULES",
@@ -130,9 +150,13 @@ __all__ = [
     "audit_v26_capture_consistency",
     "audit_weather_usage",
     "build_expanding_temporal_split",
+    "ChecksumMismatchError",
+    "download_kbo_playbyplay",
     "find_composite_reference_violations",
     "find_reference_violations",
     "install_schema",
+    "import_kbo_playbyplay",
     "live_hit_snapshot_specs",
     "table_names",
+    "write_import_report",
 ]

@@ -15,6 +15,7 @@ ROOT_FILES = (
     "LICENSE.md",
     "pyproject.toml",
     "README.md",
+    "docs/KBO_BASELINE.md",
 )
 SOURCE_DIRECTORIES = (".github", "requirements", "scripts", "src", "tests")
 IGNORED_PARTS = {

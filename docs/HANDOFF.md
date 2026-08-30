@@ -1,6 +1,6 @@
 # CPV26 Predictor 인수인계서
 
-- 작성 기준일: 2026-08-29 KST
+- 작성 기준일: 2026-08-30 KST
 - 프로젝트 버전: `0.4.0`
 - DuckDB schema version: `4`
 - 실행 대상: MobaXterm으로 접속하는 Linux 서버
@@ -23,24 +23,36 @@
 - 출처가 명시된 라이브 히트 ruleset, exact/beam optimizer와 탐색 진단
 - PA·선수경기·경기 단위 별도 loss와 alternating multi-task trainer
 - 시간순 OOF stacking과 calibration primitive
+- revision·SHA-256을 고정한 공개 KBO Parquet 다운로드와 canonical DB importer
+- 실제 2023~2025 시즌의 경기 승/무/패 CatBoost 학습·평가·모델 저장
+- 별도 선수-경기 1안타 이상 CatBoost 학습·평가·모델 저장
 
 다만 이것은 아직 당일 데이터를 받아 자동으로 추천을 내는 운영 서비스가 아니다.
-공급자 adapter, 실제 KBO 데이터, Parquet graph loader, production 학습 job, 실제 V26
-ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
+공개 데이터 adapter와 실제 시즌 baseline 실행은 연결했다. 남아 있는 것은 RelGNN용
+Parquet graph loader와 실제 학습 job, 당일 후보·출전 확률 입력, 실제 V26 ruleset replay와
+scheduler다. 정확한 표현은 다음과 같다.
 
-> 시점·관계·야구 규칙의 correctness를 검증한 연구용 프레임워크이며, 완성된 실전
-> 추천기는 아니다.
+> 실제 KBO 데이터로 두 작업을 따로 학습·평가할 수 있는 baseline과, 시점·관계·야구
+> 규칙을 검증하는 연구 프레임워크다. 학습 완료된 RelGNN이나 완성된 당일 추천기는 아니다.
+
+실행 결과는 [KBO_BASELINE.md](KBO_BASELINE.md)에 기록했다. 2025 test에서 경기 모델은
+정확도 46.53%로 학습 빈도 기준선 49.72%보다 낮다. 선수 안타 모델은 출전 선수 조건부
+정확도 59.80%이며 기준선 53.80%보다 높지만, 2024 validation에서는 기준선보다 낮았다.
+성능 개선이나 실전 일반화를 입증했다고 해석하지 않는다.
 
 ## 2. 전달 파일
 
 - `README.md`
-  - 초보자가 MobaXterm에서 clone, 설치, 환경 활성화, DB 초기화와 검증을 순서대로
-    실행할 수 있는 운영 안내서다. 상세 설계는 이 문서로 분리했다.
+  - 초보자가 MobaXterm에서 clone, 설치, 데이터 다운로드·적재, 두 모델 학습·평가를
+    순서대로 실행할 수 있는 안내서다. 상세 설계는 이 문서로 분리했다.
+- `docs/KBO_BASELINE.md`
+  - 원본 출처·revision·hash, adapter 정책, 데이터 결함, 실제 시즌 평가 결과다.
 - `docs/HANDOFF.md`
   - 이 문서다. 설계 결정, 공개 계약, 검증 결과와 다음 작업을 설명한다.
 - `code_summary.md`
   - Git에 포함하지 않는 외부 검토용 생성물이다. `code_summary.md`와 별도 문서인
-    `docs/HANDOFF.md`를 제외한 프로젝트 파일을 다음 형식으로 이어 붙인다.
+    `docs/HANDOFF.md`, 실행 데이터·모델·캐시를 제외한 소스·설정·테스트·README와
+    `docs/KBO_BASELINE.md`를 다음 형식으로 이어 붙인다.
 - `scripts/build_code_summary.py`
   - README와 handoff 수정 후 `code_summary.md`를 같은 형식으로 재생성한다.
 
@@ -52,9 +64,9 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
 ````
 ```
 
-- 최종 `code_summary.md` SHA-256: `e8143eb0b702eb54c67de79909f1bfb61e87b2457a8d3aeed1f37f24c27c151d`
-- 포함 section 수: `69`
-- 고유 경로 수: `69`
+- 최종 `code_summary.md` SHA-256: `95bc40093d775de393ad6886a67fd5c90ea9e0a0b4a714fc90002e102d56ed18`
+- 포함 section 수: `79`
+- 고유 경로 수: `79`
 
 이 hash로 외부 전달 과정에서 코드 요약이 변형되지 않았는지 확인할 수 있다.
 
@@ -70,7 +82,8 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
 ├── pyproject.toml
 ├── README.md
 ├── docs/
-│   └── HANDOFF.md
+│   ├── HANDOFF.md
+│   └── KBO_BASELINE.md
 ├── requirements/
 │   └── constraints.txt
 ├── scripts/
@@ -81,6 +94,8 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
 ├── src/cpv26/
 │   ├── data/
 │   │   ├── dataset_contracts.py
+│   │   ├── kbo_playbyplay.py
+│   │   ├── kbo_ingest.py
 │   │   ├── schema.py
 │   │   ├── schema_v4.py
 │   │   ├── store.py
@@ -111,6 +126,10 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
 │   ├── optimization/
 │   │   ├── match_prediction.py
 │   │   └── live_hit.py
+│   ├── pipelines/
+│   │   ├── __init__.py
+│   │   ├── kbo_match_baseline.py
+│   │   └── kbo_live_hit_baseline.py
 │   ├── training/
 │   │   ├── contracts.py
 │   │   ├── losses.py
@@ -129,6 +148,10 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
     ├── test_domain.py
     ├── test_evaluation.py
     ├── test_graph_models.py
+    ├── test_kbo_ingest.py
+    ├── test_kbo_live_hit_baseline.py
+    ├── test_kbo_match_baseline.py
+    ├── test_kbo_playbyplay_source.py
     ├── test_live_hit_point_in_time.py
     ├── test_live_hit_rules.py
     ├── test_model_output_contracts.py
@@ -138,8 +161,8 @@ ruleset replay와 scheduler가 없다. 정확한 표현은 다음과 같다.
     └── test_task_training.py
 ```
 
-원본 데이터나 가짜 fixture CSV용 빈 폴더는 없다. 실행 산출물은 `CPV26_HOME` 아래에
-생성한다.
+가짜 데이터 파일이나 fixture CSV용 빈 폴더는 없다. 원본·DB·모델·보고서는
+`CPV26_HOME` 아래에 생성하며 기본값은 Git에서 제외되는 `var/`다.
 
 ## 4. Linux 설치와 profile
 
@@ -148,26 +171,30 @@ Windows `.venv`는 복사하지 않는다. MobaXterm SFTP로 소스만 올린 �
 
 ```bash
 cd ~/projects/cpv26-predictor
-bash scripts/setup.sh base
-cp .env.example .env
+bash scripts/setup.sh tabular
+test -f .env || cp .env.example .env
 source scripts/activate.sh
-cpv26 db-init
+cpv26 kbo-fetch
+cpv26 kbo-import
 cpv26 db-check
+cpv26 kbo-match-evaluate
+cpv26 kbo-live-hit-evaluate
 ```
 
 `setup.sh`는 기본적으로 `python3`를 사용하고 Python 3.10~3.12인지 검사한다. 서버의
 Python 명령이 다르면 다음처럼 지정한다.
 
 ```bash
-PYTHON_BIN=python3.11 bash scripts/setup.sh base
+PYTHON_BIN=python3.11 bash scripts/setup.sh tabular
 ```
 
-Profile은 네 개다.
+Profile은 다섯 개다.
 
 | profile | 설치 내용 | 용도 |
 |---|---|---|
 | `base` | runtime만 | DB, feature, snapshot, CLI |
 | `dev` | runtime + Ruff/mypy/pytest/coverage | 개발·검증 |
+| `tabular` | runtime + dev + CatBoost | 실제 KBO baseline; PyTorch 불필요 |
 | `ml-cpu` | runtime + dev + CatBoost + 공식 CPU PyTorch wheel | CPU smoke/train |
 | `ml-cuda` | runtime + dev + CatBoost, 기존 CUDA torch 검사 | GPU 서버 |
 
@@ -211,18 +238,21 @@ import하지 않지만 DuckDB `TIMESTAMPTZ`→Python timezone datetime 변환 �
 `requirements/constraints.txt`는 Python 3.12에서 검증한 core/dev와 CatBoost 버전을
 고정한다. CUDA PyTorch wheel만 GPU host의 driver/runtime에 맞춰 선택한다.
 
-현재 CPU 검증 버전:
+현재 실제 데이터 CPU 검증 버전:
 
 ```text
 Python    3.12.13
 DuckDB    1.5.5
 NumPy     2.2.6
-PyTorch   2.13.0+cpu
 CatBoost  1.2.10
 pytest    8.4.2
 Ruff      0.16.5
 mypy      1.20.2
 ```
+
+이번 `.venv`는 `tabular` 환경이므로 PyTorch를 설치하지 않았다. 이전 프레임워크
+검증에서는 별도 full-ML 환경의 PyTorch `2.13.0+cpu`로 neural 테스트를 실행했다.
+그 결과를 이번 실제 데이터 RelGNN 학습 결과로 간주하면 안 된다.
 
 ## 6. 환경 설정
 
@@ -255,7 +285,20 @@ CPV26_LOG_LEVEL=INFO
   → recommendation artifact
 ```
 
-현재 repository 내부에서 구현된 구간:
+현재 실제 데이터로 끝까지 실행한 구간:
+
+```text
+공개 KBO Parquet(revision + SHA-256 고정)
+  → pitch를 PA·경기 단위로 축약하고 품질 보고
+  → canonical DuckDB
+  ├→ 과거 팀 성적·Elo → 승/무/패 CatBoost → 시즌 평가 JSON + .cbm
+  └→ 과거 선수·상대팀 성적 → 1안타 이상 CatBoost → 시즌 평가 JSON + .cbm
+```
+
+두 모델은 label·feature·loss·모델 파일이 별도다. 안타 모델은 실제 PA가 관측된
+선수만 평가하므로, 후보 중 미출전까지 포함한 Live Hit 추천 확률과 같지 않다.
+
+기존 연구 프레임워크에서 단위 테스트로 연결한 구간:
 
 ```text
 append-only DB
@@ -266,16 +309,17 @@ append-only DB
   → optimizer primitive
 ```
 
-현재 끊긴 구간:
+당일 RelGNN 추천기로 연결하려면 남은 구간:
 
-- 공급자 feed→정규화 row
 - snapshot Parquet→mini-batch graph tensor
-- 실제 시즌 fold dataset/job→trainer 입력
+- 실제 시즌 fold dataset/job→multi-task neural trainer 입력
 - 학습 산출물→당일 inference orchestration
+- 출전 확률·라인업·포지션 자격·선택률을 포함한 실제 후보 입력
 - 공식 V26 점수표·구간표 replay→verified scoring configuration
 
-따라서 각 부품을 import해 사용할 수는 있지만 단일 `train` 또는 `predict-today` 명령은
-아직 없다.
+`kbo-match-evaluate`와 `kbo-live-hit-evaluate`는 실제 학습도 수행한다. 단일 RelGNN
+`train`이나 `predict-today` 명령은 아직 없다. 또한 이번 공개 파일에는 당시 게시 시각이
+없어 날짜 기준 보수적 이력 재구성을 사용한다. 엄밀한 과거 공개시각 replay는 아니다.
 
 ## 8. 시간 계약
 
@@ -374,8 +418,9 @@ v3 legacy 행에는 알 수 없는 전후 상태를 만들어 넣지 않는다. 
 - 공식 V26 점수 화면에서 검증한 과거 규칙·선택률 replay fixture
 - 공식 기록원 수준의 RBI/earned-run 판정 원장
 
-테이블이 있다는 것은 수집기가 있다는 뜻이 아니다. 이 저장소에는 provider adapter나
-실데이터가 아직 없다.
+선택한 공개 데이터 adapter는 `source_revision`, `team`, `player`, `game`, `team_game`,
+`observed_plate_appearance` 여섯 테이블을 채운다. 나머지 테이블의 데이터까지 확보한
+것은 아니다. 선수 공식 박스스코어·RBI·실책·라인업·주루 이벤트를 임의로 만들지 않는다.
 
 ## 10. As-of query
 
@@ -1116,6 +1161,10 @@ cpv26 show-config
 cpv26 db-init
 cpv26 db-check
 cpv26 snapshot-build <prediction-run-id>
+cpv26 kbo-fetch
+cpv26 kbo-import
+cpv26 kbo-match-evaluate
+cpv26 kbo-live-hit-evaluate
 ```
 
 `db-init`:
@@ -1135,15 +1184,27 @@ cpv26 snapshot-build <prediction-run-id>
 - deterministic Parquet materialization
 - manifest/hash 검증
 
-아직 없는 CLI:
+`kbo-fetch` / `kbo-import`:
 
-- ingest
-- feature-build
-- graph-build
-- train
-- evaluate
-- predict
-- optimize-today
+- 기본 시즌은 완결된 2023~2025다. `--year` 반복으로 선택하며 2026은 7월 26일까지다.
+- 다운로드는 고정 revision과 파일별 SHA-256을 검사하고 `SOURCE.json`을 남긴다.
+- importer는 schema 초기화, deterministic ID 적재, 참조 감사와 품질 보고를 수행한다.
+- 기본 경로는 `var/datasets/kbo_playbyplay/v0/`와 `var/reports/kbo_import.json`이다.
+
+`kbo-match-evaluate` / `kbo-live-hit-evaluate`:
+
+- `tabular` 설치가 필요하다. 각각 2023→2024, 2023~2024→2025 두 fold를 학습한다.
+- 과거 날짜만 feature에 반영하고 같은 날짜 경기는 일괄 예측한 뒤 이력을 갱신한다.
+- `--iterations` 기본값은 400, `--report`로 JSON 경로를 지정할 수 있다.
+- 모델별 `var/reports/kbo_*_baseline.json`과
+  `var/models/kbo_*_baseline/<run-id>/{validation_2024,test_2025}.cbm`을 저장한다.
+- 실행별 모델 폴더에는 `evaluation.json`도 보존한다. 기본 보고서만 최신 결과로
+  교체하고 이전 모델은 덮어쓰지 않는다. 모델 SHA-256을 평가 JSON에 기록한다.
+- 평가 JSON에는 학습 기간, parameter, feature 목록, log loss/Brier/ECE/accuracy,
+  학습 구간 빈도 기준선과 조건부 모집단 한계를 함께 기록한다.
+
+아직 없는 CLI는 범용 provider ingest, graph tensor 생성, RelGNN 실제 시즌 학습,
+당일 inference와 `optimize-today`다. 데이터 적재나 baseline 평가 전체가 없는 것은 아니다.
 
 ## 27. 테스트와 검증 결과
 
@@ -1163,24 +1224,25 @@ python -m pip wheel . --no-deps -w /tmp/cpv26-wheel
 ```text
 compileall: passed
 Ruff:       all checks passed
-mypy:       42 source files, no issues
-pytest:     117 passed in 11.63s
+mypy:       47 source files, no issues
+pytest:     145 passed, 17 skipped (tabular; PyTorch not installed)
 pip check:  no broken requirements
 wheel:      cpv26_predictor-0.4.0-py3-none-any.whl built
 ```
 
-검증 환경은 Python 3.12.13, DuckDB 1.5.5, PyTorch 2.13.0+cpu, CatBoost 1.2.10이다.
-선택 의존성이 없는 번들 환경에서는 99 passed/18 skipped였고, 별도 임시 full-ML
-환경에서는 117개가 한 프로세스에서 skip 없이 통과했다. wheel 크기는 134,218 bytes,
-SHA-256은 `88aa809689dafb1369007da7930064aeb1f952da021cb6799908c016ae6dcc41`이며
-`dataset_contracts.py`와 `schema_v4.py` 포함을 확인했다. 최종 운영 대상 Linux에서는
-동일 suite와 CUDA 검증을 다시 실행해야 한다.
+현재 검증 환경은 Python 3.12.13, DuckDB 1.5.5, CatBoost 1.2.10의 `tabular` 환경이다.
+17개 neural 테스트는 PyTorch 미설치로 skip된다. 이전 변경 시점의 별도 full-ML 환경에서는
+당시 117개 테스트가 skip 없이 통과했으나, 이는 이번 실제 데이터 RelGNN 학습 검증이 아니다.
+
+Windows 실행 중 native 의존성 검사·import 경로에서 `Windows fatal exception: access violation`
+진단이 출력되었지만 pytest는 계속 실행되어 exit code 0으로 종료했다. 원인을 해결했다고
+주장하지 않는다. Linux가 실제 실행 대상이며 동일 suite와 필요한 CUDA 검증을 수행해야 한다.
 
 Test file별 수:
 
 | file | tests |
 |---|---:|
-| `test_cli.py` | 1 |
+| `test_cli.py` | 6 |
 | `test_config.py` | 2 |
 | `test_dataset_contracts.py` | 19 |
 | `test_dataset_integrity_v4.py` | 2 |
@@ -1188,6 +1250,10 @@ Test file별 수:
 | `test_domain.py` | 3 |
 | `test_evaluation.py` | 6 |
 | `test_graph_models.py` | 13 |
+| `test_kbo_ingest.py` | 4 |
+| `test_kbo_live_hit_baseline.py` | 19 |
+| `test_kbo_match_baseline.py` | 11 |
+| `test_kbo_playbyplay_source.py` | 6 |
 | `test_live_hit_point_in_time.py` | 7 |
 | `test_live_hit_rules.py` | 8 |
 | `test_model_output_contracts.py` | 3 |
@@ -1195,9 +1261,19 @@ Test file별 수:
 | `test_point_in_time.py` | 14 |
 | `test_simulation_optimization.py` | 15 |
 | `test_task_training.py` | 11 |
-| 합계 | 117 |
+| 합계 | 162 |
 
-실제로 실행한 optional runtime 검증:
+이번 실제 데이터 실행:
+
+- 2023~2026 원본 805,960 pitches 다운로드·SHA-256 검증
+- 2,630경기·206,583 완료 라벨 PA의 DB 적재와 재적재 중복 방지
+- 누락 label 550개, 점수 전이 불일치 13개, 원본 sequence gap 53개의 품질 보고
+- 2023~2025 경기 2,160개로 경기 모델 두 fold 학습·평가
+- 같은 기간 선수-경기 49,091개로 안타 모델 두 fold 학습·평가
+- fold별 학습 빈도 기준선 비교와 네 개의 CatBoost `.cbm` 파일 저장
+- 모델 재로드 후 보고서 log loss 일치, 모델 SHA-256·실행별 평가 JSON 보존
+
+이전 full-ML 환경에서 실행한 optional neural runtime 검증:
 
 - role encoder→RelGNN route→PA decoder/direct player head forward/backward
 - finite gradient 확인
@@ -1209,7 +1285,6 @@ Test file별 수:
 - 세 task loader alternating update와 shared-backbone/task-head gradient 분리
 - checkpoint restore와 lineage mismatch 차단
 - DirectRun output contract
-- CatBoost fit/predict
 
 실행하지 못한 검증:
 
@@ -1217,7 +1292,7 @@ Test file별 수:
 - A6000 48GB peak memory
 - A100 10GB MIG peak memory/OOM boundary
 - Linux driver별 CUDA wheel compatibility
-- 실제 KBO multi-season walk-forward
+- 실제 KBO RelGNN/multi-task 학습 및 당일 V26 추천 replay
 
 Windows CPU 통과를 GPU production 검증으로 해석하면 안 된다.
 
@@ -1275,16 +1350,24 @@ Windows CPU 통과를 GPU production 검증으로 해석하면 안 된다.
 
 ### 데이터
 
-- 실제 provider adapter가 없다.
-- 저장소에 실제 KBO/V26 row가 없다.
-- KBO 내부 ID crosswalk가 없다.
-- source licensing/retention policy가 코드화되지 않았다.
+- 공개 Hugging Face KBO source의 downloader와 importer는 있다. 다중 공급자 crosswalk,
+  공식 licensed production feed와 V26 실제 화면 데이터는 없다.
+- 실제 KBO 원본·DB는 로컬 `var/`에 보관하고 Git에는 넣지 않는다.
+- 원본 선수/팀/경기 ID를 namespace로 보존하지만 다른 공급자와의 ID 통합은 하지 않았다.
+- dataset 작성자의 CC BY 4.0 표기와 출처·revision·hash를 기록했다. 원출처의 권리·약관과
+  서비스 운영 허가는 별도 확인이 필요하다.
+- 원본의 정확한 발표·정정 시각이 없어 날짜 기반 retrospective 이력 재구성만 가능하다.
+- 누락 PA와 점수·sequence 불일치가 있어 `simulator_ready=false`다.
 - 2018~2025 당시 발표된 날씨 예보 revision archive를 확보하지 않았다.
 - 2026 V26 네 phase 선택률·자격·규칙 snapshot 수집을 아직 시작하지 않았다.
 
 ### 모델
 
 - in-memory alternating trainer는 있으나 snapshot/Parquet data loader와 production job이 없다.
+- 실제 CatBoost 모델은 학습했으나 승부예측이 빈도 기준선보다 낮고, Live Hit는 연도별
+  성능이 일관되지 않는다. 두 모델의 calibration은 아직 fitting하지 않았다.
+- 안타 baseline은 관측 PA가 있는 선수 조건부다. 미출전 확률이나 실제 V26 후보·보너스
+  최적화 전체를 학습한 모델이 아니다.
 - GraphSAGE benchmark가 없다.
 - hyperparameter tuning budget contract가 없다.
 - AMP, distributed training, gradient accumulation과 model registry가 없다.
@@ -1312,16 +1395,17 @@ Windows CPU 통과를 GPU production 검증으로 해석하면 안 된다.
 
 ## 30. 다음 구현 우선순위
 
-### P0 — 실제 데이터 baseline
+### P0 — 실제 데이터 baseline에서 남은 과제
 
-1. 허가된 source 한 개를 선택한다.
-2. immutable raw landing + checksum을 만든다.
-3. player/team/game ID crosswalk를 만든다.
-4. PIT normalization adapter를 만든다.
-5. `db-check`와 snapshot을 실제 시즌 slice에서 통과시킨다.
-6. CatBoost PA/player-hit/WDL baseline을 end-to-end로 만든다.
-7. 2026 V26 네 phase capture와 날씨 forecast revision 수집을 즉시 시작한다.
-8. 2018~2025 historical weather는 archive가 확인된 revision만 forecast 실험에 넣는다.
+공개 source 선택, checksum 다운로드, namespaced ID adapter, 실제 DB 참조 감사,
+WDL·조건부 player-hit 학습/평가/저장은 완료했다.
+
+1. 원본 누락·점수·교체 상태를 공식 기록과 대조하여 simulator용 데이터 품질을 확보한다.
+2. 선발·라인업·출전 후보와 발표 시각을 확보하고 당일 출전 확률을 별도로 모델링한다.
+3. 시간순 validation에서 feature·regularization·calibration을 검증한다.
+4. 실제 PA 다중분류 baseline을 연결한다. 현재 결과는 WDL과 player-hit 두 작업이다.
+5. 2026 V26 네 phase capture와 weather forecast revision 수집 정책을 확정한다.
+6. 과거 weather는 확인 가능한 발표 revision만 forecast 실험에 넣는다.
 
 ### P1 — 학습 infrastructure
 
@@ -1345,7 +1429,7 @@ Windows CPU 통과를 GPU production 검증으로 해석하면 안 된다.
 
 ### P3 — model benchmark
 
-1. CatBoost
+1. 현재 CatBoost와 빈도 기준선을 동일 조건으로 재검증
 2. MLP
 3. GraphSAGE
 4. 현재 RelGNN
@@ -1513,11 +1597,19 @@ correctness / leakage / migration / baseball rule
 - Ruff/mypy/pytest/wheel 검증
 - README/code summary/hand-off 일치
 
+실제 데이터 baseline 단계에서 추가로 완료한 항목:
+
+- 고정 revision 다운로드·hash·출처 manifest
+- pitch→경기/PA 정규화와 source 품질 보고
+- 경기 WDL과 선수 any-hit의 별도 데이터셋·모델·loss
+- 2024 validation / 2025 test 및 학습 빈도 기준선 비교
+- 평가 JSON과 fold별 학습 모델 파일 저장
+
 실전 추천기 완료 기준은 아직 충족하지 않았다.
 
 - licensed production data
 - provider replay
-- trained and calibrated baseline
+- 기준선 우위와 calibration이 확인된 모델(학습 자체는 완료)
 - comparable graph benchmark
 - GPU training artifacts
 - actual V26 ruleset replay
