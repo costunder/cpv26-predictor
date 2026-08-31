@@ -13,6 +13,7 @@ import numpy as np
 
 import cpv26.data.kbo_graph_dataset as graph_module
 from cpv26.data.kbo_graph_dataset import KBOGraphDataset, build_kbo_graph_dataset
+from cpv26.data.kbo_player_identity import historical_player_prior
 from cpv26.data.schema_v5 import V5_DDL
 from test_kbo_graph_dataset import _database
 
@@ -110,7 +111,7 @@ def test_boxscore_targets_use_actual_counts_and_missing_pa_lower_bounds(tmp_path
     dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
     first, second = dataset.load_day("2001-04-01"), dataset.load_day("2001-04-02")
 
-    assert dataset.manifest["dataset_version"] == 3
+    assert dataset.manifest["dataset_version"] == 4
     assert dataset.manifest["boxscore_feature_dims"] == {"batting": 19, "pitching": 21}
     assert first.live_hit_pa.tolist() == [4]
     assert first.live_hit_pa_min.tolist() == [4]
@@ -136,7 +137,7 @@ def test_boxscore_targets_use_actual_counts_and_missing_pa_lower_bounds(tmp_path
     assert coverage["box_target_missing_reasons"]["live_hit_no_observed_appearance"] == 1
 
 
-def test_all_past_rows_contribute_priors_without_merging_names_or_current_roster(
+def test_all_past_rows_contribute_priors_without_merging_observation_ids_or_current_roster(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "canonical.duckdb"
@@ -150,7 +151,9 @@ def test_all_past_rows_contribute_priors_without_merging_names_or_current_roster
 
     assert "observed:bat1" not in second.player_ids  # Not retained as a guessed career identity.
     assert "observed:bat2" in second.player_ids
-    proxy = "kbo-team-role-prior:batting:away"
+    identity = historical_player_prior("away", "batting", "동명이인")
+    assert identity.identity_status == "source_name_team_cohort"
+    proxy = identity.prior_id
     assert proxy in second.player_ids
     query = second.player_ids.index("observed:bat2")
     prior = second.player_ids.index(proxy)
@@ -160,11 +163,22 @@ def test_all_past_rows_contribute_priors_without_merging_names_or_current_roster
     assert second.player_box_batting_features[query, 0] == np.float32(
         math.log1p(3) / math.log1p(500)
     )
-    assert not second.role_features["batting"][query].any()  # No invented personal PA history.
+    # Complete observed outcome totals can populate the same legacy feature
+    # layout, but remain explicitly uncertain cohort history, not a career ID.
+    np.testing.assert_array_equal(
+        second.role_features["batting"][query], second.role_features["batting"][prior]
+    )
+    np.testing.assert_allclose(
+        second.role_features["batting"][query, :7],
+        [math.log1p(4) / math.log1p(500), 3 / 4, 1 / 4, 1 / 16, 1 / 4, 1 / 4, 0],
+    )
     route = second.routes["batter_participation_team"]
     assert route["source_index"].tolist() == [prior]
     assert query not in route["source_index"]  # Current actual roster cannot influence team nodes.
-    assert np.all(route["event_features"][:, :5] == 0)  # Participation is not a fabricated PA.
+    np.testing.assert_allclose(
+        route["event_features"][0, :5],
+        [math.log1p(4) / math.log1p(100), 1 / 4, 1 / 4, 1 / 4, 1 / 16],
+    )
     assert np.all(route["event_age_seconds"] >= route["publication_delay_seconds"])
 
 
@@ -308,7 +322,8 @@ def test_streamed_records_drop_unused_payload_only_after_full_provenance_hash(
     boxes = [record for record in records if record.kind.startswith("box_")]
     assert len(boxes) == 6
     assert all("raw_json" not in record.data for record in boxes)
-    assert all("display_name" not in record.data for record in boxes)
+    # The name is now a used cohort key; full raw payload remains hash-only.
+    assert all(record.data["display_name"] == "동명이인" for record in boxes)
     before = build_kbo_graph_dataset(database, tmp_path / "before")
     with duckdb.connect(str(database)) as connection:
         # This unused source payload must remain part of provenance, even though
@@ -344,7 +359,7 @@ def test_all_missing_placeholder_is_audited_without_false_participation_history(
         connection.execute(V5_DDL[0])
         _box(connection, "missing-placeholder", 1, "batting", {})
     dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
-    assert dataset.manifest["boxscore_history_policy"] == "observed_fields_only_v1"
+    assert dataset.manifest["boxscore_history_policy"] == "common_player_game_observed_fields_v2"
     first, second = dataset.load_day("2001-04-01"), dataset.load_day("2001-04-02")
     assert first.live_hit_pa.size == first.box_pa_counts.size == 0
     assert second.player_ids == ()

@@ -62,6 +62,8 @@ class KBOTrainingConfig:
     run_weight: float = 0.1
     box_pa_weight: float = 0.2
     box_pitch_weight: float = 0.1
+    selection_target: str = "auto"
+    box_gradient_mode: str = "auto"
     max_days_per_split: int | None = None
     train_seasons: tuple[int, ...] = (2023,)
     validation_season: int = 2024
@@ -109,6 +111,10 @@ class KBOTrainingConfig:
             raise ValueError("amp must be auto, off, fp16, or bf16")
         if not isinstance(self.chronological, bool):
             raise ValueError("chronological must be a boolean")
+        if self.selection_target not in {"auto", "match", "weighted"}:
+            raise ValueError("selection_target must be auto, match, or weighted")
+        if self.box_gradient_mode not in {"auto", "shared", "head_only"}:
+            raise ValueError("box_gradient_mode must be auto, shared, or head_only")
         seasons = (*self.train_seasons, self.validation_season, self.test_season)
         if any(
             isinstance(year, bool) or not isinstance(year, int) or not 1 <= year <= 9999
@@ -383,7 +389,60 @@ def _model_config(dataset: KBOGraphDataset, config: KBOTrainingConfig) -> KBORel
         include_boxscore_heads=manifest["dataset_version"] >= 3,
         box_batting_feature_dim=manifest.get("boxscore_feature_dims", {}).get("batting", 19),
         box_pitching_feature_dim=manifest.get("boxscore_feature_dims", {}).get("pitching", 21),
+        box_gradient_mode=_training_policies(config)["box_gradient_mode"],
     )
+
+
+def _training_policies(config: KBOTrainingConfig) -> dict[str, str]:
+    """Keep defaults stable; objective and gradient isolation are explicit controls."""
+    return {
+        "selection_target": "weighted" if config.selection_target == "auto"
+        else config.selection_target,
+        "box_gradient_mode": "shared" if config.box_gradient_mode == "auto"
+        else config.box_gradient_mode,
+    }
+
+
+def _gradient_parameter_groups(model: Any) -> dict[str, list[Any]]:
+    if model.config.include_boxscore_heads and model.config.box_gradient_mode == "head_only":
+        groups: dict[str, list[Any]] = {"primary": [], "box_heads": []}
+        for name, parameter in model.named_parameters():
+            group = (
+                "box_heads" if name.startswith(("box_pa_head.", "box_pitch_head.")) else "primary"
+            )
+            groups[group].append(parameter)
+        return groups
+    return {"shared": list(model.parameters())}
+
+
+def _clip_gradient_norms(model: Any, max_norm: float) -> dict[str, Any]:
+    """Detached auxiliary gradients must not rescale primary gradients via clipping."""
+    torch, _ = require_torch()
+    return {
+        name: torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+        for name, parameters in _gradient_parameter_groups(model).items()
+    }
+
+
+def _policy_report(config: KBOTrainingConfig, model_config: KBORelGNNConfig) -> dict[str, Any]:
+    groups = "primary_and_box_heads_separately" if (
+        model_config.include_boxscore_heads and model_config.box_gradient_mode == "head_only"
+    ) else "all_parameters_together"
+    return {
+        "requested_selection_target": config.selection_target,
+        "selection_target": _training_policies(config)["selection_target"],
+        "requested_box_gradient_mode": config.box_gradient_mode,
+        "box_gradient_mode": model_config.box_gradient_mode,
+        "gradient_clipping": groups,
+        "loss_weights": {
+            name: getattr(config, f"{name}_weight")
+            for name in ("match", "live_hit", "pa", "run", "box_pa", "box_pitch")
+        },
+        "scope": "box gradient isolation does not isolate the original match/live_hit/pa/run tasks",
+        "fp16_overflow_policy": (
+            "GradScaler-detected nonfinite gradients skip the whole optimizer step"
+        ),
+    }
 
 
 def _runtime_memory(device: Any) -> dict[str, int]:
@@ -555,9 +614,18 @@ def _evaluate_model(
                                 row["observed_pa_lower_bound"] = int(pa_minimum[index])
                         predictions[name].append(row)
     means = {name: sums[name] / max(1, counts[name]) for name in sums}
+    contributions = {name: means[name] * getattr(config, f"{name}_weight") for name in means}
+    weighted_loss = sum(contributions.values())
+    selection_target = _training_policies(config)["selection_target"]
+    if selection_target == "match" and not counts["match"]:
+        raise ValueError("match checkpoint selection requires observed match labels")
     result: dict[str, Any] = {
         "losses": means,
-        "selection_loss": sum(means[name] * getattr(config, f"{name}_weight") for name in means),
+        "loss_sample_counts": counts,
+        "weighted_loss_contributions": contributions,
+        "weighted_multitask_loss": weighted_loss,
+        "selection_target": selection_target,
+        "selection_loss": means["match"] if selection_target == "match" else weighted_loss,
     }
     for name in probabilities:
         if probabilities[name]:
@@ -754,6 +822,7 @@ def train_kbo_relgnn(
                 "training_order": training_order,
                 "split_summary": split_summary,
                 "model": model_config.to_dict(),
+                "training_policies": _policy_report(options, model_config),
                 "runtime": runtime,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
@@ -768,6 +837,11 @@ def train_kbo_relgnn(
         f"Training seasons={','.join(map(str, options.train_seasons))}; "
         f"validation={options.validation_season}; test={options.test_season}; "
         f"order={training_order}; train_games={split_summary['train']['games']:,}"
+    )
+    policy = _policy_report(options, model_config)
+    progress(
+        f"Checkpoint selection={policy['selection_target']}; "
+        f"box gradients={policy['box_gradient_mode']}; clipping={policy['gradient_clipping']}"
     )
     if options.chronological:
         progress(
@@ -788,6 +862,11 @@ def train_kbo_relgnn(
         )
         sums = dict.fromkeys(task_names, 0.0)
         counts = dict.fromkeys(sums, 0)
+        gradient_audit = {
+            name: {"steps": 0, "clipped_steps": 0, "nonfinite_steps": 0,
+                   "max_finite_preclip_norm": 0.0}
+            for name in _gradient_parameter_groups(model)
+        }
         for index, raw_batch in enumerate(loader):
             batch = _move(raw_batch, device)
             with torch.autocast(device.type, enabled=dtype is not None, dtype=dtype):
@@ -803,8 +882,21 @@ def train_kbo_relgnn(
                 counts[name] += count
             if (index + 1) % options.accumulate_steps == 0 or index + 1 == len(loader):
                 scaler.unscale_(optimizer)
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), options.gradient_clip)
-                if not scaler.is_enabled() and not bool(torch.isfinite(norm)):
+                norms = _clip_gradient_norms(model, options.gradient_clip)
+                finite_gradients = True
+                for name, norm in norms.items():
+                    value = float(norm.detach().cpu())
+                    audit = gradient_audit[name]
+                    audit["steps"] += 1
+                    if math.isfinite(value):
+                        audit["clipped_steps"] += int(value > options.gradient_clip)
+                        audit["max_finite_preclip_norm"] = max(
+                            audit["max_finite_preclip_norm"], value
+                        )
+                    else:
+                        audit["nonfinite_steps"] += 1
+                        finite_gradients = False
+                if not scaler.is_enabled() and not finite_gradients:
                     raise FloatingPointError("non-finite RelGNN gradients")
                 previous_scale = scaler.get_scale()
                 scaler.step(optimizer)
@@ -838,6 +930,7 @@ def train_kbo_relgnn(
             "skipped_optimizer_steps": skipped_optimizer_steps,
             "train_losses": {name: sums[name] / max(1, counts[name]) for name in sums},
             "training_samples": counts,
+            "gradient_audit": gradient_audit,
             "validation": validation,
             "elapsed_seconds": time.monotonic() - started,
             "best_epoch": best_epoch,
@@ -880,6 +973,7 @@ def train_kbo_relgnn(
         "runtime": runtime,
         "configuration": asdict(options),
         "model_config": model_config.to_dict(),
+        "training_policies": policy,
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "training_seasons": list(options.train_seasons),
         "validation_season": options.validation_season,
@@ -1034,6 +1128,7 @@ def evaluate_kbo_relgnn(
         "days": len(days),
         "runtime": runtime,
         "metrics": metrics,
+        "training_policies": _policy_report(options, model.config),
         "prediction_artifacts": artifacts,
         "output_directory": str(output),
         "smoke_test_only": options.max_days_per_split is not None,

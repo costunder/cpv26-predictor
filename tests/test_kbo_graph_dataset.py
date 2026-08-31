@@ -218,6 +218,8 @@ def test_2001_game_only_graph_preserves_scores_without_fabricating_player_labels
             "observed_completed_pa": 0,
             "live_hit_queries": 0,
             "pa_queries": 0,
+            "pa_derived_batting_queries": 0,
+            "pa_derived_pitching_queries": 0,
             "box_batting_rows": 0,
             "box_pitching_rows": 0,
             "box_pa_queries": 0,
@@ -461,7 +463,7 @@ def test_incomplete_transition_masks_only_pa_score_context(tmp_path: Path) -> No
     """)
     connection.close()
     after = build_kbo_graph_dataset(database, tmp_path / "after")
-    assert after.manifest["dataset_version"] == 3
+    assert after.manifest["dataset_version"] == 4
     assert after.manifest["pa_incomplete_transition_context"] == "mask_pre_scores_unknown"
     assert after.manifest["fingerprint"] != before.manifest["fingerprint"]
     quality = after.manifest["label_quality"]

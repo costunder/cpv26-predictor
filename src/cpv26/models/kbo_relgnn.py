@@ -89,6 +89,7 @@ class KBORelGNNConfig:
     include_boxscore_heads: bool = False
     box_batting_feature_dim: int = 19
     box_pitching_feature_dim: int = 21
+    box_gradient_mode: str = "shared"
 
     def __post_init__(self) -> None:
         for name in ("node_feature_dims", "role_feature_dims", "route_feature_dims"):
@@ -124,6 +125,8 @@ class KBORelGNNConfig:
             raise ValueError("include_boxscore_heads must be boolean")
         if self.box_batting_feature_dim < 1 or self.box_pitching_feature_dim < 1:
             raise ValueError("box-score feature widths must be positive")
+        if self.box_gradient_mode not in {"shared", "head_only"}:
+            raise ValueError("box_gradient_mode must be shared or head_only")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +144,7 @@ class KBORelGNNConfig:
             "include_boxscore_heads": self.include_boxscore_heads,
             "box_batting_feature_dim": self.box_batting_feature_dim,
             "box_pitching_feature_dim": self.box_pitching_feature_dim,
+            "box_gradient_mode": self.box_gradient_mode,
         }
 
 
@@ -311,9 +315,14 @@ class KBORelGNNModel(ModuleBase):
                 player = player_states[batch[f"{task}_player_index"]]
                 team = teams[batch[f"{task}_team_index"]]
                 opponent = teams[batch[f"{task}_opponent_index"]]
-                values = head(
-                    torch.cat((player, team, opponent, player * opponent, team - opponent), dim=-1)
-                ).float()
+                features = torch.cat(
+                    (player, team, opponent, player * opponent, team - opponent), dim=-1
+                )
+                if self.config.box_gradient_mode == "head_only":
+                    # This opt-in policy trains the aggregate heads but prevents
+                    # their labels from changing the shared representation.
+                    features = features.detach()
+                values = head(features).float()
                 if task == "box_pa":
                     output["box_pa_logits"] = values
                 else:

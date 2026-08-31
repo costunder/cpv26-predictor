@@ -5,6 +5,10 @@ RelGNN 프로젝트입니다. 설치 명령은 Linux/Bash 기준이며, Python�
 
 V26 계정별 당일 추천 기능은 아직 구현되지 않았습니다.
 
+v4는 과거 박스스코어와 최근 타석 기록의 통계 입력을 연결합니다. 기존 v3 학습자는
+`git pull --ff-only` 후 4절의 그래프 생성부터 실행합니다. 환경 재설치·원천 재다운로드·
+DB 재적재는 필요 없습니다. 기존 그래프와 checkpoint는 보존하고 새 경로를 사용합니다.
+
 ## 1. 프로젝트 받기
 
 공개 저장소이므로 로그인이나 토큰 없이 받을 수 있습니다.
@@ -120,7 +124,7 @@ cpv26 kbo-fetch --year 2023 --year 2024 --year 2025 --year 2026 &&
 cpv26 kbo-import --year 2023 --year 2024 --year 2025 --year 2026 &&
 cpv26 db-check &&
 cpv26 kbo-graph-build \
-  --output var/datasets/kbo_graph_2001_2026_full \
+  --output var/datasets/kbo_graph_2001_2026_v4 \
   --start-date 2001-01-01 \
   --end-date 2026-07-26
 ~~~
@@ -130,7 +134,7 @@ cpv26 kbo-graph-build \
 | 기간 | 학습에 쓰는 기록 |
 |---|---|
 | 2001~2022 | 경기·득점, 선수별 타격·투구 합계, 확인된 이닝별 타격 결과 → 경기·안타·타격 집계·투구 헤드 |
-| 2023~2025 | 경기 결과와 관측 타석 → Match·득점·PA·LiveHit 헤드 |
+| 2023~2025 | 경기 결과와 관측 타석, 그 타석의 선수·경기별 집계 → 같은 통계 입력과 전체 헤드 |
 | 2026 | 7월 26일까지의 같은 항목, 별도 테스트 |
 
 타자·투수 원문을 전부 보존하고, 읽을 수 있는 항목은 각각 학습에 연결합니다.
@@ -139,8 +143,13 @@ cpv26 kbo-graph-build \
 타자·투수·안타·타격 결과 사용 건수와 사용할 수 없는 항목의 사유를 남깁니다.
 
 옛 원천에는 고유 선수 ID가 없어 이름이 같다고 동일 선수로 합치지 않습니다.
-각 원천 행을 별도로 유지하며, 이 행의 예측 입력은 과거 팀별 타격·투구 이력입니다.
-따라서 아직 선수 개인의 2001~2026 경력을 연결한 모델은 아닙니다.
+각 원천 행을 별도로 유지하며, 과거의 같은 이름·팀·역할로 묶인 통계를 입력으로 사용합니다.
+동명이인이 섞일 수 있는 그룹이지 확인된 개인 이력이 아닙니다. 이름이 없거나 이전
+그룹 기록이 없으면 팀 통계를 사용합니다. 개인의 2001~2026 경력을 연결했다는 뜻은 아닙니다.
+
+최근 타석도 선수·경기별로 집계하므로 2023년 이후 통계 블록이 통째로 0이 되던 문제를
+해결합니다. 필드별 관측 횟수는 타석 수가 아닌 선수·경기 수입니다. 타석만으로 확정할
+수 없는 타자 득점/RBI, 투수 투구 수/아웃/실점/자책점은 결측으로 유지합니다.
 
 생성 위치는 다음과 같습니다.
 
@@ -151,7 +160,7 @@ cpv26 kbo-graph-build \
 | var/cpv26.duckdb | 정규화한 선수·팀·경기·타석 DB |
 | var/reports/kbo_history_import.json | 역사 경기 적재·중복·연도별 제공 범위 |
 | var/reports/kbo_import.json | 타석 원천 적재 결과와 품질 검사 |
-| var/datasets/kbo_graph_2001_2026_full/ | 선수 박스스코어를 포함한 v3 날짜별 그래프 |
+| var/datasets/kbo_graph_2001_2026_v4/ | 시기 간 통계 입력을 연결한 v4 날짜별 그래프 |
 
 두 fetch 명령은 고정된 공개 파일과 SHA-256을 확인합니다. 같은 파일과 적재 행은
 재실행 시 재사용합니다. 기존 `var/datasets/kbo_graph/`와 checkpoint는 건드리지 않습니다.
@@ -166,14 +175,25 @@ kbo-graph-build는 대상 날짜 이전의 최대 90일 관계를 사용해 날�
 90일은 입력 이력 범위이고, 학습 기간을 최근 90일로 제한한다는 뜻은 아닙니다.
 원천의 당시 발표 시각은 재구성한 값이므로 실시간 운영 재현과는 구분합니다.
 
+생성 후 전 기간 입력을 검사합니다. 파일 무결성·정보 시점·연도별 입력 사용량과 선수
+입력의 다양성을 검사하며, 최근 자료의 통계 입력이 비어 있으면 오류로 종료합니다.
+
+~~~bash
+python scripts/audit_cross_era_graph.py var/datasets/kbo_graph_2001_2026_v4 \
+  --output var/reports/cross_era_v4.json
+~~~
+
+검사는 입력 연결을 확인하는 것이며 예측 성능 향상을 입증하는 검사는 아닙니다.
+[실데이터 3,968일 대조 결과](docs/CROSS_ERA_VALIDATION.md)에 수정 전후 입력과 정답 보존 검사를 기록했습니다.
+
 ## 5. 2001년부터 RelGNN 학습
 
 4절이 끝난 뒤 실행합니다. A100 MIG 10GB 예시는 날짜 한 개씩 학습합니다.
 
 ~~~bash
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph_2001_2026_full \
-  --run-dir var/runs/relgnn/kbo_2001_2024_full_v1 \
+  --dataset var/datasets/kbo_graph_2001_2026_v4 \
+  --run-dir var/runs/relgnn/kbo_2001_2024_v4 \
   --train-start-year 2001 \
   --train-end-year 2024 \
   --validation-year 2025 \
@@ -211,11 +231,11 @@ LiveHit는 관측 PA가 한 개 이상임을 확인할 수 있는 선수-경기�
 learning rate 0.0003, weight decay 0.0001입니다. 상세 구조는 [GPU 학습 설명](docs/GPU_TRAINING.md)에 있습니다.
 
 위 run 이름은 이번 실험용입니다. 같은 이름으로 이미 실행했다면 새 이름을 사용합니다.
-기존 경기 점수 전용 v2 checkpoint를 이번 v3 데이터에 `--resume`하지 않습니다.
+기존 v2/v3 checkpoint를 이번 v4 데이터에 `--resume`하지 않습니다.
 기존 checkpoint는 기존 그래프에서 계속 평가할 수 있습니다.
 
 ~~~text
-var/runs/relgnn/kbo_2001_2024_full_v1/
+var/runs/relgnn/kbo_2001_2024_v4/
 ├── config.json
 ├── history.jsonl
 ├── last.pt
@@ -227,13 +247,22 @@ history.jsonl에서 진행 기록을, training_report.json에서 학습 요약�
 best.pt는 validation으로 선택한 평가용 모델이고, last.pt는 학습 재개용입니다.
 GPU를 사용할 수 없으면 오류로 끝나며 CPU 학습으로 자동 전환하지 않습니다.
 
+기본 선택 기준은 기존과 같은 가중 손실입니다. v4는 최근 연도에도 집계 정답이 있으므로
+해당 손실도 포함됩니다. `training_report.json`과 평가 출력에 각 손실·관측 수·가중 기여도를
+남깁니다. 승무패 log loss로 best.pt를 고르려면 새 학습에 `--selection-target match`를
+명시합니다. 안타/타격 성능까지 동시에 좋아진다는 의미는 아닙니다.
+
+기본은 모든 손실을 공유 모델에 역전파합니다. 집계 손실의 간섭 여부를 별도로 비교하려면
+`--box-gradient-mode head_only`로 집계 출력층만 학습할 수 있습니다. 이 옵션은 집계 손실이
+공유 표현을 학습하지 못하게 하므로 기본값이 아닙니다. 비교 시 다른 조건은 고정합니다.
+
 ## 6. 2026 부분 시즌 test 평가
 
 5절 학습이 끝난 뒤 best.pt를 명시해 실행합니다. 다른 run 이름을 썼다면 경로도 바꿉니다.
 
 ~~~bash
 cpv26 relgnn-evaluate \
-  --checkpoint var/runs/relgnn/kbo_2001_2024_full_v1/best.pt \
+  --checkpoint var/runs/relgnn/kbo_2001_2024_v4/best.pt \
   --split test \
   --device cuda:0
 ~~~

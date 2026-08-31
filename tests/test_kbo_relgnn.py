@@ -305,15 +305,84 @@ def test_boxscore_targets_cannot_change_pregame_predictions() -> None:
 
 def test_boxscore_config_default_keeps_old_state_dict_compatible() -> None:
     legacy = _config().to_dict()
-    for key in ("include_boxscore_heads", "box_batting_feature_dim", "box_pitching_feature_dim"):
+    for key in (
+        "include_boxscore_heads", "box_batting_feature_dim", "box_pitching_feature_dim",
+        "box_gradient_mode",
+    ):
         legacy.pop(key)
     restored = KBORelGNNConfig(**legacy)
     assert restored.include_boxscore_heads is False
+    assert restored.box_gradient_mode == "shared"
     source = _model()
     target = KBORelGNNModel(restored)
     target.load_state_dict(source.state_dict(), strict=True)
     assert all(
         not key.startswith(("box_pa_head.", "box_pitch_head.")) for key in source.state_dict()
+    )
+
+
+@pytest.mark.parametrize("mode", ["shared", "head_only"])
+def test_box_gradient_policy_controls_only_aggregate_to_backbone_gradients(mode: str) -> None:
+    model = KBORelGNNModel(replace(
+        _config(), include_boxscore_heads=True, box_gradient_mode=mode,
+    ))
+    batch = collate_kbo_day_graphs([_box_day()])
+    losses = kbo_multitask_loss(model(batch), batch)
+    (losses["box_pa_loss"] + losses["box_pitch_loss"]).backward()
+    backbone_has_gradient = any(
+        parameter.grad is not None and bool(parameter.grad.abs().sum() > 0)
+        for parameter in model.backbone.parameters()
+    )
+    assert backbone_has_gradient is (mode == "shared")
+    for head in (model.box_pa_head, model.box_pitch_head):
+        assert any(
+            parameter.grad is not None and bool(parameter.grad.abs().sum() > 0)
+            for parameter in head.parameters()
+        )
+    assert all(parameter.grad is None for parameter in model.match_head.parameters())
+
+
+def test_head_only_policy_preserves_primary_updates_even_when_box_gradients_are_large() -> None:
+    from cpv26.training.kbo_runner import _clip_gradient_norms
+
+    torch.manual_seed(19)
+    original = KBORelGNNModel(replace(
+        _config(), include_boxscore_heads=True, box_gradient_mode="head_only",
+    ))
+    ordinary = [_box_day("2001-04-05"), _box_day("2023-04-01")]
+    changed = copy.deepcopy(ordinary)
+    for day in changed:
+        day["box_pa_counts"] = np.roll(day["box_pa_counts"], 4, axis=1)
+        day["box_pitch_targets"] *= 3
+    states, gradients, norms = [], [], []
+    for days, weight in ((ordinary, 0.0), (changed, 1000.0)):
+        model = copy.deepcopy(original)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, weight_decay=0.0)
+        batch = collate_kbo_day_graphs(days)
+        loss = kbo_multitask_loss(
+            model(batch), batch, run_weight=0.1, box_pa_weight=weight, box_pitch_weight=weight,
+        )["loss"]
+        loss.backward()
+        norms.append(_clip_gradient_norms(model, 0.01))
+        gradients.append({
+            name: parameter.grad.clone() if parameter.grad is not None else None
+            for name, parameter in model.named_parameters()
+        })
+        optimizer.step()
+        states.append(model.state_dict())
+    assert set(norms[1]) == {"primary", "box_heads"}
+    assert norms[1]["primary"] > 0.01 and norms[1]["box_heads"] > 0.01
+    for name in gradients[0]:
+        if name.startswith(("box_pa_head.", "box_pitch_head.")):
+            continue
+        if gradients[0][name] is None:
+            assert gradients[1][name] is None
+        else:
+            torch.testing.assert_close(gradients[0][name], gradients[1][name], rtol=0, atol=0)
+        torch.testing.assert_close(states[0][name], states[1][name], rtol=0, atol=0)
+    assert any(
+        not torch.equal(states[0][name], states[1][name])
+        for name in states[0] if name.startswith(("box_pa_head.", "box_pitch_head."))
     )
 
 

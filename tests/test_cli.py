@@ -112,9 +112,39 @@ def test_relgnn_train_forwards_seasons_and_date_order_without_gpu(
     assert config.max_edges_per_route_per_day == 0
     assert config.box_pa_weight == 0.2
     assert config.box_pitch_weight == 0.1
+    assert config.selection_target == "auto"
+    assert config.box_gradient_mode == "auto"
     assert f"{test_season} test was not used" in result.output
     assert "Epochs: 17; best: 11" in result.output
     assert not runtime.exists()
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "field_name"),
+    [("--selection-target", "match", "selection_target"),
+     ("--box-gradient-mode", "head_only", "box_gradient_mode")],
+)
+def test_relgnn_train_explicit_policy_options(
+    tmp_path: Path, monkeypatch: MonkeyPatch, option: str, value: str, field_name: str,
+) -> None:
+    from cpv26.training import kbo_runner
+
+    monkeypatch.setenv("CPV26_HOME", str(tmp_path / "runtime"))
+
+    def fake_train(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        assert getattr(kwargs["config"], field_name) == value
+        return {"completed_epochs": 1, "best_epoch": 1, "smoke_test_only": False}
+
+    monkeypatch.setattr(kbo_runner, "train_kbo_relgnn", fake_train)
+    result = CliRunner().invoke(app, ["relgnn-train", option, value])
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("option", ["--selection-target", "--box-gradient-mode"])
+def test_relgnn_train_rejects_invalid_policy_before_training(option: str) -> None:
+    result = CliRunner().invoke(app, ["relgnn-train", option, "invalid"])
+    assert result.exit_code != 0
+    assert "must be" in result.output
 
 
 @pytest.mark.parametrize(

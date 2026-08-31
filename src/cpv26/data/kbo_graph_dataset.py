@@ -25,10 +25,11 @@ import duckdb
 import numpy as np
 from numpy.typing import NDArray
 
+from cpv26.data.kbo_player_identity import historical_player_prior
 from cpv26.simulation.adapter import NEURAL_PA_OUTCOMES, neural_training_target_index
 from cpv26.simulation.events import TerminalPlateAppearanceEvent
 
-GRAPH_DATASET_VERSION = 3
+GRAPH_DATASET_VERSION = 4
 _KST = ZoneInfo("Asia/Seoul")
 Array = NDArray[Any]
 BOX_BATTING_FIELDS = (
@@ -221,7 +222,7 @@ class KBOGraphDataset:
         self.directory = Path(directory).expanduser().resolve()
         with (self.directory / "manifest.json").open(encoding="utf-8") as handle:
             self.manifest: dict[str, Any] = json.load(handle)
-        if self.manifest.get("dataset_version") not in (2, GRAPH_DATASET_VERSION):
+        if self.manifest.get("dataset_version") not in (2, 3, GRAPH_DATASET_VERSION):
             raise ValueError("unsupported KBO graph dataset version")
         self._entries = {entry["day"]: entry for entry in self.manifest["days"]}
         if len(self._entries) != len(self.manifest["days"]):
@@ -330,6 +331,11 @@ class _History:
         self.box_pitching: dict[str, _Aggregate] = {}
         self.box_team_batting: dict[str, _Aggregate] = {}
         self.box_team_pitching: dict[str, _Aggregate] = {}
+        # Active source versions, NOT latest retrospective labels. Rebuild only
+        # changed player-game groups after publication/revision/expiry updates.
+        self.box_inputs: dict[tuple[str, str, str], dict[str, _Record]] = defaultdict(dict)
+        self.box_applied: dict[tuple[str, str, str], list[_Record]] = {}
+        self.changed_box_groups: set[tuple[str, str, str]] = set()
         self.routes: dict[str, dict[tuple[str, str], _Aggregate]] = {
             route: {} for route in ROUTE_METADATA
         }
@@ -362,6 +368,18 @@ class _History:
                 self._update(selected, True)
                 self.digest ^= selected.digest
                 self.active[key] = selected
+        for group in sorted(self.changed_box_groups):
+            for record in self.box_applied.pop(group, ()):
+                self._update_box(record, False)
+            inputs = self.box_inputs.get(group, {})
+            if inputs:
+                applied = _common_box_records(list(inputs.values()), group[2])
+                for record in applied:
+                    self._update_box(record, True)
+                self.box_applied[group] = applied
+            else:
+                self.box_inputs.pop(group, None)
+        self.changed_box_groups.clear()
 
     @staticmethod
     def _update_bucket(
@@ -392,31 +410,13 @@ class _History:
                 ("pitcher_participation_team", (pitcher, data["fielding_team_id"])),
             ):
                 update(self.routes[route], key, record, record.values, add)
+            for role, team in (
+                ("batting", data["batting_team_id"]),
+                ("pitching", data["fielding_team_id"]),
+            ):
+                self._track_box_input(record, role, team, add)
         elif record.kind.startswith("box_"):
-            if not record.box_values[len(record.box_values) // 2 :].any():
-                # An entirely missing placeholder remains in raw data and audit
-                # counts, but does not prove a historical participation or reset
-                # recency. Any actually reported field, including zero, is kept.
-                return
-            role = data["role"]
-            team = data["team_id"]
-            # The archive has no verified stable player IDs. Keep observations
-            # separate and aggregate their contributions into explicit team-role
-            # prior nodes, never into a guessed identity based on display name.
-            identity = (
-                data["player_id"]
-                if data.get("identity_status") == "canonical_verified"
-                else _box_prior_id(role, team)
-            )
-            update(getattr(self, f"box_{role}"), identity, record, record.box_values, add)
-            update(getattr(self, f"box_team_{role}"), team, record, record.box_values, add)
-            route = (
-                "batter_participation_team" if role == "batting" else "pitcher_participation_team"
-            )
-            # This is a verified historical participation relation, not a PA.
-            # Unsupported legacy PA-specific edge fields stay zero; observed
-            # box statistics and their missingness live in the separate inputs.
-            update(self.routes[route], (identity, team), record, np.zeros(7), add)
+            self._track_box_input(record, data["role"], data["team_id"], add)
         else:
             home, away = data["home_team_id"], data["away_team_id"]
             home_runs, away_runs = data["home_score"], data["away_score"]
@@ -435,6 +435,41 @@ class _History:
                 record,
                 record.values,
                 add,
+            )
+
+    def _track_box_input(self, record: _Record, role: str, team: str, add: bool) -> None:
+        key = (record.data["game_id"], team, role)
+        if add:
+            self.box_inputs[key][record.row_id] = record
+        else:
+            del self.box_inputs[key][record.row_id]
+        self.changed_box_groups.add(key)
+
+    def _update_box(self, record: _Record, add: bool) -> None:
+        data = record.data
+        if not record.box_values[len(record.box_values) // 2 :].any():
+            return
+        role, team = data["role"], data["team_id"]
+        identity = _box_history_id(data)
+        update = self._update_bucket
+        update(getattr(self, f"box_{role}"), identity, record, record.box_values, add)
+        if not data.get("skip_team_history", False):
+            update(getattr(self, f"box_team_{role}"), team, record, record.box_values, add)
+        if data.get("derived_from_pa", False):
+            # PA already populated individual legacy features and actual routes.
+            return
+        values = _complete_legacy_box_values(data)
+        if values is not None and not data.get("has_pa_history", False):
+            update(getattr(self, role), identity, record, values, add)
+        # The cohort is an explicitly uncertain source-name/team group, never
+        # a resolved person or an invented batter-pitcher encounter.
+        if not data.get("has_pa_history", False):
+            route = (
+                "batter_participation_team" if role == "batting" else "pitcher_participation_team"
+            )
+            update(
+                self.routes[route], (identity, team), record,
+                values if values is not None else np.zeros(7), add,
             )
 
 
@@ -481,7 +516,8 @@ def build_kbo_graph_dataset(
         "dataset_version": GRAPH_DATASET_VERSION,
         "rolling_days": rolling_days,
         "pa_incomplete_transition_context": "mask_pre_scores_unknown",
-        "boxscore_history_policy": "observed_fields_only_v1",
+        "boxscore_history_policy": "common_player_game_observed_fields_v2",
+        "boxscore_identity_policy": "unmerged_observations_name_team_role_cohorts_v1",
         "cutoff_timezone": "Asia/Seoul",
         "cutoff_time": "00:00:00",
         "knowledge_at": knowledge_at.isoformat()
@@ -515,6 +551,14 @@ def build_kbo_graph_dataset(
             "game_only_games": len(games - pa_games - box_games),
             "observed_completed_pa": sum(row.kind == "pa" for row in labels[day]),
             **_box_label_audit(labels[day]),
+            "pa_derived_batting_queries": sum(
+                row.data.get("derived_from_pa", False) and row.data["role"] == "batting"
+                for row in _label_boxes(labels[day])
+            ),
+            "pa_derived_pitching_queries": sum(
+                row.data.get("derived_from_pa", False) and row.data["role"] == "pitching"
+                for row in _label_boxes(labels[day])
+            ),
         }
         cached = _read_valid_cache(sidecar, path, input_fingerprint)
         if cached is not None:
@@ -547,6 +591,14 @@ def build_kbo_graph_dataset(
             "live_hit_queries": len(graph.arrays["live_hit_pa"]),
             "pa_queries": len(graph.arrays["pa_targets"]),
             "history_rows": len(history.active),
+            "feature_coverage": {
+                name: int(np.any(graph.arrays[name] != 0, axis=1).sum())
+                for name in (
+                    "player_batting_features", "player_pitching_features",
+                    "player_box_batting_features", "player_box_pitching_features",
+                    "team_box_batting_features", "team_box_pitching_features",
+                )
+            },
             **coverage,
         }
         _write_json_atomic(sidecar, entry)
@@ -589,6 +641,9 @@ def build_kbo_graph_dataset(
         "match_target_classes": ("away_win", "draw", "home_win"),
         "source_provenance": sources,
         "label_quality": {
+            "historical_boxscore_identity": _identity_audit(
+                [row for day in selected_days for row in labels[day]]
+            ),
             "observed_completed_pa": sum(
                 row.kind == "pa" for day in selected_days for row in labels[day]
             ),
@@ -641,12 +696,20 @@ def build_kbo_graph_dataset(
             "unknown_labels": "unlabelled source PAs omitted; catcher interference is not PA10",
             "game_only": "final scores supervise match/run only; no synthetic PA or LiveHit labels",
             "boxscore_identity": (
-                "unresolved player observations stay distinct; names never join identities; "
-                "past team-role priors supply isolated query-node features"
+                "observation IDs stay distinct; canonical IDs only when source-verified; "
+                "unresolved names use explicitly uncertain name/team/role cohort features, "
+                "not individual career history; missing names fall back to team-role priors"
             ),
             "boxscore_history": (
-                "all source rows contribute observed fields with observation-count masks; "
-                "explicit team-role prior nodes retain historical participation relations"
+                "box and PA sources share player-game observed sums/counts; one field count "
+                "per player-game, not per PA; unknown fields remain masked; revisions selected "
+                "at cutoff before aggregation; raw source records remain unchanged"
+            ),
+            "overlap": (
+                "verified same-player archive fields precede PA-derived missing fields; "
+                "unresolved archive team totals precede PA-derived team totals; individual "
+                "PA history and PA labels remain; overlapping unresolved LiveHit/box targets "
+                "use archive rows for that game/team instead of counting both sources"
             ),
             "boxscore_pa": "verified actual outcome totals only; no invented ordered PA or pitcher",
             "boxscore_live_hit": (
@@ -682,6 +745,8 @@ def _season_coverage(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "box_live_hit_unknown_pa_queries",
         "box_pa_outcomes",
         "box_pitch_observed_counts",
+        "pa_derived_batting_queries",
+        "pa_derived_pitching_queries",
     )
     return [
         {
@@ -841,6 +906,7 @@ def _box_graph_data(row: Mapping[str, Any]) -> dict[str, Any]:
     if stats.get("counts_verified"):
         names.add("outcome_counts")
     return {
+        "display_name": row.get("display_name"),
         **{
             name: row[name]
             for name in (
@@ -878,15 +944,15 @@ def _label_records(records: list[_Record]) -> dict[date, list[_Record]]:
 def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay:
     games = [row for row in labels if row.kind == "game"]
     pas = [row for row in labels if row.kind == "pa"]
-    boxes = [row for row in labels if row.kind.startswith("box_")]
-    box_queries = {row.data["player_id"]: row.data for row in boxes}
+    boxes = _label_boxes(labels)
+    box_queries = {(row.data["player_id"], row.data["role"]): row.data for row in boxes}
     player_ids = tuple(
         sorted(
             set(history.batting)
             | set(history.pitching)
             | set(history.box_batting)
             | set(history.box_pitching)
-            | set(box_queries)
+            | {key[0] for key in box_queries}
             | {row.data[key] for row in pas for key in ("batter_id", "pitcher_id")}
         )
     )
@@ -904,16 +970,25 @@ def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay
     players = {value: index for index, value in enumerate(player_ids)}
     teams = {value: index for index, value in enumerate(team_ids)}
     cutoff = datetime.combine(day, time.min, tzinfo=_KST).timestamp()
+
+    def role_history(player: str, role: str) -> _Aggregate | None:
+        mapping = getattr(history, role)
+        aggregate = mapping.get(player)
+        query = box_queries.get((player, role))
+        if aggregate is None and query is not None:
+            aggregate = mapping.get(_box_history_id(query))
+        return cast(_Aggregate | None, aggregate)
+
     batting = np.asarray(
         [
-            _role_features(history.batting.get(player), cutoff, history.rolling_days)
+            _role_features(role_history(player, "batting"), cutoff, history.rolling_days)
             for player in player_ids
         ],
         dtype=np.float32,
     ).reshape(-1, 8)
     pitching = np.asarray(
         [
-            _role_features(history.pitching.get(player), cutoff, history.rolling_days)
+            _role_features(role_history(player, "pitching"), cutoff, history.rolling_days)
             for player in player_ids
         ],
         dtype=np.float32,
@@ -938,11 +1013,11 @@ def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay
         player_features = []
         for player in player_ids:
             aggregate = personal.get(player)
-            query = box_queries.get(player)
+            query = box_queries.get((player, role))
             if aggregate is None and query is not None:
-                # Query identity is not resolved: this is explicitly the team's
-                # earlier role prior, not this person's claimed career history.
-                aggregate = team_prior.get(query["team_id"])
+                aggregate = personal.get(_box_history_id(query))
+                if aggregate is None:
+                    aggregate = team_prior.get(query["team_id"])
             player_features.append(
                 _box_features(aggregate, cutoff, history.rolling_days, dimension)
             )
@@ -989,6 +1064,153 @@ def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay
 
 def _box_prior_id(role: str, team: str) -> str:
     return f"kbo-team-role-prior:{role}:{team}"
+
+
+def _box_history_id(row: Mapping[str, Any]) -> str:
+    if row.get("identity_status") == "canonical_verified":
+        return str(row["player_id"])
+    return historical_player_prior(
+        team_id=row["team_id"], role=row["role"], display_name=row.get("display_name")
+    ).prior_id
+
+
+def _complete_legacy_box_values(row: Mapping[str, Any]) -> Array | None:
+    stats = _box_stat_fields(row)
+    fields = (
+        "plate_appearances" if row["role"] == "batting" else "batters_faced",
+        "at_bats", "hits", "total_bases", "walks_hbp", "strikeouts", "home_runs",
+    )
+    if not all(_observed_nonnegative(stats.get(name)) for name in fields):
+        return None
+    if stats[fields[0]] <= 0:
+        return None
+    return np.asarray([stats[name] for name in fields], dtype=np.float64)
+
+
+def _aggregate_record(data: dict[str, Any], components: list[_Record]) -> _Record:
+    digest = int(_json_sha256({
+        "policy": "common_player_game_v1", "data": data,
+        "components": sorted(f"{row.digest:064x}" for row in components),
+    }), 16)
+    return _Record(
+        kind="box_" + data["role"], entity=data["observation_id"],
+        row_id=f"pa-box:{digest:064x}", day=components[0].day,
+        event_at=max(row.event_at for row in components),
+        available_at=max(row.available_at for row in components),
+        ingested_at=max(row.ingested_at for row in components),
+        valid_from=max(row.valid_from for row in components), valid_to=None,
+        source_id=components[0].source_id, data=data, digest=digest,
+        box_values=_box_record_values(data),
+    )
+
+
+def _pa_box_records(pas: list[_Record], role: str) -> list[_Record]:
+    """Observed PA totals, one field-observation per player-game, not per PA.
+
+    Runs/RBI, pitcher outs/pitches/runs/ER cannot be reconstructed completely
+    from terminal PA rows. They remain unobserved, even when all PAs are known.
+    Call with already selected source versions (history or retrospective labels).
+    """
+    player_field = "batter_id" if role == "batting" else "pitcher_id"
+    team_field = "batting_team_id" if role == "batting" else "fielding_team_id"
+    opponent_field = "fielding_team_id" if role == "batting" else "batting_team_id"
+    grouped: dict[tuple[str, str], list[_Record]] = defaultdict(list)
+    for record in pas:
+        grouped[(record.data["game_id"], record.data[player_field])].append(record)
+    result = []
+    for (game, player), components in sorted(grouped.items()):
+        first = components[0].data
+        if any(
+            (row.data[team_field], row.data[opponent_field])
+            != (first[team_field], first[opponent_field]) for row in components
+        ):
+            raise ValueError(f"conflicting PA teams for player-game {(game, player)}")
+        totals = np.sum([row.values for row in components], axis=0)
+        stats: dict[str, Any] = dict(zip(
+            ("plate_appearances" if role == "batting" else "batters_faced",
+             "at_bats", "hits", "total_bases", "walks_hbp", "strikeouts", "home_runs"),
+            (int(value) for value in totals), strict=True,
+        ))
+        if role == "batting":
+            counts = [0] * len(NEURAL_PA_OUTCOMES)
+            for row in components:
+                target = neural_training_target_index(
+                    TerminalPlateAppearanceEvent(row.data["outcome"])
+                )
+                if target is not None:
+                    counts[target] += 1
+            stats.update(outcome_counts=counts, counts_verified=True, hits_verified=True)
+        observation = f"observed-pa-box:{role}:{game}:{player}"
+        data = {
+            "game_id": game, "observation_id": observation, "role": role,
+            "player_id": player, "identity_status": "canonical_verified",
+            "team_id": first[team_field], "opponent_team_id": first[opponent_field],
+            "stats_json": stats, "quality_json": [], "derived_from_pa": True,
+        }
+        result.append(_aggregate_record(data, components))
+    return result
+
+
+def _common_box_records(records: list[_Record], role: str) -> list[_Record]:
+    """Merge a single game/team/role without counting overlapping sources twice.
+
+    Verified same-ID boxes supply reported fields first; observed PA fills only
+    missing fields. Unresolved archive rows cannot be joined to a person: their
+    reported team totals take precedence, while PA personal history is retained.
+    """
+    boxes = [row for row in records if row.kind == "box_" + role]
+    derived = _pa_box_records([row for row in records if row.kind == "pa"], role)
+    if not boxes:
+        return derived
+    by_player = {row.data["player_id"]: row for row in derived}
+    result = []
+    for record in boxes:
+        row = record.data
+        pa = by_player.pop(row["player_id"], None) if (
+            row.get("identity_status") == "canonical_verified"
+        ) else None
+        if pa is None:
+            result.append(record)
+            continue
+        stats = _box_stat_fields(row)
+        pa_stats = pa.data["stats_json"]
+        if not _observed_nonnegative(stats.get("hits")) and _observed_nonnegative(
+            pa_stats.get("hits")
+        ):
+            stats["hits"] = pa_stats["hits"]
+            stats["hits_verified"] = True
+        if role == "batting" and not stats.get("counts_verified"):
+            stats["outcome_counts"] = pa_stats["outcome_counts"]
+            stats["counts_verified"] = True
+        for key, value in pa_stats.items():
+            if stats.get(key) is None:
+                stats[key] = value
+        result.append(_aggregate_record(
+            {**row, "stats_json": stats, "has_pa_history": True}, [record, pa]
+        ))
+    unresolved = any(row.data.get("identity_status") != "canonical_verified" for row in boxes)
+    for record in by_player.values():
+        if unresolved:
+            record.data["skip_team_history"] = True
+            record.data["overlap_unresolved"] = True
+        result.append(record)
+    return result
+
+
+def _label_boxes(labels: list[_Record]) -> list[_Record]:
+    grouped: dict[tuple[str, str, str], list[_Record]] = defaultdict(list)
+    for record in labels:
+        row = record.data
+        if record.kind == "pa":
+            for role, field in (("batting", "batting_team_id"), ("pitching", "fielding_team_id")):
+                grouped[(row["game_id"], row[field], role)].append(record)
+        elif record.kind.startswith("box_"):
+            grouped[(row["game_id"], row["team_id"], row["role"])].append(record)
+    return [
+        record for group, inputs in sorted(grouped.items())
+        for record in _common_box_records(inputs, group[2])
+        if not record.data.get("overlap_unresolved", False)
+    ]
 
 
 def _box_stat_fields(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1145,6 +1367,8 @@ def _queries(
         if outcome is not None:
             pa_rows.append(row)
             pa_targets.append(outcome)
+    pa_live_keys = set(live)
+    archive_live_scopes: set[tuple[str, str]] = set()
     for record in boxes or ():
         row = record.data
         if row["role"] != "batting":
@@ -1165,6 +1389,8 @@ def _queries(
         key = (row["game_id"], row["player_id"])
         if key in live:
             continue  # Already supervised by actual PA events for this verified identity.
+        if row.get("identity_status") != "canonical_verified":
+            archive_live_scopes.add((row["game_id"], row["team_id"]))
         live[key] = [
             row["team_id"],
             row["opponent_team_id"],
@@ -1172,6 +1398,9 @@ def _queries(
             int(hits),
             observed_pa if known_pa else observed_ab,
         ]
+    for key in pa_live_keys:
+        if (key[0], live[key][0]) in archive_live_scopes:
+            del live[key]
     live_keys = sorted(live)
     context = []
     for row in pa_rows:
@@ -1370,6 +1599,32 @@ def _box_label_audit(labels: list[_Record]) -> dict[str, Any]:
         "box_pitch_observed_counts": pitch_observed,
         "box_target_missing_reasons": dict(sorted(reasons.items())),
     }
+
+
+def _identity_audit(labels: list[_Record]) -> dict[str, int]:
+    counts = {
+        "source_observation_rows": 0, "name_team_cohort_rows": 0,
+        "team_role_fallback_rows": 0, "canonical_verified_rows": 0,
+        "same_game_cohort_collision_groups": 0,
+    }
+    cohorts: dict[tuple[str, str], int] = defaultdict(int)
+    for record in labels:
+        if not record.kind.startswith("box_"):
+            continue
+        row = record.data
+        if row.get("identity_status") == "canonical_verified":
+            counts["canonical_verified_rows"] += 1
+        else:
+            counts["source_observation_rows"] += 1
+            prior = historical_player_prior(
+                team_id=row["team_id"], role=row["role"], display_name=row.get("display_name")
+            )
+            named = prior.identity_status == "source_name_team_cohort"
+            counts["name_team_cohort_rows" if named else "team_role_fallback_rows"] += 1
+            if named:
+                cohorts[(row["game_id"], prior.prior_id)] += 1
+    counts["same_game_cohort_collision_groups"] = sum(count > 1 for count in cohorts.values())
+    return counts
 
 
 def _validate_graph(graph: GraphDay) -> None:

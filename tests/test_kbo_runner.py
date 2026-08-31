@@ -304,9 +304,14 @@ def test_training_config_accepts_historical_years_and_reads_legacy_checkpoints()
     del legacy["chronological"]
     del legacy["box_pa_weight"]
     del legacy["box_pitch_weight"]
+    del legacy["selection_target"]
+    del legacy["box_gradient_mode"]
     assert KBOTrainingConfig.from_dict(legacy).chronological is False
     assert KBOTrainingConfig.from_dict(legacy).box_pa_weight == 0.2
     assert KBOTrainingConfig.from_dict(legacy).box_pitch_weight == 0.1
+    assert runner_module._training_policies(KBOTrainingConfig.from_dict(legacy)) == {
+        "selection_target": "weighted", "box_gradient_mode": "shared",
+    }
     _resume_compatible({"training_config": legacy, "epoch": 1}, KBOTrainingConfig(epochs=2))
     with pytest.raises(ValueError, match="chronological"):
         _resume_compatible(
@@ -338,6 +343,34 @@ def test_model_config_enables_boxscore_features_only_for_v3_graphs(graph_directo
     assert old.include_boxscore_heads is False
     assert old.node_feature_dims == current.node_feature_dims
     assert old.role_feature_dims == current.role_feature_dims
+    for version in (2, 3, 4):
+        selected = SimpleNamespace(manifest={**dataset.manifest, "dataset_version": version})
+        config = runner_module._model_config(selected, KBOTrainingConfig())
+        assert config.include_boxscore_heads is (version >= 3)
+        assert config.box_gradient_mode == "shared"
+    isolated = runner_module._model_config(
+        dataset, KBOTrainingConfig(box_gradient_mode="head_only")
+    )
+    assert isolated.box_gradient_mode == "head_only"
+
+
+def test_selection_and_gradient_policies_are_independent_explicit_controls() -> None:
+    assert runner_module._training_policies(KBOTrainingConfig(selection_target="match")) == {
+        "selection_target": "match", "box_gradient_mode": "shared",
+    }
+    assert runner_module._training_policies(KBOTrainingConfig(box_gradient_mode="head_only")) == {
+        "selection_target": "weighted", "box_gradient_mode": "head_only",
+    }
+    for field in ("selection_target", "box_gradient_mode"):
+        with pytest.raises(ValueError, match=field):
+            KBOTrainingConfig(**{field: "invalid"})
+        changed = KBOTrainingConfig(
+            **{field: "match" if field == "selection_target" else "head_only"}
+        )
+        with pytest.raises(ValueError, match=field):
+            _resume_compatible(
+                {"training_config": asdict(KBOTrainingConfig()), "epoch": 1}, changed
+            )
 
 
 def test_nullable_prediction_export_does_not_replace_unknown_labels_with_zero(
@@ -363,20 +396,40 @@ def test_nullable_prediction_export_does_not_replace_unknown_labels_with_zero(
     assert {row[0]: row[1] for row in types}["observed_pitches_thrown"] == "BIGINT"
 
 
-def test_v2_checkpoint_without_boxscore_fields_still_resumes_and_evaluates(
-    graph_directory: Path, tmp_path: Path,
+@pytest.mark.parametrize("version", [2, 3])
+def test_legacy_checkpoint_without_new_policy_fields_still_resumes_and_evaluates(
+    graph_directory: Path, tmp_path: Path, version: int,
 ) -> None:
     torch = pytest.importorskip("torch")
     manifest_path = graph_directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["dataset_version"] = 2
+    manifest["dataset_version"] = version
+    # Older PBP-only caches had no unified box histories or aggregate queries.
+    for entry in manifest["days"]:
+        path = graph_directory / entry["file"]
+        with np.load(path, allow_pickle=False) as archive:
+            arrays = {
+                key: archive[key] for key in archive.files
+                if not key.startswith(("box_", "player_box_", "team_box_"))
+                and key != "live_hit_pa_min"
+            }
+        with path.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+        entry["sha256"] = sha256_file(path)
+        for key in tuple(entry):
+            if key.startswith("box_"):
+                del entry[key]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     run = tmp_path / "legacy-run"
     train_kbo_relgnn(graph_directory, run, config=_config(), progress=lambda _: None)
     state = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
-    for key in ("include_boxscore_heads", "box_batting_feature_dim", "box_pitching_feature_dim"):
-        state["model_config"].pop(key)
-    for key in ("box_pa_weight", "box_pitch_weight"):
+    state["model_config"].pop("box_gradient_mode")
+    if version == 2:
+        for key in (
+            "include_boxscore_heads", "box_batting_feature_dim", "box_pitching_feature_dim",
+        ):
+            state["model_config"].pop(key)
+    for key in ("box_pa_weight", "box_pitch_weight", "selection_target", "box_gradient_mode"):
         state["training_config"].pop(key)
     torch.save(state, run / "last.pt")
     resumed = train_kbo_relgnn(
@@ -384,9 +437,77 @@ def test_v2_checkpoint_without_boxscore_fields_still_resumes_and_evaluates(
         progress=lambda _: None,
     )
     assert resumed["completed_epochs"] == 2
-    assert set(resumed["history"][-1]["training_samples"]) == {"match", "live_hit", "pa", "run"}
+    tasks = {"match", "live_hit", "pa", "run"} | (
+        {"box_pa", "box_pitch"} if version >= 3 else set()
+    )
+    assert set(resumed["history"][-1]["training_samples"]) == tasks
+    assert resumed["training_policies"]["selection_target"] == "weighted"
+    assert resumed["training_policies"]["box_gradient_mode"] == "shared"
     report = evaluate_kbo_relgnn(run / "best.pt", device="cpu", amp="off", workers=0)
-    assert set(report["metrics"]["losses"]) == {"match", "live_hit", "pa", "run"}
+    assert set(report["metrics"]["losses"]) == tasks
+
+
+def test_cross_era_graph_inputs_train_and_evaluate_with_audited_optional_policies(
+    graph_directory: Path, tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    from test_kbo_history_graph import _historical_database
+
+    database = tmp_path / "cross-era.duckdb"
+    _historical_database(database)
+    with duckdb.connect(str(database)) as combined, duckdb.connect(
+        str(graph_directory.parent / "canonical.duckdb"), read_only=True
+    ) as recent:
+        for table in ("source_revision", "game", "observed_plate_appearance"):
+            rows = recent.execute(f"SELECT * FROM {table}").fetchall()
+            combined.executemany(
+                f"INSERT INTO {table} VALUES ({','.join('?' for _ in rows[0])})", rows,
+            )
+    directory = tmp_path / "cross-era-graphs"
+    dataset = build_kbo_graph_dataset(database, directory)
+    assert dataset.manifest["dataset_version"] >= 4
+    options = _config(
+        epochs=2, train_seasons=(2001, 2023, 2024), validation_season=2025, test_season=2026,
+        chronological=True, max_pa_per_day=0, max_edges_per_route_per_day=0,
+        selection_target="match", box_gradient_mode="head_only",
+    )
+    model_config = runner_module._model_config(dataset, options)
+    model = runner_module.KBORelGNNModel(model_config)
+    for day in ("2001-04-02", "2023-04-02"):
+        graph = dataset.load_day(day)
+        assert graph.team_box_batting_features.any()
+        assert graph.box_pa_counts.size or graph.box_pitch_mask.any()
+        batch = runner_module.collate_kbo_day_graphs([graph])
+        batch["team_box_batting_features"].requires_grad_(True)
+        model.zero_grad(set_to_none=True)
+        loss = runner_module._losses(model(batch), batch, options)["match_loss"]
+        loss.backward()
+        gradient = batch["team_box_batting_features"].grad
+        assert gradient is not None and torch.isfinite(gradient).all() and gradient.abs().sum() > 0
+    run = tmp_path / "cross-era-run"
+    training = train_kbo_relgnn(directory, run, config=options, progress=lambda _: None)
+    policy = training["training_policies"]
+    assert policy["selection_target"] == "match"
+    assert policy["box_gradient_mode"] == "head_only"
+    assert policy["gradient_clipping"] == "primary_and_box_heads_separately"
+    for record in training["history"]:
+        assert record["training_samples"]["box_pa"] > 0
+        assert record["training_samples"]["box_pitch"] > 0
+        assert record["gradient_audit"]["primary"]["max_finite_preclip_norm"] > 0
+        assert record["gradient_audit"]["box_heads"]["max_finite_preclip_norm"] > 0
+        validation = record["validation"]
+        assert validation["selection_loss"] == validation["losses"]["match"]
+        assert validation["loss_sample_counts"]["box_pa"] > 0
+        assert validation["loss_sample_counts"]["box_pitch"] > 0
+    report = evaluate_kbo_relgnn(run / "best.pt", device="cpu", amp="off", workers=0)
+    metrics = report["metrics"]
+    assert metrics["selection_target"] == "match"
+    assert metrics["selection_loss"] == metrics["losses"]["match"]
+    assert metrics["weighted_multitask_loss"] == pytest.approx(
+        sum(metrics["weighted_loss_contributions"].values())
+    )
+    assert metrics["box_pa"]["observed_outcomes"] == metrics["loss_sample_counts"]["box_pa"]
+    assert metrics["box_pitch"]["observed_counts"] == metrics["loss_sample_counts"]["box_pitch"]
 
 
 def test_multi_year_splits_are_complete_ordered_and_disjoint(graph_directory: Path) -> None:

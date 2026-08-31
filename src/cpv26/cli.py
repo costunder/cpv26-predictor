@@ -629,6 +629,12 @@ def relgnn_train(
     box_pitch_weight: Annotated[
         float, typer.Option(min=0.0, help="Historical masked pitching-count loss weight.")
     ] = 0.1,
+    selection_target: Annotated[
+        str, typer.Option(help="Checkpoint criterion: auto/weighted or match log loss.")
+    ] = "auto",
+    box_gradient_mode: Annotated[
+        str, typer.Option(help="auto/shared trains all layers; head_only isolates box decoders.")
+    ] = "auto",
     patience: Annotated[
         int, typer.Option(min=0, help="Validation early stopping; 0 disables it.")
     ] = 6,
@@ -677,6 +683,8 @@ def relgnn_train(
             max_edges_per_route_per_day=max_edges_per_route,
             box_pa_weight=box_pa_weight,
             box_pitch_weight=box_pitch_weight,
+            selection_target=selection_target,
+            box_gradient_mode=box_gradient_mode,
             patience=patience,
             seed=settings.random_seed,
             max_days_per_split=max_days_per_split,
