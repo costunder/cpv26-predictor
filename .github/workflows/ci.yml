@@ -67,6 +67,8 @@ jobs:
           cpv26 kbo-graph-build --help
           cpv26 relgnn-train --help
           cpv26 relgnn-evaluate --help
+          python scripts/profile_relgnn.py --help
+          python scripts/show_relgnn_results.py --help
           cpv26 kbo-match-evaluate --help
           cpv26 kbo-live-hit-evaluate --help
 

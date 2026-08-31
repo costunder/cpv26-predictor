@@ -316,6 +316,17 @@ evaluations/test-<run-id>/
 평가 연도는 checkpoint에 저장한 분할에서 읽습니다. 2026 자료는 부분 시즌이므로
 전체 시즌 성능이라고 표시하지 않습니다. test 결과를 보고 설정을 골랐다면 그 사실도 기록합니다.
 
+저장된 학습 요약과 가장 최근 test 평가 결과만 다시 보려면 아래 명령을 실행합니다.
+학습이나 평가를 새로 실행하지 않습니다.
+
+~~~bash
+python scripts/show_relgnn_results.py \
+  --run-dir var/runs/relgnn/kbo_2001_2024_v5
+~~~
+
+GPU 사용률이 낮을 때는 [병목 진단](docs/GPU_BOTTLENECK_DIAGNOSIS.md)을 사용합니다.
+기존 학습·평가가 끝난 뒤 같은 MIG가 비어 있을 때만 실행하며, 원래 checkpoint는 변경하지 않습니다.
+
 ## 7. 학습 재개
 
 학습 프로세스가 종료됐다면 마지막으로 저장된 last.pt에서 재개합니다.

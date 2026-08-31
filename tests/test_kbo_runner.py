@@ -163,6 +163,70 @@ def test_cuda_is_required_unless_cpu_is_explicit(monkeypatch: pytest.MonkeyPatch
         check_gpu("cpu", amp="fp16")
 
 
+def test_isolated_profile_preserves_run_and_data(graph_directory: Path, tmp_path: Path) -> None:
+    pytest.importorskip("torch")
+    from cpv26.training.kbo_profile import profile_run
+
+    run = tmp_path / "original-run"
+    train_kbo_relgnn(graph_directory, run, config=_config(), progress=lambda _: None)
+    # Resume settings live in the checkpoint, not the old config.json.
+    saved = json.loads((run / "config.json").read_text())
+    saved["training"]["batch_days"] = 99
+    (run / "config.json").write_text(json.dumps(saved))
+    protected = [
+        path for root in (run, graph_directory) for path in root.rglob("*") if path.is_file()
+    ]
+    original_hashes = {path: sha256_file(path) for path in protected}
+    report_path = profile_run(
+        run, output_directory=tmp_path / "diagnostic", device="cpu",
+        warmup=1, steps=1, trace_steps=0, workers=0, progress=lambda _: None,
+    )
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "completed"
+    assert report["diagnostic_only"] is True
+    assert report["configuration"]["batch_days"] == 1
+    assert report["checkpoint_epoch"] == 1
+    for window in report["windows"].values():
+        assert all(day.startswith("2023-") for day in window["days"])
+        assert set(window["cases"]) == {"stream", "resident", "resident_no_statistics"}
+        for case in window["cases"].values():
+            assert case["steps"] == 1 and case["milliseconds_per_batch"] > 0
+        assert window["cases"]["resident_no_statistics"]["host_stage_mean_ms"]
+    assert original_hashes == {path: sha256_file(path) for path in protected}
+    for forbidden in (run, run / "new-output", graph_directory / "new-output", report_path.parent):
+        with pytest.raises((ValueError, FileExistsError)):
+            profile_run(
+                run, output_directory=forbidden, device="cpu",
+                warmup=1, steps=1, trace_steps=0, workers=0, progress=lambda _: None,
+            )
+
+
+def test_profile_optimizer_copy_does_not_alias_checkpoint(
+    graph_directory: Path, tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    from cpv26.training.kbo_profile import _new_session, _step
+
+    run = tmp_path / "optimizer-source"
+    config = _config()
+    train_kbo_relgnn(graph_directory, run, config=config, progress=lambda _: None)
+    state = runner_module._read_checkpoint(run / "last.pt")
+    snapshots = {
+        (key, name): value.clone()
+        for key, values in state["optimizer"]["state"].items()
+        for name, value in values.items() if torch.is_tensor(value)
+    }
+    device = torch.device("cpu")
+    session = _new_session(state, config, device)
+    batch = next(iter(_loader(
+        graph_directory, [date(2023, 4, 2)], config, epoch=0, training=True,
+    )))
+    _step(session, batch, config, device, index=0, statistics_enabled=True)
+    assert snapshots
+    for (key, name), original in snapshots.items():
+        assert torch.equal(original, state["optimizer"]["state"][key][name])
+
+
 def test_real_graph_train_resume_and_test_artifacts(graph_directory: Path, tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
     run = tmp_path / "training"
