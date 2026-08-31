@@ -19,6 +19,7 @@
 | object/혼합형 정답 label 조회 실패 | Python·NumPy scalar를 원래 label 타입으로 매핑 |
 | 매우 큰 유한 표본 가중치에서 LL/Brier/ECE overflow | 최댓값으로 먼저 스케일한 뒤 정규화. 극대·극소 가중치의 배율 불변성 검사 |
 | 보고서 경로로 DB·원천·그래프 입력을 덮어쓸 수 있음 | 현대 importer 보고서는 DB/원천 디렉터리, graph 감사 보고서는 입력 graph 디렉터리 안으로 쓰지 못하도록 차단 |
+| 여러 스레드가 열린 부모 프로세스에서 DataLoader 워커를 fork | 워커가 있을 때 해당 loader만 `spawn` 사용. 워커 0은 단일 프로세스를 유지하고 전역 시작 방식은 변경하지 않음 |
 
 원천 스냅샷 선택 기준은 `knowledge_at`이다. 삭제된 첫 경기 때문에 원천의 합성
 `available_at`이 뒤로 이동해도 이전 스냅샷을 되살리지 않는다. 과거 knowledge 시점에는
@@ -79,9 +80,20 @@ v5 fingerprint는 `c1776f500c93a19ec83c82d9f23b60ef4c52711e7d8c1029c4b290e5806db
 
 ## 코드 검사
 
-Windows/Python 3.12.13 로컬 전체 테스트는 **528 passed, 45 skipped**다.
+워커 보완까지 포함한 Windows/Python 3.12.13 로컬 전체 테스트는 **531 passed, 45 skipped**다.
 PyTorch·선택적 CatBoost 미설치와 Windows 권한 재현 불가 항목이 skip 사유이며,
 skip을 성공한 신경망 검사로 계산하지 않았다. Ruff와 56개 소스 파일 Mypy 검사는 통과했다.
+
+첫 수정 커밋 `c6b2ec3`의 [Conda/PyTorch CI](https://github.com/costunder/cpv26-predictor/actions/runs/33398904934)는
+612 passed, 1 skipped와 wheel/의존성 검사 성공을 기록했다. CPU PyTorch 환경이므로
+CUDA 실장비 항목은 제외된다. 그 로그의 두 경고는
+멀티스레드 프로세스에서의 `fork`였으므로, 추가로 loader 시작 방식을 수정했다.
+실제 교착이 발생했다는 주장은 아니다.
+
+[Python 3.12 설명](https://docs.python.org/3.12/library/multiprocessing.html#contexts-and-start-methods)과
+[PyTorch multiprocessing 지침](https://docs.pytorch.org/docs/stable/notes/multiprocessing.html)은
+스레드·가속기 상태를 상속하는 fork의 위험과 다른 시작 방식 사용을 설명한다.
+추가 변경은 워커 시작 방식뿐이며, 위 실데이터 그래프의 배열·정답·fingerprint를 바꾸지 않는다.
 
 신경망 테스트에는 FP32/FP16/BF16 극단 logit의 손실·유한 기울기, 실제 optimizer
 갱신, 기존 checkpoint 로딩, RelGNN 학습·재개·평가와 집계 gradient 경로를 포함한다.

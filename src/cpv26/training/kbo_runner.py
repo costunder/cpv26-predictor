@@ -279,6 +279,9 @@ def _loader(
         batch_size=config.batch_days,
         shuffle=training and not config.chronological,
         num_workers=config.workers,
+        # Workers start after model/CUDA initialization. Do not fork its
+        # threaded runtime; keep this choice local to this DataLoader.
+        multiprocessing_context="spawn" if config.workers > 0 else None,
         pin_memory=config.device.startswith("cuda"),
         generator=generator,
         collate_fn=partial(

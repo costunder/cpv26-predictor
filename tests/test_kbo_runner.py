@@ -268,15 +268,53 @@ def test_resume_refuses_wrong_lineage_and_overwrites(graph_directory: Path, tmp_
         evaluate_kbo_relgnn(run / "best.pt", device="cpu", amp="off", workers=0)
 
 
-def test_worker_process_graph_loading(graph_directory: Path, tmp_path: Path) -> None:
-    pytest.importorskip("torch")
+@pytest.mark.filterwarnings("error:.*multi-threaded.*fork.*:DeprecationWarning")
+def test_worker_process_graph_loading(
+    graph_directory: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    original_loader = runner_module._loader
+    loader_modes: list[bool] = []
+
+    def checked_loader(*args: Any, **kwargs: Any) -> Any:
+        loader = original_loader(*args, **kwargs)
+        assert loader.num_workers == 2
+        assert loader.multiprocessing_context.get_start_method() == "spawn"
+        loader_modes.append(kwargs["training"])
+        return loader
+
+    monkeypatch.setattr(runner_module, "_loader", checked_loader)
+    run = tmp_path / "worker-training"
     report = train_kbo_relgnn(
         graph_directory,
-        tmp_path / "worker-training",
-        config=replace(_config(), workers=1),
+        run,
+        config=replace(_config(), workers=2),
         progress=lambda _: None,
     )
     assert report["completed_epochs"] == 1
+    assert loader_modes == [True, False]  # Train and validation both spawned.
+    state = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+    assert state["training_config"]["workers"] == 2
+    assert state["history"][0]["training_samples"]["match"] == 2
+    saved_training = json.loads((run / "training_report.json").read_text())
+    assert saved_training["completed_epochs"] == 1
+
+    evaluated = evaluate_kbo_relgnn(
+        run / "best.pt", split="test", device="cpu", amp="off", workers=2,
+    )
+    assert loader_modes == [True, False, False]
+    assert evaluated["metrics"]["match"]["samples"] == 2
+    assert evaluated["metrics"]["live_hit"]["samples"] == 4
+    saved_metrics = json.loads(
+        (Path(evaluated["output_directory"]) / "metrics.json").read_text()
+    )
+    assert saved_metrics["metrics"] == evaluated["metrics"]
+    for artifact in evaluated["prediction_artifacts"].values():
+        path = Path(artifact["path"])
+        assert artifact["sha256"] == sha256_file(path)
+        with duckdb.connect() as connection:
+            row = connection.execute("SELECT count(*) FROM read_parquet(?)", [str(path)]).fetchone()
+        assert row is not None and row[0] == artifact["rows"]
 
 
 def test_training_config_disallows_invalid_splits_and_empty_tasks() -> None:
@@ -588,12 +626,14 @@ def test_split_summary_counts_actual_modern_box_targets(
     ("chronological", "training", "expected_shuffle"),
     [(True, True, False), (False, True, True), (False, False, False)],
 )
+@pytest.mark.parametrize("workers", [0, 2])
 def test_loader_orders_training_dates_only_when_requested(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     chronological: bool,
     training: bool,
     expected_shuffle: bool,
+    workers: int,
 ) -> None:
     class Generator:
         def manual_seed(self, value: int) -> Generator:
@@ -609,10 +649,21 @@ def test_loader_orders_training_dates_only_when_requested(
     )
     monkeypatch.setattr(runner_module, "require_torch", lambda: (fake_torch, None))
     days = (date(2024, 4, 2), date(2023, 4, 1), date(2024, 4, 1))
-    config = _config(chronological=chronological)
+    config = replace(_config(chronological=chronological), workers=workers)
     loader = _loader(tmp_path, days, config, epoch=3, training=training)
     assert loader["shuffle"] is expected_shuffle
     assert loader["generator"].seed == config.seed + 3
+    assert loader["num_workers"] == workers
+    assert loader["multiprocessing_context"] == ("spawn" if workers else None)
+    assert loader["batch_size"] == config.batch_days
+    assert loader["pin_memory"] is False
+    assert loader["collate_fn"].func is runner_module.collate_kbo_day_graphs
+    assert loader["collate_fn"].keywords == {
+        "device": "cpu",
+        "max_pa_per_day": config.max_pa_per_day if training else None,
+        "max_edges_per_route_per_day": config.max_edges_per_route_per_day,
+        "seed": config.seed + 3 if training else config.seed,
+    }
     expected_days = days if expected_shuffle else tuple(sorted(days))
     assert loader["dataset"].selected_days == expected_days
 

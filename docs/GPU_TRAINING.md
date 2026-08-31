@@ -323,6 +323,12 @@ CPU 검증은 명시적으로 CPU를 선택하며 runner에서는 AMP를 끕니�
 GPU 이름, VRAM, PyTorch/CUDA 버전, precision과 peak memory를 보고서에 기록합니다.
 seed를 고정해도 CUDA atomic 연산까지 bitwise 재현된다고 보장하지 않습니다.
 
+데이터 로더 워커는 `spawn`으로 시작합니다. 이미 열린 PyTorch 스레드/가속기 상태를
+`fork`로 복제하지 않으며, 프로그램 전역의 multiprocessing 설정은 바꾸지 않습니다.
+`--workers 0`이면 별도 워커를 만들지 않습니다. CLI 실행 방법은 같고, Python API를
+직접 스크립트에서 호출할 때는 진입점을 `if __name__ == "__main__":`로 보호합니다.
+워커 시작에 드는 비용이 있으므로 이 변경 자체가 속도 향상을 뜻하지는 않습니다.
+
 ## 체크포인트·재개·평가 산출물
 
 학습 run 디렉터리에는 `config.json`, `history.jsonl`, `best.pt`, `last.pt`,
