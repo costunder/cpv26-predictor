@@ -10,11 +10,12 @@ import argparse
 import gc
 import json
 import math
+import os
 import statistics
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from uuid import uuid4
 from cpv26.data.kbo_graph_dataset import KBOGraphDataset
 from cpv26.models._torch import require_torch
 from cpv26.models.kbo_relgnn import KBORelGNNConfig, KBORelGNNModel
+from cpv26.training.batch_transfer import move_batch
 from cpv26.training.kbo_runner import (
     KBOTrainingConfig,
     _clip_gradient_norms,
@@ -36,6 +38,7 @@ from cpv26.training.kbo_runner import (
     _read_checkpoint,
     _runtime_memory,
 )
+from cpv26.training.optimizer_state import make_adamw
 
 
 def select_windows(
@@ -129,22 +132,21 @@ def _sync(device: Any) -> None:
         torch.cuda.synchronize(device)
 
 
-def _new_session(state: Mapping[str, Any], config: KBOTrainingConfig, device: Any) -> Any:
+def _new_session(
+    state: Mapping[str, Any], config: KBOTrainingConfig, device: Any,
+    *, optimized: bool = True,
+) -> Any:
     torch, _ = require_torch()
     torch.manual_seed(config.seed)
     model: Any = KBORelGNNModel(KBORelGNNConfig(**state["model_config"]))
     model.load_state_dict(state["model"])
+    model.backbone.set_execution_optimization(optimized)
     model.to(device)
     model.train()
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
+    optimizer = make_adamw(
+        model, learning_rate=config.learning_rate, weight_decay=config.weight_decay,
+        checkpoint=state, clone_state=True,
     )
-    optimizer.load_state_dict(state["optimizer"])
-    # CPU tensors may otherwise alias the source checkpoint's optimizer state.
-    for parameter_state in optimizer.state.values():
-        for key, value in parameter_state.items():
-            if torch.is_tensor(value):
-                parameter_state[key] = value.clone()
     _, dtype, _ = _device_and_precision(str(device), config.amp)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and dtype == torch.float16)
     if scaler.is_enabled() and state.get("scaler"):
@@ -198,6 +200,7 @@ def _step(
 def _measure(
     session: Any, batches: Any, config: KBOTrainingConfig, device: Any,
     *, warmup: int, steps: int, resident: bool, statistics_enabled: bool,
+    packed_transfers: bool = True,
 ) -> dict[str, Any]:
     iterator_started = time.perf_counter()
     iterator = iter(batches)
@@ -215,7 +218,7 @@ def _measure(
         if index == 0:
             first_batch_wait = row["next_batch_host_wait"]
         with _stage("h2d_host_dispatch", row):
-            batch = raw if resident else _move(raw, device)
+            batch = raw if resident else move_batch(raw, device, packed=packed_transfers)
         row.update(_step(
             session, batch, config, device, index=index,
             statistics_enabled=statistics_enabled,
@@ -285,16 +288,80 @@ def _comparisons(cases: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compare_optimizations(
+    state: Mapping[str, Any], directory: Path, days: Sequence[date],
+    config: KBOTrainingConfig, device: Any, *, warmup: int, steps: int,
+    repeats: int, progress: Callable[[str], None],
+) -> dict[str, Any]:
+    """Alternate reference/optimized private replays; never reuse updated weights."""
+    samples: dict[str, list[dict[str, Any]]] = {"reference": [], "optimized": []}
+    execution_order: list[list[str]] = []
+    for repeat in range(repeats):
+        order = ["reference", "optimized"] if repeat % 2 == 0 else ["optimized", "reference"]
+        execution_order.append(order)
+        for name in order:
+            optimized = name == "optimized"
+            session = _new_session(state, config, device, optimized=optimized)
+            loader = _loader(directory, days, config, epoch=0, training=True)
+            result = _measure(
+                session, loader, config, device, warmup=warmup, steps=steps,
+                resident=False, statistics_enabled=True, packed_transfers=optimized,
+            )
+            samples[name].append(result)
+            progress(
+                f"comparison {repeat + 1}/{repeats} {name}: "
+                f"{result['milliseconds_per_batch']:.3f} ms/batch"
+            )
+            del session, loader
+            gc.collect()
+    reference = statistics.median(row["milliseconds_per_batch"] for row in samples["reference"])
+    optimized_ms = statistics.median(row["milliseconds_per_batch"] for row in samples["optimized"])
+    return {
+        "repeats": repeats, "execution_order": execution_order,
+        "reference_median_ms_per_batch": reference,
+        "optimized_median_ms_per_batch": optimized_ms,
+        "speedup": reference / optimized_ms,
+        "time_reduction_percent": 100 * (1 - optimized_ms / reference),
+        "samples": samples,
+        "reference": {"shared_route_context": False, "packed_transfers": False},
+        "optimized": {"shared_route_context": True, "packed_transfers": True},
+        "interpretation": (
+            "Same checkpoint, seed, dates, batch size, workers, precision and optimizer. "
+            "Both modes load real input batches and collect the same statistics. "
+            "Every replay uses a new private model/optimizer copy. "
+            "Ratio of median batch times, not GPU utilization. Startup/warmup excluded; "
+            "filesystem cache and host scheduling are uncontrolled. Small changes can be noise."
+        ),
+    }
+
+
+def _host_runtime() -> dict[str, Any]:
+    torch, _ = require_torch()
+    affinity = None
+    if hasattr(os, "sched_getaffinity"):
+        with suppress(OSError):
+            affinity = sorted(os.sched_getaffinity(0))
+    return {
+        "logical_cpu_count": os.cpu_count(), "allowed_cpu_affinity": affinity,
+        "torch_num_threads": torch.get_num_threads(),
+        "torch_num_interop_threads": torch.get_num_interop_threads(),
+        "note": "Affinity is not a measurement of CPU utilization or cgroup CPU quota.",
+    }
+
+
 def profile_run(
     run_directory: str | Path, *, dataset_directory: str | Path | None = None,
     output_directory: str | Path | None = None, device: str = "cuda:0",
     steps: int = 12, warmup: int = 3, trace_steps: int = 3,
     batch_days: int | None = None, workers: int | None = None,
-    device_idle: bool = False, progress: Callable[[str], None] = print,
+    device_idle: bool = False, compare_optimizations: bool = False, repeats: int = 3,
+    progress: Callable[[str], None] = print,
 ) -> Path:
     """Replay a few TRAINING days. Checkpoint/config/cache are read-only inputs."""
     if min(steps, warmup) < 1 or not 0 <= trace_steps <= steps:
         raise ValueError("steps/warmup must be positive; trace_steps must be 0..steps")
+    if not 1 <= repeats <= 10:
+        raise ValueError("repeats must be between 1 and 10")
     if device.startswith("cuda") and not device_idle:
         raise ValueError(
             "Wait until training on this MIG has finished, then use --device-idle. "
@@ -339,6 +406,9 @@ def profile_run(
     output.mkdir(parents=True, exist_ok=False)
     report: dict[str, Any] = {
         "status": "running", "diagnostic_only": True,
+        "profile_schema_version": 2,
+        "mode": "optimization_comparison" if compare_optimizations else "bottleneck_diagnostic",
+        "host_runtime": _host_runtime(),
         "run_directory": str(run), "checkpoint": str(run / "last.pt"),
         "checkpoint_epoch": state["epoch"], "runtime": runtime,
         "configuration": asdict(config), "original_training": state["training_config"],
@@ -362,6 +432,36 @@ def profile_run(
             report["windows"][name] = window
             if selected.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(selected)
+            if compare_optimizations:
+                comparison = _compare_optimizations(
+                    state, directory, days, config, selected, warmup=warmup,
+                    steps=steps, repeats=repeats, progress=progress,
+                )
+                window["optimization_comparison"] = comparison
+                progress("Optimization comparison: " + json.dumps({
+                    "window": name,
+                    **{key: comparison[key] for key in (
+                        "reference_median_ms_per_batch", "optimized_median_ms_per_batch",
+                        "speedup", "time_reduction_percent",
+                    )},
+                }, ensure_ascii=False))
+                if trace_steps:
+                    loader = _loader(directory, days, config, epoch=0, training=True)
+                    resident = [_move(batch, selected) for batch in loader]
+                    _sync(selected)
+                    del loader
+                    session = _new_session(state, config, selected)
+                    try:
+                        window["trace"] = _trace(
+                            session, resident[warmup:], config, selected,
+                            output / f"{name}_trace.json", trace_steps,
+                        )
+                    except RuntimeError as exc:
+                        window["trace"] = {"unavailable": str(exc)}
+                    del session, resident
+                window.update(_runtime_memory(selected))
+                gc.collect()
+                continue
             session = _new_session(state, config, selected)
             loader = _loader(directory, days, config, epoch=0, training=True)
             window["cases"]["stream"] = _measure(
@@ -421,12 +521,15 @@ def main() -> None:
     parser.add_argument("--trace-steps", type=int, default=3)
     parser.add_argument("--batch-days", type=int)
     parser.add_argument("--workers", type=int)
+    parser.add_argument("--compare-optimizations", action="store_true")
+    parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
     profile_run(
         args.run_dir, dataset_directory=args.dataset, output_directory=args.output,
         device=args.device, device_idle=args.device_idle, steps=args.steps,
         warmup=args.warmup, trace_steps=args.trace_steps, batch_days=args.batch_days,
-        workers=args.workers,
+        workers=args.workers, compare_optimizations=args.compare_optimizations,
+        repeats=args.repeats,
     )
 
 

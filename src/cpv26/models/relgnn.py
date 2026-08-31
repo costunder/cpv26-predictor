@@ -131,6 +131,18 @@ class _CompositeRouteAttention(ModuleBase):
             features.append(signed_log_delay)
         return self.temporal_encoder(torch.stack(features, dim=-1))
 
+    def encode_route_context(self, batch: TorchAtomicRouteBatch) -> tuple[Any, Any]:
+        """Encode direction-independent inputs for this route in this layer.
+
+        Both encoders are deterministic (no dropout). Keep their outputs
+        separate so aggregation retains the original ``(source + event) +
+        temporal`` floating-point addition order. This is a forward-local
+        value, never a cache across batches, layers, or optimizer steps.
+        """
+
+        event = None if self.event_encoder is None else self.event_encoder(batch.event_features)
+        return event, self._temporal_context(batch)
+
     def aggregate(
         self,
         source_state: Any,
@@ -138,6 +150,7 @@ class _CompositeRouteAttention(ModuleBase):
         batch: TorchAtomicRouteBatch,
         *,
         reverse: bool,
+        encoded_context: tuple[Any, Any] | None = None,
     ) -> tuple[Any, Any]:
         """Aggregate one direction with a softmax per destination and head."""
 
@@ -170,9 +183,16 @@ class _CompositeRouteAttention(ModuleBase):
             return empty_messages, empty_mask
 
         context = source_projection(source_state[source_index])
-        if self.event_encoder is not None:
-            context = context + self.event_encoder(batch.event_features)
-        context = self.context_norm(context + self._temporal_context(batch))
+        if encoded_context is None:
+            # Retain the original direction-by-direction path for A/B checks.
+            if self.event_encoder is not None:
+                context = context + self.event_encoder(batch.event_features)
+            temporal_context = self._temporal_context(batch)
+        else:
+            event_context, temporal_context = encoded_context
+            if event_context is not None:
+                context = context + event_context
+        context = self.context_norm(context + temporal_context)
         context = self.dropout(context)
 
         query = query_projection(destination_state[destination_index]).reshape(
@@ -371,6 +391,7 @@ class _CompositeRouteLayer(ModuleBase):
         route_batches: tuple[TorchAtomicRouteBatch, ...],
         *,
         validate_routes: bool = True,
+        reuse_route_context: bool = True,
     ) -> RelGNNState:
         torch, _ = require_torch()
         channels = state.channels()
@@ -398,21 +419,28 @@ class _CompositeRouteLayer(ModuleBase):
             if validate_routes:
                 self._validate_tensor_batch(route, batch, source_state, destination_state)
 
-            message, mask = self.messages[batch.route_name].aggregate(
+            attention = self.messages[batch.route_name]
+            encoded_context = None
+            if reuse_route_context and route.bidirectional and batch.num_edges:
+                encoded_context = attention.encode_route_context(batch)
+
+            message, mask = attention.aggregate(
                 source_state,
                 destination_state,
                 batch,
                 reverse=False,
+                encoded_context=encoded_context,
             )
             incoming[destination_channel].append(
                 (message, mask, _gate_key(batch.route_name, False))
             )
             if route.bidirectional:
-                reverse_message, reverse_mask = self.messages[batch.route_name].aggregate(
+                reverse_message, reverse_mask = attention.aggregate(
                     destination_state,
                     source_state,
                     batch,
                     reverse=True,
+                    encoded_context=encoded_context,
                 )
                 incoming[source_channel].append(
                     (reverse_message, reverse_mask, _gate_key(batch.route_name, True))
@@ -567,6 +595,25 @@ class CompositeRelGNNBackbone(ModuleBase):
                 for _ in range(num_layers)
             ]
         )
+        self._execution_optimization_enabled = True
+
+    @property
+    def execution_optimization_enabled(self) -> bool:
+        """Whether to reuse direction-independent route encodings at runtime."""
+
+        return self._execution_optimization_enabled
+
+    def set_execution_optimization(self, enabled: bool) -> None:
+        """Select optimized or original execution without changing model state.
+
+        This runtime-only switch is deliberately absent from ``state_dict``
+        and model configuration. Disabling it recomputes event/time encodings
+        independently in each direction, providing the original A/B path.
+        """
+
+        if not isinstance(enabled, bool):
+            raise TypeError("execution optimization must be enabled or disabled with a bool")
+        self._execution_optimization_enabled = enabled
 
     def _tensorize_routes(
         self,
@@ -710,7 +757,12 @@ class CompositeRelGNNBackbone(ModuleBase):
             dtype=first_features.dtype,
         )
         for layer in self.layers:
-            state = layer(state, tensor_batches, validate_routes=validate_routes)
+            state = layer(
+                state,
+                tensor_batches,
+                validate_routes=validate_routes,
+                reuse_route_context=self._execution_optimization_enabled,
+            )
         return state
 
     def forward(

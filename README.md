@@ -327,6 +327,26 @@ python scripts/show_relgnn_results.py \
 GPU 사용률이 낮을 때는 [병목 진단](docs/GPU_BOTTLENECK_DIAGNOSIS.md)을 사용합니다.
 기존 학습·평가가 끝난 뒤 같은 MIG가 비어 있을 때만 실행하며, 원래 checkpoint는 변경하지 않습니다.
 
+최적화 전후의 속도만 비교하려면 기존 `last.pt`로 아래를 실행합니다. 전체 학습을 다시
+할 필요는 없습니다. 기존과 같은 worker 2개를 유지합니다.
+
+~~~bash
+python scripts/profile_relgnn.py \
+  --run-dir var/runs/relgnn/kbo_2001_2024_v5 \
+  --device cuda:0 \
+  --device-idle \
+  --workers 2 \
+  --compare-optimizations \
+  --repeats 3 \
+  --trace-steps 0
+~~~
+
+양방향 관계의 event/time 인코딩 재사용과 dtype별 묶음 CUDA 전송을 끈 실행/켠 실행을
+같은 조건으로 비교합니다. 두 최적화는 기존 학습·평가 명령에도 기본 적용되며 모델 설정,
+데이터와 checkpoint를 바꾸지 않습니다. CPU 등가성 검사와 A100 속도 검증은 별개이며,
+실제 가속량은 아직 측정하지 않았습니다. 구간별 `Optimization comparison`과 새 `report.json`을
+확인합니다. [측정 조건과 결과 읽기](docs/GPU_BOTTLENECK_DIAGNOSIS.md#최적화-전후-비교)를 참고합니다.
+
 ## 7. 학습 재개
 
 학습 프로세스가 종료됐다면 마지막으로 저장된 last.pt에서 재개합니다.

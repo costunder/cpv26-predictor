@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -249,3 +250,56 @@ def test_trace_without_profile_steps_cannot_report_step_gpu_utilization(
     assert result["step_wall_ms"] == pytest.approx(0)
     assert result["cuda_active_ms"] is None
     assert result["cuda_active_fraction"] is None
+
+
+def test_optimization_comparison_alternates_fresh_sessions_and_uses_medians(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    state: dict[str, Any] = {"checkpoint": "unchanged"}
+    config = kbo_profile.KBOTrainingConfig()
+    days = [date(2023, 7, 1), date(2023, 7, 2)]
+    sessions: list[object] = []
+    flags: list[bool] = []
+    durations = {False: iter([30.0, 1000.0, 20.0]), True: iter([10.0, 12.0, 11.0])}
+    device = SimpleNamespace(type="cpu")
+
+    def new_session(checkpoint: Any, options: Any, selected: Any, *, optimized: bool) -> Any:
+        assert checkpoint is state and options is config and selected is device
+        session = SimpleNamespace(optimized=optimized)
+        sessions.append(session)
+        flags.append(optimized)
+        return session
+
+    def loader(directory: Path, selected_days: Any, options: Any, **kwargs: Any) -> Any:
+        assert directory == tmp_path and selected_days is days and options is config
+        assert kwargs == {"epoch": 0, "training": True}
+        return "same input batches"
+
+    def measure(session: Any, batches: Any, options: Any, selected: Any, **kwargs: Any) -> Any:
+        assert batches == "same input batches" and options is config and selected is device
+        assert kwargs == {
+            "warmup": 1, "steps": 1, "resident": False,
+            "statistics_enabled": True, "packed_transfers": session.optimized,
+        }
+        return {"milliseconds_per_batch": next(durations[session.optimized])}
+
+    monkeypatch.setattr(kbo_profile, "_new_session", new_session)
+    monkeypatch.setattr(kbo_profile, "_loader", loader)
+    monkeypatch.setattr(kbo_profile, "_measure", measure)
+    result = kbo_profile._compare_optimizations(
+        state, tmp_path, days, config, device, warmup=1, steps=1, repeats=3,
+        progress=lambda _: None,
+    )
+    assert flags == [False, True, True, False, False, True]
+    assert len({id(session) for session in sessions}) == 6
+    assert result["reference_median_ms_per_batch"] == 30.0
+    assert result["optimized_median_ms_per_batch"] == 11.0
+    assert result["speedup"] == pytest.approx(30 / 11)
+    assert result["time_reduction_percent"] == pytest.approx(100 * (1 - 11 / 30))
+    assert state == {"checkpoint": "unchanged"}
+
+
+@pytest.mark.parametrize("repeats", [0, -1, 11])
+def test_profile_rejects_unbounded_or_empty_comparison_before_loading(repeats: int) -> None:
+    with pytest.raises(ValueError, match="repeats"):
+        kbo_profile.profile_run("missing-run", device="cpu", repeats=repeats)

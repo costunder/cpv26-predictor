@@ -35,7 +35,49 @@ python scripts/profile_relgnn.py \
 기존 출력 디렉터리, run 안, 데이터셋 안에는 쓰지 않습니다.
 학습 코드, 데이터, 원래 모델/optimizer/checkpoint 파일은 변경하지 않습니다.
 
-## 무엇을 비교하는가
+## 최적화 전후 비교
+
+기존 run의 `last.pt`를 그대로 읽어 최적화 효과만 비교합니다. **같은 MIG가 비어 있을 때만**
+실행하며, 전체 학습을 다시 시작하거나 그래프를 다시 만들 필요는 없습니다.
+아래 명령은 기존 worker 2개를 유지합니다. worker 1개가 더 빠르다고 가정하지 않습니다.
+
+```bash
+python scripts/profile_relgnn.py \
+  --run-dir var/runs/relgnn/kbo_2001_2024_v5 \
+  --device cuda:0 \
+  --device-idle \
+  --workers 2 \
+  --compare-optimizations \
+  --repeats 3 \
+  --trace-steps 0
+```
+
+`reference`는 두 최적화를 끄고, `optimized`는 같은 layer·관계의 양방향 event/time 인코딩
+재사용과 dtype별 pinned buffer 묶음 CUDA 전송을 켭니다. 모델의 파라미터·`state_dict`·설정,
+손실과 optimizer는 그대로입니다. 두 최적화는 일반 학습·평가에서도 기본으로 켜집니다.
+
+Optimizer는 저장된 파라미터 이름 순서로 복원하며, 이름 목록이 없는 옛 checkpoint는
+`state_dict`의 기록된 순서를 사용하고 새 checkpoint에는 `optimizer_parameter_names`를 저장합니다.
+모델 가중치와 checkpoint version 호환성은 유지하지만, 과거 잘못된 재개로 이미 뒤섞인
+optimizer 상태는 역복구할 수 없으며 기존 학습 결과 파일도 수정하지 않습니다.
+
+이 모드는 아래의 세 경로 진단 대신 **실제 loader를 포함한 stream 실행 두 개만** 비교합니다.
+각 실행은 같은 checkpoint 복사본, seed, 날짜, 배치 크기, workers, AMP와 정답을 사용합니다.
+3회 반복하며 실행 순서는 reference→optimized, optimized→reference로 번갈아 바꿉니다.
+선택한 훈련 구간마다 기본 워밍업 3배치를 제외하고 12배치를 측정합니다.
+worker 시작·첫 배치 대기는 측정에서 제외하며, 파일 캐시 상태는 통제하지 않습니다.
+
+구간별로 출력되는 `Optimization comparison` JSON을 확인합니다. 전체 결과는 새 `report.json`의
+`windows.<구간>.optimization_comparison`에 있습니다. `reference_median_ms_per_batch`와
+`optimized_median_ms_per_batch`가 두 실행의 중앙값이며, `samples`와 `execution_order`에
+개별 측정값과 순서를 남깁니다. `speedup`은 reference 시간 / optimized 시간으로, 1보다 크면
+최적화된 실행이 빠릅니다. 작은 차이는 잡음일 수 있습니다. 원래 checkpoint와 데이터는 변경하지 않습니다.
+
+CPU 등가성 검사는 연산 결과와 gradient의 일치 여부를 확인하는 검사입니다.
+CI에서는 기본 CPU 전체 검사에 더해 사용자 환경과 같은 PyTorch 2.5.1의 CPU 핵심 검사도 실행합니다.
+**A100/MIG에서 얼마나 빨라지는지는 아직 측정하지 않았습니다.** 위 GPU 비교 결과로 확인합니다.
+
+## 기본 진단: 세 경로 비교
 
 훈련 연도 안에서 PA가 없는 날짜와 PA가 있는 날짜를 구분하고, 각 그룹의 최신 연도
 중간 구간을 선택합니다. 각 구간에서 3개 워밍업 배치를 제외한 12개 배치를 측정합니다.

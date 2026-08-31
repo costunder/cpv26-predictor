@@ -8,7 +8,7 @@ import os
 import random
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -29,6 +29,9 @@ from cpv26.models.kbo_relgnn import (
     live_hit_observed_nll,
 )
 from cpv26.simulation.adapter import NEURAL_PA_OUTCOMES
+
+from .batch_transfer import move_batch
+from .optimizer_state import make_adamw, optimizer_parameter_names
 
 CHECKPOINT_VERSION = 1
 BOX_PITCH_TARGET_NAMES = (
@@ -232,20 +235,7 @@ def _read_checkpoint(path: Path) -> dict[str, Any]:
 
 
 def _move(value: Any, device: Any) -> Any:
-    torch, _ = require_torch()
-    if torch.is_tensor(value):
-        return value.to(device=device, non_blocking=True)
-    if isinstance(value, Mapping):
-        return {key: _move(item, device) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_move(item, device) for item in value)
-    if isinstance(value, list):
-        return [_move(item, device) for item in value]
-    if is_dataclass(value) and not isinstance(value, type):
-        return replace(
-            value, **{item.name: _move(getattr(value, item.name), device) for item in fields(value)}
-        )
-    return value
+    return move_batch(value, device, packed=True)
 
 
 class _DayDataset:
@@ -471,6 +461,11 @@ def _policy_report(config: KBOTrainingConfig, model_config: KBORelGNNConfig) -> 
         "fp16_overflow_policy": (
             "GradScaler-detected nonfinite gradients skip the whole optimizer step"
         ),
+        "execution_optimizations": {
+            "shared_bidirectional_route_context": True,
+            "dtype_packed_cuda_input_transfer": True,
+            "optimizer_algorithm_changed": False,
+        },
     }
 
 
@@ -750,6 +745,7 @@ def _checkpoint_state(
         "history": list(history),
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "optimizer_parameter_names": optimizer_parameter_names(model, optimizer),
         "scaler": scaler.state_dict(),
         "torch_rng_state": torch.get_rng_state(),
         "python_rng_state": random.getstate(),
@@ -795,9 +791,9 @@ def train_kbo_relgnn(
         torch.set_num_threads(min(4, os.cpu_count() or 1))
     model: Any = KBORelGNNModel(model_config)
     model.to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=options.learning_rate,
+    optimizer = make_adamw(
+        model,
+        learning_rate=options.learning_rate,
         weight_decay=options.weight_decay,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and dtype == torch.float16)
@@ -816,7 +812,10 @@ def train_kbo_relgnn(
             raise ValueError("checkpoint model/feature/route configuration differs")
         _resume_compatible(state, options)
         model.load_state_dict(state["model"])
-        optimizer.load_state_dict(state["optimizer"])
+        optimizer = make_adamw(
+            model, learning_rate=options.learning_rate, weight_decay=options.weight_decay,
+            checkpoint=state,
+        )
         if scaler.is_enabled() and state["scaler"]:
             scaler.load_state_dict(state["scaler"])
         torch.set_rng_state(state["torch_rng_state"])

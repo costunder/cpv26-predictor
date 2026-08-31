@@ -163,7 +163,10 @@ def test_cuda_is_required_unless_cpu_is_explicit(monkeypatch: pytest.MonkeyPatch
         check_gpu("cpu", amp="fp16")
 
 
-def test_isolated_profile_preserves_run_and_data(graph_directory: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("compare_optimizations", [False, True])
+def test_isolated_profile_preserves_run_and_data(
+    graph_directory: Path, tmp_path: Path, compare_optimizations: bool,
+) -> None:
     pytest.importorskip("torch")
     from cpv26.training.kbo_profile import profile_run
 
@@ -180,18 +183,31 @@ def test_isolated_profile_preserves_run_and_data(graph_directory: Path, tmp_path
     report_path = profile_run(
         run, output_directory=tmp_path / "diagnostic", device="cpu",
         warmup=1, steps=1, trace_steps=0, workers=0, progress=lambda _: None,
+        compare_optimizations=compare_optimizations, repeats=2,
     )
     report = json.loads(report_path.read_text())
     assert report["status"] == "completed"
     assert report["diagnostic_only"] is True
     assert report["configuration"]["batch_days"] == 1
     assert report["checkpoint_epoch"] == 1
+    assert report["profile_schema_version"] == 2
+    assert report["host_runtime"]["torch_num_threads"] > 0
     for window in report["windows"].values():
         assert all(day.startswith("2023-") for day in window["days"])
-        assert set(window["cases"]) == {"stream", "resident", "resident_no_statistics"}
-        for case in window["cases"].values():
-            assert case["steps"] == 1 and case["milliseconds_per_batch"] > 0
-        assert window["cases"]["resident_no_statistics"]["host_stage_mean_ms"]
+        if compare_optimizations:
+            comparison = window["optimization_comparison"]
+            assert comparison["repeats"] == 2
+            assert comparison["execution_order"] == [
+                ["reference", "optimized"], ["optimized", "reference"],
+            ]
+            assert comparison["speedup"] > 0
+            assert len(comparison["samples"]["reference"]) == 2
+            assert len(comparison["samples"]["optimized"]) == 2
+        else:
+            assert set(window["cases"]) == {"stream", "resident", "resident_no_statistics"}
+            for case in window["cases"].values():
+                assert case["steps"] == 1 and case["milliseconds_per_batch"] > 0
+            assert window["cases"]["resident_no_statistics"]["host_stage_mean_ms"]
     assert original_hashes == {path: sha256_file(path) for path in protected}
     for forbidden in (run, run / "new-output", graph_directory / "new-output", report_path.parent):
         with pytest.raises((ValueError, FileExistsError)):
