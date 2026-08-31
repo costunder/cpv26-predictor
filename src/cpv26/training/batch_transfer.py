@@ -77,7 +77,7 @@ def _can_pack(tensor: Any, torch: Any) -> bool:
         and tensor.numel() > 0
         and not tensor.is_conj()
         and not tensor.is_neg()
-        and all(name is None for name in tensor.names)
+        and all(name is None for name in getattr(tensor, "names", ()))
     )
 
 
