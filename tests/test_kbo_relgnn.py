@@ -87,6 +87,115 @@ def _model() -> Any:
     return KBORelGNNModel(_config())
 
 
+def _game_only_day(day_id: str = "2001-04-05", *, with_history: bool = True) -> dict[str, Any]:
+    day = _day(day_id)
+    day["node_features"]["player"] = np.empty((0, 4), dtype=np.float32)
+    for role in day["role_features"]:
+        day["role_features"][role] = np.empty((0, 8), dtype=np.float32)
+    for name, route in day["routes"].items():
+        if not with_history or name != "home_team_game_away_team":
+            for key, value in route.items():
+                route[key] = value[:0]
+    if not with_history:
+        day["node_features"]["team"][:] = 0
+    for key in tuple(day):
+        if key.startswith(("live_hit_", "pa_")):
+            day[key] = day[key][:0]
+    # Explicit score labels remain present when the source supplies no PA records.
+    day["match_runs"] = np.asarray([[11, 6]], dtype=np.float32)
+    return day
+
+
+@pytest.mark.parametrize("with_history", [False, True])
+def test_game_only_day_without_players_trains_match_and_run_without_optional_labels(
+    with_history: bool,
+) -> None:
+    model = _model()
+    batch = collate_kbo_day_graphs([_game_only_day(with_history=with_history)])
+    assert batch["node_features"]["player"].shape == (0, 4)
+    assert batch["node_graph_index"]["player"].numel() == 0
+    assert batch["match_runs"].tolist() == [[11, 6]]
+    output = model(batch)
+    assert output["match_logits"].shape == (1, 3)
+    assert output["live_hit_joint_probabilities"].shape == (0, 9, 7)
+    assert output["pa_logits"].shape == (0, 10)
+    losses = kbo_multitask_loss(output, batch, run_weight=0.1)
+    assert all(torch.isfinite(value) for value in losses.values())
+    assert losses["live_hit_loss"].item() == 0
+    assert losses["pa_loss"].item() == 0
+    assert losses["match_loss"].item() > 0
+    assert losses["run_loss"].item() > 0
+    losses["loss"].backward()
+    assert all(parameter.grad is None for parameter in model.live_hit_head.parameters())
+    assert all(parameter.grad is None for parameter in model.pa_head.parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for parameter in model.run_head.parameters()
+    )
+    if with_history:
+        gradient = (
+            model.backbone.layers[0].messages["home_team_game_away_team"].forward_value.weight.grad
+        )
+        assert gradient is not None and gradient.abs().sum() > 0
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
+
+
+@pytest.mark.parametrize("historical_first", [False, True])
+def test_game_only_and_pa_days_share_disjoint_batches_without_label_or_offset_leakage(
+    historical_first: bool,
+) -> None:
+    historical, recent = _game_only_day(), _day("2023-04-01")
+    days = [historical, recent] if historical_first else [recent, historical]
+    model = _model().eval()
+    separate = [model(collate_kbo_day_graphs([day])) for day in days]
+    batch = collate_kbo_day_graphs(days)
+    output = model(batch)
+    assert batch["day_ids"] == tuple(day["day_id"] for day in days)
+    assert batch["match_graph_index"].tolist() == [0, 1]
+    assert batch["live_hit_graph_index"].tolist() == [int(historical_first)] * 2
+    assert batch["pa_graph_index"].tolist() == [int(historical_first)] * 6
+    assert batch["live_hit_player_index"].tolist() == [0, 2]
+    assert batch["match_home_team_index"].tolist() == [0, 2]
+    for key in ("match_logits", "live_hit_joint_probabilities", "pa_logits"):
+        assert torch.allclose(output[key], torch.cat([item[key] for item in separate]), atol=2e-6)
+    losses = kbo_multitask_loss(output, batch, run_weight=0.1)
+    assert all(torch.isfinite(value) for value in losses.values())
+    losses["loss"].backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
+
+
+def test_evaluation_of_only_game_history_reports_missing_pa_tasks_without_fake_metrics() -> None:
+    from cpv26.training.kbo_runner import KBOTrainingConfig, _evaluate_model
+
+    batches = [
+        collate_kbo_day_graphs([_game_only_day("2001-04-05", with_history=False)]),
+        collate_kbo_day_graphs([_game_only_day("2001-04-06")]),
+    ]
+    report, predictions = _evaluate_model(
+        _model(),
+        batches,
+        KBOTrainingConfig(device="cpu"),
+        torch.device("cpu"),
+        None,
+        collect_predictions=True,
+    )
+    assert report["match"]["samples"] == 2
+    assert report["live_hit"] is None
+    assert report["pa"] is None
+    assert report["losses"]["live_hit"] == report["losses"]["pa"] == 0
+    assert np.isfinite(report["selection_loss"])
+    assert len(predictions["match"]) == 2
+    assert predictions["live_hit"] == predictions["pa"] == []
+
+
 def test_actual_relgnn_backpropagates_all_task_losses_through_graph_relations() -> None:
     model = _model()
     batch = collate_kbo_day_graphs([_day()])

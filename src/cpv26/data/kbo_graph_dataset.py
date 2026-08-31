@@ -449,8 +449,19 @@ def build_kbo_graph_dataset(
         )
         path = directory / "days" / f"{day.isoformat()}.npz"
         sidecar = path.with_suffix(".json")
+        games = {row.entity for row in labels[day] if row.kind == "game"}
+        pa_games = {row.data["game_id"] for row in labels[day] if row.kind == "pa"}
+        coverage = {
+            "games_with_pa": len(games & pa_games),
+            "game_only_games": len(games - pa_games),
+            "observed_completed_pa": sum(row.kind == "pa" for row in labels[day]),
+        }
         cached = _read_valid_cache(sidecar, path, input_fingerprint)
         if cached is not None:
+            # Coverage is metadata only: preserve old graph/checkpoint fingerprints.
+            if any(cached.get(key) != value for key, value in coverage.items()):
+                cached.update(coverage)
+                _write_json_atomic(sidecar, cached)
             entries.append(cached)
             reused += 1
             continue
@@ -476,6 +487,7 @@ def build_kbo_graph_dataset(
             "live_hit_queries": len(graph.arrays["live_hit_pa"]),
             "pa_queries": len(graph.arrays["pa_targets"]),
             "history_rows": len(history.active),
+            **coverage,
         }
         _write_json_atomic(sidecar, entry)
         entries.append(entry)
@@ -491,6 +503,7 @@ def build_kbo_graph_dataset(
         ),
         "built_at": datetime.now(timezone.utc).isoformat(),
         "days": entries,
+        "season_coverage": _season_coverage(entries),
         "cache_reused_days": reused,
         "cache_built_days": len(entries) - reused,
         "node_feature_dims": {key: len(value) for key, value in NODE_FEATURE_NAMES.items()},
@@ -546,11 +559,36 @@ def build_kbo_graph_dataset(
             "pa_pair": "credited batter/terminal pitcher; substitutions may not face final pitch",
             "scaling": "fixed constants and past-only ratios; no fitted full-sample normalization",
             "unknown_labels": "unlabelled source PAs omitted; catcher interference is not PA10",
+            "game_only": "final scores supervise match/run only; no synthetic PA or LiveHit labels",
             "simulator_ready": False,
         },
     }
     _write_json_atomic(directory / "manifest.json", manifest)
     return KBOGraphDataset(directory)
+
+
+def _season_coverage(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seasons: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for entry in entries:
+        seasons[date.fromisoformat(entry["day"]).year].append(entry)
+    counts = (
+        "games",
+        "games_with_pa",
+        "game_only_games",
+        "observed_completed_pa",
+        "live_hit_queries",
+        "pa_queries",
+    )
+    return [
+        {
+            "season": season,
+            "days": len(rows),
+            "date_start": min(row["day"] for row in rows),
+            "date_end": max(row["day"] for row in rows),
+            **{name: sum(row[name] for row in rows) for name in counts},
+        }
+        for season, rows in sorted(seasons.items())
+    ]
 
 
 def _read_records(

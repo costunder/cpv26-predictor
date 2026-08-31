@@ -114,86 +114,95 @@ cpv26 db-check
 ## 4. KBO 데이터와 그래프 생성
 
 ~~~bash
-cpv26 kbo-fetch
-cpv26 kbo-import
-cpv26 db-check
-cpv26 kbo-graph-build
+cpv26 kbo-history-fetch &&
+cpv26 kbo-history-import &&
+cpv26 kbo-fetch --year 2023 --year 2024 --year 2025 --year 2026 &&
+cpv26 kbo-import --year 2023 --year 2024 --year 2025 --year 2026 &&
+cpv26 db-check &&
+cpv26 kbo-graph-build \
+  --output var/datasets/kbo_graph_2001_2026 \
+  --start-date 2001-01-01 \
+  --end-date 2026-07-26
 ~~~
 
-기본 대상은 2023·2024·2025 정규시즌입니다. 생성 위치는 다음과 같습니다.
+**2001년부터** 적재합니다. 기간별로 확보된 기록은 다릅니다.
+
+| 기간 | 학습에 쓰는 기록 |
+|---|---|
+| 2001~2022 | 실제 정규시즌 경기 결과·최종 득점 → Match·득점 헤드 |
+| 2023~2025 | 경기 결과와 관측 타석 → Match·득점·PA·LiveHit 헤드 |
+| 2026 | 7월 26일까지의 같은 항목, 별도 테스트 |
+
+과거 박스스코어를 타석 순서로 복원하거나 없는 PA·선수 안타 라벨을 만들지 않습니다.
+`kbo-history-import`가 연도별 경기 수를 출력하고, 그래프의 `manifest.json`에는
+`season_coverage`로 경기만 있는 수와 PA가 있는 수를 나눠 기록합니다.
+
+생성 위치는 다음과 같습니다.
 
 | 위치 | 내용 |
 |---|---|
+| var/datasets/kbo_history/ | 2001~2022년 고정 원천 JSON과 SOURCE.json |
 | var/datasets/kbo_playbyplay/v0/ | 내려받은 원천 Parquet와 SOURCE.json |
 | var/cpv26.duckdb | 정규화한 선수·팀·경기·타석 DB |
-| var/reports/kbo_import.json | 적재 결과와 원천 품질 검사 |
-| var/datasets/kbo_graph/ | 실제 날짜별 RelGNN graph dataset/cache |
+| var/reports/kbo_history_import.json | 역사 경기 적재·중복·연도별 제공 범위 |
+| var/reports/kbo_import.json | 타석 원천 적재 결과와 품질 검사 |
+| var/datasets/kbo_graph_2001_2026/ | 2001년부터의 날짜별 RelGNN 그래프 |
 
-kbo-fetch는 고정된 공개 파일과 SHA-256을 확인합니다. KBO·NAVER·Statiz 사이트를
-새로 크롤링하거나 실시간으로 갱신하는 명령이 아닙니다. 같은 revision의 파일과
-적재 행은 재실행 시 재사용합니다.
+두 fetch 명령은 고정된 공개 파일과 SHA-256을 확인합니다. 같은 파일과 적재 행은
+재실행 시 재사용합니다. 기존 `var/datasets/kbo_graph/`와 checkpoint는 건드리지 않습니다.
+역사 원천의 출처와 보완 기록은 [데이터 설명](docs/GPU_TRAINING.md#데이터-출처와-고정-스냅샷)에 있습니다.
 
 kbo-graph-build는 대상 날짜 이전의 최대 90일 관계를 사용해 날짜별 그래프를 만듭니다.
 그날의 경기 결과는 정답이며, 같은 날의 결과를 과거 관계 입력으로 사용하지 않습니다.
-원본의 누락·불완전한 라벨은 임의의 안타나 아웃으로 채우지 않습니다. 다운로드·적재
-보고서와 [원천 데이터 설명](docs/KBO_BASELINE.md)을 함께 확인하세요.
-원천의 당시 발표 시각은 재구성된 값이므로 이 실험은 retrospective benchmark이며,
-실시간으로 수집한 당시 정보만으로 재현한 V26 운영 검증과는 구분합니다.
+90일은 입력 이력 범위이고, 학습 기간을 최근 90일로 제한한다는 뜻은 아닙니다.
+원천의 당시 발표 시각은 재구성한 값이므로 실시간 운영 재현과는 구분합니다.
 
-~~~bash
-ls -lah var/datasets/kbo_graph
-~~~
+## 5. 2001년부터 RelGNN 학습
 
-## 5. RelGNN 학습
-
-아래 run 이름은 이번 실행을 구분하는 폴더 이름입니다. 새 실험에는 다른 이름을
-사용하고, 기존 실행을 이어갈 때만 --resume를 사용합니다.
+4절이 끝난 뒤 실행합니다. A100 MIG 10GB 예시는 날짜 한 개씩 학습합니다.
 
 ~~~bash
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph \
-  --run-dir var/runs/relgnn/kbo_2023_2024_v1 \
+  --dataset var/datasets/kbo_graph_2001_2026 \
+  --run-dir var/runs/relgnn/kbo_2001_2024_v1 \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
   --device cuda:0 \
   --epochs 30 \
-  --batch-days 2 \
+  --batch-days 1 \
   --amp auto
 ~~~
 
-위 명령의 기본 학습·평가 시즌은 다음과 같습니다.
-
 | 시즌 | 역할 |
 |---|---|
-| 2023 | 가중치를 학습하는 train |
-| 2024 | validation, early stopping, best.pt 선택 |
-| 2025 | 다음 절에서 명시적으로 실행하는 test |
+| 2001~2024 | 가중치를 학습하는 train |
+| 2025 | validation, early stopping, best.pt 선택 |
+| 2026-07-26까지 | 다음 절에서 별도로 실행하는 test |
 
-2025 test는 학습 중 자동 실행하지 않습니다. 기본 early stopping은 validation이
-6 epoch 동안 개선되지 않으면 멈추며, --patience 0은 이를 끕니다. --epochs는 최대
-전체 epoch 수이므로 early stopping이 먼저 끝낼 수 있습니다.
+`--chronological`은 매 epoch 2001년부터 날짜순으로 학습합니다. 연도가 바뀌어도
+가중치·optimizer를 유지하고, 다음 epoch에는 2001년부터 다시 학습합니다.
+요청한 학습연도의 자료가 빠졌으면 오류로 중단합니다.
 
-기본 모델은 hidden dimension 64, 관계 layer 2개, attention head 4개입니다.
-기본 learning rate는 0.0003, weight decay는 0.0001입니다. 서로 다른 정답을 쓰는
-세 Head가 공유 RelGNN backbone을 학습합니다.
+2026 test는 학습 중 실행하지 않습니다. validation이 6 epoch 동안 개선되지 않으면
+early stopping하며, `--patience 0`은 이를 끕니다. `--epochs`는 최대 전체 epoch 수입니다.
+이미 결과를 확인한 2025년은 여기서 검증용으로 사용하고 독립적인 최종 테스트로 부르지 않습니다.
 
-~~~text
-실제 KBO 기록 → 날짜 이전 관계 graph → 공유 RelGNN
-                                      ├─ PA: 타석 결과 10개 분류
-                                      ├─ Match: 홈팀 패·무·승
-                                      └─ Live Hit: 선수별 PA·안타 수 결합 분포
-                         2024 validation → best.pt
-                         별도 2025 test → 평가 보고서와 예측 Parquet
-~~~
+2001~2022년은 경기·득점 손실만 계산합니다. PA·LiveHit 손실을 0점 정답으로 채우는 것이
+아니라, 해당 질의 자체가 없습니다. 2023년부터는 관측 타석이 있는 날짜에서 네 헤드를 학습합니다.
+현재 LiveHit는 완료된 관측 PA가 한 개 이상인 선수-경기에 조건부인 분포입니다.
+미출장 확률이나 V26 계정별 최종 추천과 같지 않습니다.
 
-현재 Live Hit 학습은 완료된 관측 PA가 1개 이상인 선수-경기 기록에 조건부인 분포입니다.
-기록에 없는 미출장 후보까지 포함한 무조건부 출전확률이나 V26 계정 점수와 같지 않습니다.
-같은 경기 선수들의 joint scenario와 게임 보너스를 결합하는 최종 추천도 별도입니다.
-PA 보조 task는 해당 타석 직전 상태를 사용하고, Match·Live Hit는 날짜 이전 입력을
-사용합니다.
+기본 모델은 hidden dimension 64, 관계 layer 2개, attention head 4개이며,
+learning rate 0.0003, weight decay 0.0001입니다. 상세 구조는 [GPU 학습 설명](docs/GPU_TRAINING.md)에 있습니다.
 
-학습 결과는 지정한 run 폴더에 저장됩니다.
+위 run 이름은 이번 실험용입니다. 같은 이름으로 이미 실행했다면 새 이름을 사용합니다.
+이전에 2023년부터 학습한 checkpoint를 이번 데이터에 `--resume`하지 않습니다.
 
 ~~~text
-var/runs/relgnn/kbo_2023_2024_v1/
+var/runs/relgnn/kbo_2001_2024_v1/
 ├── config.json
 ├── history.jsonl
 ├── last.pt
@@ -205,61 +214,13 @@ history.jsonl에서 진행 기록을, training_report.json에서 학습 요약�
 best.pt는 validation으로 선택한 평가용 모델이고, last.pt는 학습 재개용입니다.
 GPU를 사용할 수 없으면 오류로 끝나며 CPU 학습으로 자동 전환하지 않습니다.
 
-### 더 많은 시즌을 시간순으로 학습하기
+## 6. 2026 부분 시즌 test 평가
 
-4절의 2023~2025년 적재를 마쳤다면 2026년 자료를 추가합니다. 현재 고정 원천은
-2023~2025년 정규시즌과 **2026년 7월 26일까지**이며, 2000~2022년 자료는 없습니다.
-아래 명령은 기존 그래프와 checkpoint를 보존하고 별도 그래프를 만듭니다.
-
-~~~bash
-cpv26 kbo-fetch --year 2026 &&
-cpv26 kbo-import --year 2026 --report var/reports/kbo_import_2026.json &&
-cpv26 db-check &&
-cpv26 kbo-graph-build \
-  --output var/datasets/kbo_graph_2023_2026 \
-  --start-date 2023-01-01 \
-  --end-date 2026-07-26
-~~~
-
-그래프 생성이 끝나면 실행합니다.
-
-~~~bash
-cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph_2023_2026 \
-  --train-start-year 2023 \
-  --train-end-year 2024 \
-  --validation-year 2025 \
-  --test-year 2026 \
-  --chronological \
-  --device cuda:0 \
-  --epochs 30 \
-  --batch-days 1 \
-  --amp auto
-~~~
-
-학습 경기는 기존 2023년 720경기에서 **2023~2024년 1,440경기**로 늘어납니다.
-2025년은 검증·모델 선택, 2026년 부분 시즌은 별도 테스트입니다. 이미 결과를 확인한
-2025년을 다시 독립적인 최종 테스트로 취급하지 않습니다.
-
-`--chronological`은 날짜를 섞지 않고 2023년부터 2024년까지 순서대로 학습합니다.
-연도가 바뀌어도 가중치·optimizer를 유지하며, 다음 epoch에는 처음 날짜부터 다시
-학습합니다. 예측한 뒤 새 결과를 받아 갱신하는 온라인 학습은 아니며, 입력의 90일
-이력 범위는 그대로입니다. 옵션을 생략하면 기존처럼 학습 날짜를 섞습니다.
-
-run 폴더는 자동으로 새로 생성됩니다. 완료 로그에 나온 실제 폴더의 `best.pt`를
-다음 절의 `relgnn-evaluate --split test`로 평가하면 이 실행에서는 **2026년 부분 시즌**을
-평가합니다. `--resume`는 새 시즌 추가용이 아니라 같은 데이터·분할·순서 설정의 학습
-재개용입니다. 요청한 학습연도의 자료가 빠졌으면 오류로 중단합니다.
-2000~2022년까지 넓히려면 검증된 타석 원천과 그에 맞는 변환 코드가 먼저 필요합니다.
-
-## 6. 2025 test 평가
-
-기본 2023/2024/2025 분할의 평가 예시입니다. 학습이 끝난 뒤 best.pt를 명시해 실행합니다.
-다년 학습 실행을 평가할 때는 checkpoint 경로를 해당 실행의 실제 `best.pt`로 바꿉니다.
+5절 학습이 끝난 뒤 best.pt를 명시해 실행합니다. 다른 run 이름을 썼다면 경로도 바꿉니다.
 
 ~~~bash
 cpv26 relgnn-evaluate \
-  --checkpoint var/runs/relgnn/kbo_2023_2024_v1/best.pt \
+  --checkpoint var/runs/relgnn/kbo_2001_2024_v1/best.pt \
   --split test \
   --device cuda:0
 ~~~
@@ -275,8 +236,8 @@ evaluations/test-<run-id>/
 └── pa_predictions.parquet
 ~~~
 
-2025 결과를 본 뒤 모델 설정을 바꾸고 같은 2025 성능을 다시 고르면 독립적인 최종
-테스트가 아닙니다. 설정 선택은 2024 validation으로 하고 test 결과는 따로 기록합니다.
+평가 연도는 checkpoint에 저장한 분할에서 읽습니다. 2026 자료는 부분 시즌이므로
+전체 시즌 성능이라고 표시하지 않습니다. test 결과를 보고 설정을 골랐다면 그 사실도 기록합니다.
 
 ## 7. 학습 재개
 
@@ -286,43 +247,38 @@ best.pt는 재개용으로 사용하지 않습니다.
 
 ~~~bash
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph \
-  --resume var/runs/relgnn/kbo_2023_2024_v1/last.pt \
+  --dataset var/datasets/kbo_graph_2001_2026 \
+  --resume var/runs/relgnn/kbo_2001_2024_v1/last.pt \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
   --device cuda:0 \
   --epochs 50 \
-  --batch-days 2 \
+  --batch-days 1 \
   --amp auto
 ~~~
 
 --run-dir를 생략하면 checkpoint의 부모 폴더를 사용합니다. --epochs 50은 추가
 50 epoch가 아니라 전체 목표 50 epoch입니다. 30 epoch까지 저장됐다면 최대 20 epoch를
 더 실행합니다. 재개할 때는 같은 데이터셋과 모델 설정을 유지합니다.
+이 명령은 같은 실행의 중단 지점을 잇습니다. 새 경기 자동 수집·추가 학습은 하지 않습니다.
 재개는 마지막 checkpoint에 저장된 지점부터이며, 이후 저장되지 않은 batch의 진행은
 복구하지 않습니다. 기존 프로세스가 종료됐는지 확인한 뒤 재개합니다.
 
 ## 8. VRAM 부족
 
-먼저 한 batch의 날짜 수를 줄여 실행합니다.
-
-~~~bash
-cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph \
-  --run-dir var/runs/relgnn/kbo_2023_2024_small_batch \
-  --device cuda:0 \
-  --epochs 30 \
-  --batch-days 1 \
-  --max-pa-per-day 128 \
-  --amp auto
-~~~
+5절은 이미 `--batch-days 1`입니다. 학습 PA 질의에서 메모리가 부족하면
+`--max-pa-per-day 64`를 추가하고 새 run 이름으로 실행합니다.
 
 --max-pa-per-day의 기본값은 128이며 훈련 PA query만 표본화합니다. validation과
 test PA는 전부 평가하므로 이 옵션이 평가 메모리까지 제한하지는 않습니다.
 --amp auto는 GPU가 지원하는 혼합정밀도를 선택합니다. 데이터 로딩 프로세스가
 문제라면 --workers 0으로 확인할 수 있습니다.
 
-다중 GPU·분산 학습은 지원하지 않습니다. A100 MIG 10GB에서 전체 학습의 최대 메모리
-사용량은 아직 측정하지 않았습니다. `--batch-days 1`부터 시험하고 학습·평가의
-peak memory를 각각 확인합니다.
+다중 GPU·분산 학습은 지원하지 않습니다. 2001년부터의 전체 학습·평가 메모리와 성능은
+실제 실행 결과로 확인해야 합니다.
 
 ## 9. 환경 활성화와 코드 업데이트
 
@@ -411,8 +367,13 @@ bash scripts/setup.sh ml-cpu
 ~~~bash
 source scripts/activate.sh
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph \
+  --dataset var/datasets/kbo_graph_2001_2026 \
   --run-dir var/runs/relgnn/cpu_validation \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
   --device cpu \
   --amp off \
   --workers 0 \
@@ -470,18 +431,14 @@ cpv26 gpu-check --device cuda:0
 
 ### KBO source file not found / graph dataset not found
 
-~~~bash
-cpv26 kbo-fetch
-cpv26 kbo-import
-cpv26 kbo-graph-build
-~~~
-
-다른 경로를 사용했다면 각 명령의 --help에서 source/dataset 옵션을 확인하고 같은
-데이터셋을 가리키도록 맞춥니다.
+[4절의 데이터·그래프 생성 명령](#4-kbo-데이터와-그래프-생성)을 실행합니다.
+다른 경로를 사용했다면 각 명령의 --help에서 source/dataset 옵션을 확인하고,
+학습 명령도 같은 그래프 경로를 가리키도록 맞춥니다.
 
 ### SHA-256 mismatch
 
-오류 파일명과 SOURCE.json의 revision을 확인하고 kbo-fetch를 다시 실행합니다.
+오류 파일명과 SOURCE.json의 revision을 확인하고 해당 원천의
+`kbo-history-fetch` 또는 `kbo-fetch`를 다시 실행합니다.
 다른 revision의 파일을 검증 없이 같은 파일명으로 바꾸지 않습니다.
 
 ### Conda가 없거나 conda activate가 동작하지 않음
@@ -506,7 +463,8 @@ Conda 자체가 없다면 [공식 설치 안내](https://docs.conda.io/projects/
 
 `environment.yml`은 Git에 포함하며, `.env`, `var/` 아래의 실행 데이터와 모델은
 Git에서 제외됩니다. 예전 `.venv` 폴더도 추적하지 않으며 실행 경로에서 사용하지 않습니다.
-원본 KBO 파일과 학습 모델을 GitHub에 재배포하지 않습니다.
+원본 아카이브와 학습 모델을 GitHub에 재배포하지 않습니다. 아카이브에서 빠진 10경기는
+공식 기록으로 확인한 최종 점수와 출처만 별도 보완 자료로 포함합니다.
 
 - 원천 출처·라이선스·품질 검사: [docs/KBO_BASELINE.md](docs/KBO_BASELINE.md)
 - RelGNN 그래프·GPU 학습의 기술 설명: [docs/GPU_TRAINING.md](docs/GPU_TRAINING.md)

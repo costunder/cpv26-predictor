@@ -197,15 +197,20 @@ class DuckDBStore:
         rows: Mapping[str, Any] | Iterable[Mapping[str, Any]],
         *,
         ignore_existing: bool = False,
+        batch_size: int = 1,
     ) -> int:
         """Append homogeneous rows and return the submitted row count.
 
         ``ignore_existing`` only suppresses primary-key duplicates, which makes
         source ingestion retry-safe without modifying the existing row.
+        ``batch_size`` optionally groups bound-parameter inserts after the same
+        validation/normalization, within the same all-or-nothing transaction.
         """
 
         if self.read_only:
             raise PermissionError("cannot append through a read-only store")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
         self._validate_table(table)
         materialised = self._materialise_rows(rows)
         if not materialised:
@@ -243,7 +248,19 @@ class DuckDBStore:
             try:
                 if table == "prediction_run":
                     self._validate_new_prediction_runs(materialised)
-                self._connection.executemany(sql, values)
+                if batch_size == 1:
+                    self._connection.executemany(sql, values)
+                else:
+                    for offset in range(0, len(values), batch_size):
+                        batch = values[offset : offset + batch_size]
+                        value_sql = ", ".join(f"({placeholders})" for _ in batch)
+                        batched_sql = (
+                            f'INSERT INTO "{table}" ({column_sql}) VALUES '
+                            f"{value_sql}{conflict_sql}"
+                        )
+                        self._connection.execute(
+                            batched_sql, [value for row in batch for value in row]
+                        )
                 if owns_transaction:
                     self._connection.execute("COMMIT")
             except Exception:

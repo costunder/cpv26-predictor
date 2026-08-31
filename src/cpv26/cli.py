@@ -24,6 +24,12 @@ from cpv26.data import (
     table_names,
     write_import_report,
 )
+from cpv26.data.kbo_history_ingest import import_kbo_history
+from cpv26.data.kbo_history_source import (
+    KBO_HISTORY_FILES,
+    download_kbo_history,
+    select_history_artifacts,
+)
 from cpv26.data.kbo_playbyplay import sha256_file
 from cpv26.pipelines import (
     LIVE_HIT_CANONICAL_SQL,
@@ -59,6 +65,24 @@ def _require_database(path: Path) -> None:
 
 def _kbo_dataset_directory(settings: Settings) -> Path:
     return settings.home / "datasets" / "kbo_playbyplay" / "v0"
+
+
+def _history_years(start_year: int, end_year: int) -> tuple[int, ...]:
+    if start_year > end_year:
+        raise typer.BadParameter("--start-year must not exceed --end-year")
+    return tuple(range(start_year, end_year + 1))
+
+
+def _write_json_report(output: Path, value: object) -> None:
+    saved = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_name(f".{output.name}.{uuid4().hex}.part")
+    try:
+        with partial.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(saved)
+        partial.replace(output)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def _model_run_directory(settings: Settings, task: str) -> Path:
@@ -259,6 +283,103 @@ def kbo_import(
         f"{report.unreconciled_score_games} unreconciled games; "
         f"{report.source_unallocated_runs} source-unallocated runs"
     )
+    console.print(f"[green]Import report ready[/green]: {output}")
+
+
+@app.command("kbo-history-fetch")
+def kbo_history_fetch(
+    start_year: Annotated[
+        int, typer.Option("--start-year", min=2001, max=2022, help="First season, inclusive.")
+    ] = 2001,
+    end_year: Annotated[
+        int, typer.Option("--end-year", min=2001, max=2022, help="Last season, inclusive.")
+    ] = 2022,
+    destination: Annotated[
+        Path | None,
+        typer.Option(
+            "--destination", "-d",
+            help="Archive directory (default: CPV26_HOME/datasets/kbo_history).",
+        ),
+    ] = None,
+) -> None:
+    """Download checksum-pinned 2001-2022 game archives; these are not PA records."""
+
+    years = _history_years(start_year, end_year)
+    settings = _settings()
+    output = (destination or settings.home / "datasets" / "kbo_history").expanduser().resolve()
+    try:
+        paths = download_kbo_history(output, years=years)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        error_console.print(f"[red]KBO history download failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]KBO history ready[/green]: {output} ({start_year}-{end_year})")
+    for path in paths:
+        console.print(f"  {path.name}")
+    console.print("  SOURCE.json")
+
+
+@app.command("kbo-history-import")
+def kbo_history_import(
+    start_year: Annotated[
+        int, typer.Option("--start-year", min=2001, max=2022, help="First season, inclusive.")
+    ] = 2001,
+    end_year: Annotated[
+        int, typer.Option("--end-year", min=2001, max=2022, help="Last season, inclusive.")
+    ] = 2022,
+    source_dir: Annotated[
+        Path | None, typer.Option("--source-dir", help="Directory produced by kbo-history-fetch.")
+    ] = None,
+    report_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--report", help="Report path (default: CPV26_HOME/reports/kbo_history_import.json)."
+        ),
+    ] = None,
+) -> None:
+    """Import historical final scores for match/run training, without inventing PA labels."""
+
+    years = _history_years(start_year, end_year)
+    settings = _settings()
+    directory = (source_dir or settings.home / "datasets" / "kbo_history").expanduser().resolve()
+    output = (
+        report_path or settings.home / "reports" / "kbo_history_import.json"
+    ).expanduser().resolve()
+    if (
+        output == settings.database_path.resolve()
+        or output == directory
+        or directory in output.parents
+    ):
+        raise typer.BadParameter("--report must not overwrite the database or source archive")
+    missing = [
+        directory / artifact.filename
+        for artifact in select_history_artifacts(KBO_HISTORY_FILES, years=years)
+        if not (directory / artifact.filename).is_file()
+    ]
+    if missing:
+        error_console.print(f"[red]KBO history source file not found:[/red] {missing[0]}")
+        error_console.print("Run `cpv26 kbo-history-fetch` first.")
+        raise typer.Exit(code=1)
+    try:
+        settings.ensure_runtime_directories()
+        with DuckDBStore(settings.database_path) as store:
+            report = import_kbo_history(store, directory, years=years)
+            store.assert_referential_integrity()
+            store.assert_composite_referential_integrity()
+        _write_json_report(output, report)
+    except (DuckDBError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        error_console.print(f"[red]KBO history import failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    table = Table(title="KBO historical game coverage (match/run only)")
+    table.add_column("Season")
+    table.add_column("Games", justify="right")
+    table.add_column("First date")
+    table.add_column("Last date")
+    for season in report["season_coverage"]:
+        table.add_row(
+            str(season["year"]), str(season["games"]), season["date_start"], season["date_end"]
+        )
+    console.print(table)
+    console.print(f"Historical games: {report['games']:,}; no PA or LiveHit labels created.")
     console.print(f"[green]Import report ready[/green]: {output}")
 
 

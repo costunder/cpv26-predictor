@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "kind": "verified_final_score_supplement",
+  "publisher": "Korea Baseball Organization",
+  "retrieved_at": "2026-08-31",
+  "retrieved_at_precision": "day",
+  "endpoint": "https://www.koreabaseball.com/ws/Main.asmx/GetKboGameList",
+  "method": "POST",
+  "request_content_type": "application/x-www-form-urlencoded",
+  "scope": "final_game_score_only",
+  "description": "Ten actual final scores verified against five dated official KBO responses to fill identified gaps in public game archives. No play-by-play, player records, HTML or upstream software is reproduced. Unknown hit and error totals remain null.",
+  "field_mapping": {
+    "game_key": "G_ID with an underscore inserted after the eight-digit date",
+    "away_team_code": "AWAY_ID",
+    "home_team_code": "HOME_ID",
+    "away_runs": "T_SCORE_CN",
+    "home_runs": "B_SCORE_CN",
+    "scoreboard_order": "away, home",
+    "result": "win/loss derived from the verified final run totals"
+  },
+  "verified_flags_for_every_game": {
+    "GAME_STATE_SC": "3",
+    "CANCEL_SC_ID": "0",
+    "SR_ID": 0
+  },
+  "supplements": [
+    {
+      "filename": "history_supplement_2015.json",
+      "year": 2015,
+      "sha256": "efba4b0bca8e58d2e9711c94e54445f65cacab26de3d1dee75aa7febcb734682",
+      "game_count": 1,
+      "game_keys": ["20150708_HTWO0"],
+      "reason": "The pinned annual archive contains 719 regular games and omits this game.",
+      "archive_url": "https://raw.githubusercontent.com/dialektike/KBO-league/00c63c74c3c0590f3ca2fae5c03d4d2eeaa18296/data/temp/temp_data_2015.json"
+    },
+    {
+      "filename": "history_supplement_2018.json",
+      "year": 2018,
+      "sha256": "4652c4dad9c150f12956ed510e8392a088f0b7c88c7d4f2079ce279ba6166ca4",
+      "game_count": 1,
+      "game_keys": ["20180801_WOSK0"],
+      "reason": "The pinned annual archive contains 719 regular games and omits this game.",
+      "archive_url": "https://raw.githubusercontent.com/dialektike/KBO-league/00c63c74c3c0590f3ca2fae5c03d4d2eeaa18296/data/temp/temp_data_2018.json"
+    },
+    {
+      "filename": "history_supplement_2021.json",
+      "year": 2021,
+      "sha256": "b048c8630b1145fe102e9bed6ed83e1a37d244cfb338f2cd0a260e69a5e0c8c1",
+      "game_count": 8,
+      "game_keys": [
+        "20210509_HHLG2",
+        "20210509_NCKT2",
+        "20210509_OBHT1",
+        "20210509_WOSK1",
+        "20210616_LTHH1",
+        "20210616_SKHT2",
+        "20210901_HTOB2",
+        "20210901_NCSK1"
+      ],
+      "reason": "The pinned monthly archives repeat eight identical doubleheader records and omit the other game of each pair. Removing those duplicates and the October 31 tiebreaker leaves 712 regular games; these eight verified games complete the regular-season final scores.",
+      "archive_urls": [
+        "https://raw.githubusercontent.com/LOPES-HUFS/KBO_data/94e72c797e07b3b72167c92258728bef599ed5fc/sample_data/2021/2021_05.json",
+        "https://raw.githubusercontent.com/LOPES-HUFS/KBO_data/94e72c797e07b3b72167c92258728bef599ed5fc/sample_data/2021/2021_06.json",
+        "https://raw.githubusercontent.com/LOPES-HUFS/KBO_data/94e72c797e07b3b72167c92258728bef599ed5fc/sample_data/2021/2021_09.json"
+      ]
+    }
+  ],
+  "responses": [
+    {
+      "form": {"leId": "1", "srId": "0", "date": "20150708"},
+      "response_sha256": "954f62eee5a4b7c5902a90f5b7f7ca9af1e1a28d5dea6040635ecc920108feaa",
+      "game_ids": ["20150708HTWO0"],
+      "note": "The official response repeats this game with the same final score. Only one factual record is included."
+    },
+    {
+      "form": {"leId": "1", "srId": "0", "date": "20180801"},
+      "response_sha256": "cd436caeefa02ed65a00119b50a809941b1feb9ec4d18c97a04cc75e03c26478",
+      "game_ids": ["20180801WOSK0"]
+    },
+    {
+      "form": {"leId": "1", "srId": "0", "date": "20210509"},
+      "response_sha256": "982cd875d90b7d45c3875f0f03ef84d9c72d838dcb8b1ee3f95a7a9ff62a0630",
+      "game_ids": ["20210509HHLG2", "20210509NCKT2", "20210509OBHT1", "20210509WOSK1"]
+    },
+    {
+      "form": {"leId": "1", "srId": "0", "date": "20210616"},
+      "response_sha256": "5b09c7df0e76de0521d91b41900b95d842292dff5a25ea818c3abccffc38b4d7",
+      "game_ids": ["20210616LTHH1", "20210616SKHT2"]
+    },
+    {
+      "form": {"leId": "1", "srId": "0", "date": "20210901"},
+      "response_sha256": "867884bb3c4dab28d3bc9d0040d0bc6974c09acce5cbd0332cb9eaf66edb176c",
+      "game_ids": ["20210901HTOB2", "20210901NCSK1"]
+    }
+  ],
+  "excluded_non_regular_game": {
+    "game_id": "20211031KTSS0",
+    "SR_ID": 6,
+    "classification": "first_place_tiebreaker_not_regular_series_0",
+    "evidence_url": "https://raw.githubusercontent.com/dialektike/KBO-league/00c63c74c3c0590f3ca2fae5c03d4d2eeaa18296/data/schedule/2021/2021_10.csv",
+    "note": "The archived SR_NM label is inconsistent; classification uses the numerical SR_ID."
+  }
+}

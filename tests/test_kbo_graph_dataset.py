@@ -15,7 +15,7 @@ from cpv26.data.kbo_graph_dataset import KBOGraphDataset, build_kbo_graph_datase
 _KST = ZoneInfo("Asia/Seoul")
 
 
-def _database(path: Path) -> None:
+def _database(path: Path, *, season: int = 2023, include_pas: bool = True) -> None:
     connection = duckdb.connect(str(path))
     connection.execute("""
         CREATE TABLE source_revision (
@@ -40,7 +40,7 @@ def _database(path: Path) -> None:
             ingested_at TIMESTAMPTZ, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ
         )
     """)
-    at = datetime(2023, 4, 1, tzinfo=_KST)
+    at = datetime(season, 4, 1, tzinfo=_KST)
     connection.execute(
         "INSERT INTO source_revision VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
@@ -57,16 +57,19 @@ def _database(path: Path) -> None:
         ],
     )
     for number in (1, 2, 3):
-        _game(connection, f"g{number}", number)
-    _pa(connection, "pa1", "g1", 1, "old-batter", "old-pitcher", "single")
-    _pa(connection, "pa2", "g2", 2, "new-batter", "new-pitcher", "home_run")
-    _pa(connection, "pa3", "g2", 2, "old-batter", "old-pitcher", "strikeout")
-    _pa(connection, "pa4", "g3", 3, "old-batter", "old-pitcher", "walk")
+        _game(connection, f"g{number}", number, season=season)
+    if include_pas:
+        _pa(connection, "pa1", "g1", 1, "old-batter", "old-pitcher", "single", season=season)
+        _pa(connection, "pa2", "g2", 2, "new-batter", "new-pitcher", "home_run", season=season)
+        _pa(connection, "pa3", "g2", 2, "old-batter", "old-pitcher", "strikeout", season=season)
+        _pa(connection, "pa4", "g3", 3, "old-batter", "old-pitcher", "walk", season=season)
     connection.close()
 
 
-def _game(connection: duckdb.DuckDBPyConnection, game_id: str, day: int) -> None:
-    start = datetime(2023, 4, day, tzinfo=_KST)
+def _game(
+    connection: duckdb.DuckDBPyConnection, game_id: str, day: int, *, season: int = 2023
+) -> None:
+    start = datetime(season, 4, day, tzinfo=_KST)
     event = start + timedelta(hours=23, minutes=59, seconds=59)
     connection.execute(
         "INSERT INTO game VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -99,8 +102,9 @@ def _pa(
     *,
     row_id: str | None = None,
     available_at: datetime | None = None,
+    season: int = 2023,
 ) -> None:
-    start = datetime(2023, 4, day, tzinfo=_KST)
+    start = datetime(season, 4, day, tzinfo=_KST)
     event = start + timedelta(hours=23, minutes=59, seconds=59)
     hit = outcome in ("single", "double", "triple", "home_run")
     connection.execute(
@@ -168,6 +172,83 @@ def test_daily_cutoff_isolated_newcomers_and_safe_npz(tmp_path: Path) -> None:
             assert not array.dtype.hasobject
             if np.issubdtype(array.dtype, np.number):
                 assert np.isfinite(array).all()
+
+
+def test_2001_game_only_graph_preserves_scores_without_fabricating_player_labels(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database, season=2001, include_pas=False)
+    dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
+    assert dataset.days() == (date(2001, 4, 1), date(2001, 4, 2), date(2001, 4, 3))
+    for day in dataset.days():
+        graph = dataset.load_day(day)
+        assert graph.player_ids == ()
+        assert graph.node_features["player"].shape == (0, 4)
+        assert graph.role_features["batting"].shape == (0, 8)
+        assert graph.role_features["pitching"].shape == (0, 8)
+        assert graph.pa_context.shape == (0, 10)
+        assert graph.pa_targets.shape == (0,)
+        assert graph.live_hit_pa.shape == (0,)
+        assert graph.live_hit_hits.shape == (0,)
+        assert len(graph.match_targets) == 1
+        for name, route in graph.routes.items():
+            if name != "home_team_game_away_team":
+                assert len(route["source_index"]) == 0
+    first = dataset.load_day("2001-04-01")
+    assert not first.node_features["team"].any()
+    assert not first.routes["home_team_game_away_team"]["source_index"].size
+    second = dataset.load_day("2001-04-02")
+    assert second.match_targets.tolist() == [2]
+    assert second.match_runs.tolist() == [[2, 1]]
+    home = second.team_ids.index("home")
+    np.testing.assert_allclose(second.node_features["team"][home, 1:6], [0, 1, 0.1, 0.1, 0])
+    assert len(second.routes["home_team_game_away_team"]["source_index"]) == 1
+    assert dataset.manifest["season_coverage"] == [
+        {
+            "season": 2001,
+            "days": 3,
+            "date_start": "2001-04-01",
+            "date_end": "2001-04-03",
+            "games": 3,
+            "games_with_pa": 0,
+            "game_only_games": 3,
+            "observed_completed_pa": 0,
+            "live_hit_queries": 0,
+            "pa_queries": 0,
+        }
+    ]
+
+
+def test_game_only_same_day_scores_and_future_pa_do_not_enter_historical_features(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database, season=2001, include_pas=False)
+    before = build_kbo_graph_dataset(database, tmp_path / "before").load_day("2001-04-02")
+    connection = duckdb.connect(str(database))
+    connection.execute("UPDATE game SET home_score = 30 WHERE game_id IN ('g2', 'g3')")
+    _game(connection, "g2-doubleheader", 2, season=2001)
+    _game(connection, "g2023", 1)
+    _pa(connection, "future-pa", "g2023", 1, "future-batter", "future-pitcher", "double")
+    connection.close()
+    dataset = build_kbo_graph_dataset(database, tmp_path / "after")
+    after = dataset.load_day("2001-04-02")
+    assert before.player_ids == after.player_ids == ()
+    assert before.team_ids == after.team_ids
+    for key in before.arrays:
+        if key.endswith("features") or "__" in key:
+            np.testing.assert_array_equal(before.arrays[key], after.arrays[key])
+    assert after.match_runs.tolist() == [[30, 1], [2, 1]]
+    early, recent = dataset.manifest["season_coverage"]
+    assert early["season"] == 2001
+    assert early["games"] == early["game_only_games"] == 4
+    assert early["games_with_pa"] == early["observed_completed_pa"] == 0
+    assert recent["season"] == 2023
+    assert recent["games"] == recent["games_with_pa"] == 1
+    assert recent["game_only_games"] == 0
+    assert recent["observed_completed_pa"] == recent["pa_queries"] == 1
+    assert recent["live_hit_queries"] == 1
 
 
 def test_same_day_results_and_lineup_do_not_change_graph_features(tmp_path: Path) -> None:
@@ -268,6 +349,33 @@ def test_cache_incremental_reuse_integrity_and_corruption_rebuild(tmp_path: Path
     assert repaired.manifest["cache_built_days"] == 1
     assert KBOGraphDataset(output).load_day("2023-04-01").day == date(2023, 4, 1)
     assert not list(output.rglob("*.part"))
+
+
+def test_coverage_metadata_upgrade_reuses_legacy_graph_arrays_and_fingerprint(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    output = tmp_path / "graph"
+    first = build_kbo_graph_dataset(database, output)
+    paths = [output / entry["file"] for entry in first.manifest["days"]]
+    original_times = [path.stat().st_mtime_ns for path in paths]
+    for path in paths:
+        sidecar = path.with_suffix(".json")
+        entry = json.loads(sidecar.read_text(encoding="utf-8"))
+        for key in ("games_with_pa", "game_only_games", "observed_completed_pa"):
+            entry.pop(key)
+        sidecar.write_text(json.dumps(entry), encoding="utf-8")
+    updated = build_kbo_graph_dataset(database, output)
+    assert updated.manifest["fingerprint"] == first.manifest["fingerprint"]
+    assert updated.manifest["cache_reused_days"] == 3
+    assert updated.manifest["cache_built_days"] == 0
+    assert [path.stat().st_mtime_ns for path in paths] == original_times
+    assert updated.manifest["season_coverage"] == first.manifest["season_coverage"]
+    assert updated.manifest["season_coverage"][0]["games_with_pa"] == 3
+    assert updated.manifest["season_coverage"][0]["game_only_games"] == 0
+    assert updated.manifest["season_coverage"][0]["observed_completed_pa"] == 4
+    assert updated.manifest["days"] == first.manifest["days"]
 
 
 def test_reject_bad_options_and_unknown_day(tmp_path: Path) -> None:

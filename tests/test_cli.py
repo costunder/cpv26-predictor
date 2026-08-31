@@ -41,6 +41,8 @@ def test_kbo_commands_are_available_without_loading_catboost() -> None:
     for command in (
         "kbo-fetch",
         "kbo-import",
+        "kbo-history-fetch",
+        "kbo-history-import",
         "kbo-match-evaluate",
         "kbo-live-hit-evaluate",
         "gpu-check",
@@ -58,10 +60,10 @@ def test_kbo_commands_are_available_without_loading_catboost() -> None:
         ([], (2023,), 2024, 2025, False),
         (
             [
-                "--train-start-year", "2000", "--train-end-year", "2024",
+                "--train-start-year", "2001", "--train-end-year", "2024",
                 "--validation-year", "2025", "--test-year", "2026", "--chronological",
             ],
-            tuple(range(2000, 2025)),
+            tuple(range(2001, 2025)),
             2025,
             2026,
             True,
@@ -198,6 +200,195 @@ def test_kbo_import_explains_missing_source(tmp_path: Path, monkeypatch: MonkeyP
     assert result.exit_code == 1
     assert "KBO source file not found" in result.output
     assert "cpv26 kbo-fetch" in result.output
+
+
+@pytest.mark.parametrize("years", [(2001, 2022), (2001, 2001), (2021, 2022)])
+def test_kbo_history_fetch_uses_inclusive_year_range_and_destination(
+    tmp_path: Path, monkeypatch: MonkeyPatch, years: tuple[int, int]
+) -> None:
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    calls: list[tuple[Path, tuple[int, ...]]] = []
+
+    def fake_download(destination: Path, *, years: Any) -> tuple[Path, ...]:
+        calls.append((destination, tuple(years)))
+        return (destination / "verified_archive.json",)
+
+    monkeypatch.setattr(cli_module, "download_kbo_history", fake_download)
+    options = []
+    destination = runtime / "datasets" / "kbo_history"
+    if years != (2001, 2022):
+        destination = tmp_path / "chosen-archive"
+        options = [
+            "--start-year", str(years[0]), "--end-year", str(years[1]),
+            "--destination", str(destination),
+        ]
+    result = CliRunner().invoke(app, ["kbo-history-fetch", *options])
+    assert result.exit_code == 0, result.output
+    assert calls == [(destination.resolve(), tuple(range(years[0], years[1] + 1)))]
+    assert "KBO history ready" in result.output
+    assert "verified_archive.json" in result.output
+    assert not runtime.exists()
+
+
+@pytest.mark.parametrize("command", ["kbo-history-fetch", "kbo-history-import"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--start-year", "2000"],
+        ["--end-year", "2023"],
+        ["--start-year", "2022", "--end-year", "2001"],
+    ],
+)
+def test_kbo_history_commands_reject_unavailable_or_reversed_years_before_writes(
+    tmp_path: Path, monkeypatch: MonkeyPatch, command: str, options: list[str]
+) -> None:
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    monkeypatch.setenv("CPV26_DB_PATH", str(runtime / "cpv26.duckdb"))
+    result = CliRunner().invoke(app, [command, *options])
+    assert result.exit_code == 2
+    assert not runtime.exists()
+
+
+def test_kbo_history_import_missing_archive_does_not_create_database(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    monkeypatch.setenv("CPV26_DB_PATH", str(runtime / "cpv26.duckdb"))
+    result = CliRunner().invoke(app, ["kbo-history-import"])
+    assert result.exit_code == 1
+    assert "KBO history source file not found" in result.output
+    assert "cpv26 kbo-history-fetch" in result.output
+    assert not runtime.exists()
+
+
+@pytest.mark.parametrize("default_paths", [False, True])
+def test_kbo_history_import_forwards_years_checks_references_and_writes_coverage_report(
+    tmp_path: Path, monkeypatch: MonkeyPatch, default_paths: bool
+) -> None:
+    runtime = tmp_path / "runtime"
+    database = runtime / "cpv26.duckdb"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    monkeypatch.setenv("CPV26_DB_PATH", str(database))
+    directory = runtime / "datasets" / "kbo_history" if default_paths else tmp_path / "archives"
+    output = (
+        runtime / "reports" / "kbo_history_import.json"
+        if default_paths else tmp_path / "report.json"
+    )
+    years = tuple(range(2001, 2023)) if default_paths else (2001, 2002)
+    directory.mkdir(parents=True)
+    for artifact in cli_module.select_history_artifacts(cli_module.KBO_HISTORY_FILES, years):
+        (directory / artifact.filename).write_text("{}", encoding="utf-8")
+    calls: list[tuple[Path, tuple[int, ...]]] = []
+    checks: list[str] = []
+    report = {
+        "games": 532,
+        "season_coverage": [
+            {"year": 2001, "games": 532, "date_start": "2001-04-05", "date_end": "2001-10-04"}
+        ],
+        "inserted_rows": {"game": 532},
+        "total_rows": {"game": 532},
+    }
+
+    def fake_import(store: Any, source: Path, *, years: Any) -> dict[str, Any]:
+        assert store.connection.execute("SELECT count(*) FROM game").fetchone() == (0,)
+        calls.append((source, tuple(years)))
+        return report
+
+    monkeypatch.setattr(cli_module, "import_kbo_history", fake_import)
+    for name in ("assert_referential_integrity", "assert_composite_referential_integrity"):
+        original = getattr(cli_module.DuckDBStore, name)
+
+        def checked(self: Any, _name: str = name, _original: Any = original) -> None:
+            checks.append(_name)
+            _original(self)
+
+        monkeypatch.setattr(cli_module.DuckDBStore, name, checked)
+    options = [] if default_paths else [
+        "--start-year", "2001", "--end-year", "2002",
+        "--source-dir", str(directory), "--report", str(output),
+    ]
+    result = CliRunner().invoke(app, ["kbo-history-import", *options])
+    assert result.exit_code == 0, result.output
+    assert calls == [(directory.resolve(), years)]
+    assert checks == ["assert_referential_integrity", "assert_composite_referential_integrity"]
+    assert json.loads(output.read_text(encoding="utf-8")) == report
+    assert "Historical games: 532" in result.output
+    assert "no PA or LiveHit labels created" in result.output
+    assert not list(output.parent.glob("*.part"))
+
+
+@pytest.mark.parametrize("target", ["database", "source"])
+def test_kbo_history_import_report_cannot_overwrite_database_or_source(
+    tmp_path: Path, monkeypatch: MonkeyPatch, target: str
+) -> None:
+    runtime = tmp_path / "runtime"
+    database = runtime / "cpv26.duckdb"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    monkeypatch.setenv("CPV26_DB_PATH", str(database))
+    output = (
+        database if target == "database" else runtime / "datasets" / "kbo_history" / "SOURCE.json"
+    )
+    result = CliRunner().invoke(app, ["kbo-history-import", "--report", str(output)])
+    assert result.exit_code == 2
+    assert "must not overwrite" in result.output
+    assert not runtime.exists()
+
+
+def test_kbo_history_fetch_failure_is_reported_without_traceback(monkeypatch: MonkeyPatch) -> None:
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("archive SHA-256 mismatch")
+
+    monkeypatch.setattr(cli_module, "download_kbo_history", fail)
+    result = CliRunner().invoke(app, ["kbo-history-fetch"])
+    assert result.exit_code == 1
+    assert "KBO history download failed" in result.output
+    assert "archive SHA-256 mismatch" in result.output
+
+
+def test_kbo_history_import_failure_preserves_previous_report(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    monkeypatch.setenv("CPV26_DB_PATH", str(runtime / "cpv26.duckdb"))
+    directory = runtime / "datasets" / "kbo_history"
+    directory.mkdir(parents=True)
+    for artifact in cli_module.select_history_artifacts(cli_module.KBO_HISTORY_FILES, (2001,)):
+        (directory / artifact.filename).write_text("{}", encoding="utf-8")
+    report = tmp_path / "report.json"
+    report.write_text('{"previous": true}\n', encoding="utf-8")
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise ValueError("existing canonical score conflict")
+
+    monkeypatch.setattr(cli_module, "import_kbo_history", fail)
+    result = CliRunner().invoke(
+        app, ["kbo-history-import", "--end-year", "2001", "--report", str(report)]
+    )
+    assert result.exit_code == 1
+    assert "KBO history import failed" in result.output
+    assert "existing canonical score conflict" in result.output
+    assert json.loads(report.read_text(encoding="utf-8")) == {"previous": True}
+    assert not list(tmp_path.rglob("*.part"))
+
+
+def test_json_report_failed_replace_preserves_previous_report_and_removes_partial(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    output = tmp_path / "report.json"
+    output.write_text('{"previous": true}\n', encoding="utf-8")
+
+    def fail_replace(self: Path, target: Path) -> None:
+        raise OSError("report replacement unavailable")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="replacement unavailable"):
+        cli_module._write_json_report(output, {"updated": True})
+    assert json.loads(output.read_text(encoding="utf-8")) == {"previous": True}
+    assert list(tmp_path.iterdir()) == [output]
 
 
 @pytest.mark.parametrize(

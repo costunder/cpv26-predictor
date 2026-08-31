@@ -62,6 +62,8 @@ jobs:
           cpv26 gpu-check --help
           cpv26 kbo-fetch --help
           cpv26 kbo-import --help
+          cpv26 kbo-history-fetch --help
+          cpv26 kbo-history-import --help
           cpv26 kbo-graph-build --help
           cpv26 relgnn-train --help
           cpv26 relgnn-evaluate --help
@@ -84,3 +86,15 @@ jobs:
         run: |
           source scripts/activate.sh
           python -m pip wheel . --no-deps -w dist
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("cpv26_predictor-*.whl"))
+          with ZipFile(wheel) as archive:
+              for name in (
+                  "history_supplement_2015.json", "history_supplement_2018.json",
+                  "history_supplement_2021.json", "history_supplement_sources.json",
+              ):
+                  assert f"cpv26/data/{name}" in archive.namelist(), name
+          PY
