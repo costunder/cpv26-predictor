@@ -269,9 +269,13 @@ def test_canonical_sql_selects_latest_revisions_before_state_filters(
 ) -> None:
     connection = duckdb.connect()
     # Minimal canonical schema columns used by the query; two revisions each.
+    connection.execute(
+        "CREATE TABLE source_revision (source_revision_id VARCHAR, source_name VARCHAR, "
+        "metadata_json JSON, ingested_at TIMESTAMPTZ)"
+    )
     temporal = (
         "available_at TIMESTAMPTZ, ingested_at TIMESTAMPTZ, "
-        "valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ"
+        "valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ, source_revision_id VARCHAR"
     )
     connection.execute(
         "CREATE TABLE observed_plate_appearance "
@@ -301,7 +305,7 @@ def test_canonical_sql_selects_latest_revisions_before_state_filters(
 
         connection.execute(
             "INSERT INTO observed_plate_appearance "
-            "VALUES (?, 'pa', 'g', 'p', 'A', 'B', ?, ?, 1, 0, ?, ?, ?, ?)",
+            "VALUES (?, 'pa', 'g', 'p', 'A', 'B', ?, ?, 1, 0, ?, ?, ?, ?, 'fixture')",
             [
                 str(revision),
                 "single" if revision == 2 else "strikeout",
@@ -310,16 +314,16 @@ def test_canonical_sql_selects_latest_revisions_before_state_filters(
             ],
         )
         connection.execute(
-            "INSERT INTO game VALUES (?, 'g', '2023-04-01 00:00:00+09', ?, ?, ?, ?, ?)",
+            "INSERT INTO game VALUES (?, 'g', '2023-04-01 00:00:00+09', ?, ?, ?, ?, ?, 'fixture')",
             [str(revision), latest_game_status if revision == 2 else "final", *times["game"]],
         )
         connection.execute(
-            "INSERT INTO player VALUES (?, 'p', ?, ?, ?, ?, ?)",
+            "INSERT INTO player VALUES (?, 'p', ?, ?, ?, ?, ?, 'fixture')",
             [str(revision), f"Player {revision}", *times["player"]],
         )
         for team in ("A", "B"):
             connection.execute(
-                "INSERT INTO team VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO team VALUES (?, ?, ?, ?, ?, ?, ?, 'fixture')",
                 [f"{team}{revision}", team, f"{team} {revision}", *times["team"]],
             )
     try:

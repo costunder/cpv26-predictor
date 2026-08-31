@@ -182,13 +182,13 @@ def test_match_sql_never_resurrects_old_final_after_latest_revision_filter(
             "INSERT INTO game VALUES "
             "('old', 'game', 2025, '2025-04-01 00:00:00+09', 'A', 'B', 3, 1, 'final', "
             "'2025-04-02 00:00:00+09', '2025-04-02 00:00:00+09', "
-            "'2025-04-02 00:00:00+09', NULL)"
+            "'2025-04-02 00:00:00+09', NULL, 'fixture')"
         )
         connection.execute(
             "INSERT INTO game VALUES "
             "('new', 'game', ?, ?, 'A', 'B', ?, 1, ?, "
             "'2026-01-01 00:00:00+09', '2026-01-01 00:00:00+09', "
-            "'2026-01-01 00:00:00+09', ?)",
+            "'2026-01-01 00:00:00+09', ?, 'fixture')",
             [
                 latest_season,
                 f"{latest_season}-04-01 00:00:00+09",
@@ -209,7 +209,8 @@ def test_match_sql_keeps_new_final_after_old_cancelled_revision() -> None:
         ):
             connection.execute(
                 "INSERT INTO game VALUES "
-                "(?, 'game', 2025, '2025-04-01 00:00:00+09', 'A', 'B', ?, 2, ?, ?, ?, ?, NULL)",
+                "(?, 'game', 2025, '2025-04-01 00:00:00+09', 'A', 'B', ?, 2, "
+                "?, ?, ?, ?, NULL, 'fixture')",
                 [row_id, home_score, status, timestamp, timestamp, timestamp],
             )
         assert connection.execute(MATCH_CANONICAL_SQL).fetchall() == [
@@ -219,11 +220,15 @@ def test_match_sql_keeps_new_final_after_old_cancelled_revision() -> None:
 
 def _create_match_query_table(connection: Any) -> None:
     connection.execute(
+        "CREATE TABLE source_revision (source_revision_id VARCHAR, source_name VARCHAR, "
+        "metadata_json JSON, ingested_at TIMESTAMPTZ)"
+    )
+    connection.execute(
         "CREATE TABLE game (game_row_id VARCHAR, game_id VARCHAR, season INTEGER, "
         "scheduled_start TIMESTAMPTZ, home_team_id VARCHAR, away_team_id VARCHAR, "
         "home_score INTEGER, away_score INTEGER, game_status VARCHAR, "
         "available_at TIMESTAMPTZ, ingested_at TIMESTAMPTZ, "
-        "valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ)"
+        "valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ, source_revision_id VARCHAR)"
     )
 
 

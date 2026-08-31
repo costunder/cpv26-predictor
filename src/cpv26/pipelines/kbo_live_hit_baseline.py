@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 from numpy.typing import NDArray
 
+from cpv26.data.kbo_source_snapshots import source_snapshot_filter_sql
 from cpv26.evaluation import evaluate_probabilities
 from cpv26.models.baseline import DEFAULT_CATBOOST_PARAMETERS, CatBoostClassifierBaseline
 
@@ -85,27 +86,31 @@ LIVE_HIT_FEATURE_NAMES: tuple[str, ...] = (
 # Historical publication timestamps are not reconstructed by this query.
 # Validity/state filters follow revision selection so closed newer revisions
 # cannot resurrect older, still-open rows.
-LIVE_HIT_CANONICAL_SQL = """
+LIVE_HIT_CANONICAL_SQL = f"""
 WITH latest_pa AS (
     SELECT * FROM observed_plate_appearance
+    WHERE {source_snapshot_filter_sql()}
     QUALIFY row_number() OVER (
         PARTITION BY plate_appearance_id
         ORDER BY available_at DESC, ingested_at DESC, valid_from DESC, observed_pa_row_id DESC
     ) = 1
 ), latest_game AS (
     SELECT * FROM game
+    WHERE {source_snapshot_filter_sql()}
     QUALIFY row_number() OVER (
         PARTITION BY game_id
         ORDER BY available_at DESC, ingested_at DESC, valid_from DESC, game_row_id DESC
     ) = 1
 ), latest_player AS (
     SELECT * FROM player
+    WHERE {source_snapshot_filter_sql()}
     QUALIFY row_number() OVER (
         PARTITION BY player_id
         ORDER BY available_at DESC, ingested_at DESC, valid_from DESC, player_row_id DESC
     ) = 1
 ), latest_team AS (
     SELECT * FROM team
+    WHERE {source_snapshot_filter_sql()}
     QUALIFY row_number() OVER (
         PARTITION BY team_id
         ORDER BY available_at DESC, ingested_at DESC, valid_from DESC, team_row_id DESC

@@ -340,12 +340,38 @@ def _split_summary(
         }
         for key in (
             "games_with_pa", "game_only_games", "observed_completed_pa",
-            "box_batting_rows", "box_pitching_rows", "box_pa_queries", "box_pa_outcomes",
-            "box_pitch_queries", "box_pitch_observed_counts", "box_live_hit_queries",
+            "box_batting_rows", "box_pitching_rows", "box_live_hit_queries",
             "box_live_hit_unknown_pa_queries",
         ):
             if any(key in row for row in rows):
                 summary[name][key] = sum(row.get(key, 0) for row in rows)
+        box_keys = (
+            "box_pa_queries", "box_pa_outcomes", "box_pitch_queries", "box_pitch_observed_counts",
+        )
+        if int(dataset.manifest.get("dataset_version", 2)) >= 5:
+            # v5 records the actual targets from both archive and modern PA.
+            # A missing required field is corrupt metadata, not zero coverage.
+            for key in box_keys:
+                summary[name][key] = sum(row[key] for row in rows)
+            summary[name]["box_coverage_source"] = "manifest_all_sources"
+        else:
+            # v4's flat counts were archive-only; modern derived targets were
+            # present in NPZ but falsely reported as zero. Read legacy arrays
+            # once for this report without rewriting caches/checkpoints.
+            totals = dict.fromkeys(box_keys, 0)
+            for day in days:
+                graph = dataset.load_day(day)
+                totals["box_pa_queries"] += len(graph.box_pa_counts)
+                totals["box_pa_outcomes"] += int(graph.box_pa_counts.sum())
+                totals["box_pitch_queries"] += len(graph.box_pitch_mask)
+                totals["box_pitch_observed_counts"] += int(graph.box_pitch_mask.sum())
+            summary[name].update(totals)
+            summary[name]["box_coverage_source"] = "graph_arrays_legacy_manifest"
+        if any("raw_archive_boxscore" in row for row in rows):
+            summary[name]["raw_archive_boxscore"] = {
+                key: sum(row.get("raw_archive_boxscore", {}).get(key, 0) for row in rows)
+                for key in box_keys
+            }
     return summary
 
 

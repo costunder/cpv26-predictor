@@ -111,7 +111,7 @@ def test_boxscore_targets_use_actual_counts_and_missing_pa_lower_bounds(tmp_path
     dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
     first, second = dataset.load_day("2001-04-01"), dataset.load_day("2001-04-02")
 
-    assert dataset.manifest["dataset_version"] == 4
+    assert dataset.manifest["dataset_version"] == 5
     assert dataset.manifest["boxscore_feature_dims"] == {"batting": 19, "pitching": 21}
     assert first.live_hit_pa.tolist() == [4]
     assert first.live_hit_pa_min.tolist() == [4]
@@ -359,7 +359,7 @@ def test_all_missing_placeholder_is_audited_without_false_participation_history(
         connection.execute(V5_DDL[0])
         _box(connection, "missing-placeholder", 1, "batting", {})
     dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
-    assert dataset.manifest["boxscore_history_policy"] == "common_player_game_observed_fields_v2"
+    assert dataset.manifest["boxscore_history_policy"] == "common_player_game_observed_fields_v3"
     first, second = dataset.load_day("2001-04-01"), dataset.load_day("2001-04-02")
     assert first.live_hit_pa.size == first.box_pa_counts.size == 0
     assert second.player_ids == ()

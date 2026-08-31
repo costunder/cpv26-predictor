@@ -15,7 +15,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeGuard, cast
@@ -26,10 +26,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from cpv26.data.kbo_player_identity import historical_player_prior
+from cpv26.data.kbo_source_snapshots import superseded_source_ids
 from cpv26.simulation.adapter import NEURAL_PA_OUTCOMES, neural_training_target_index
 from cpv26.simulation.events import TerminalPlateAppearanceEvent
 
-GRAPH_DATASET_VERSION = 4
+GRAPH_DATASET_VERSION = 5
 _KST = ZoneInfo("Asia/Seoul")
 Array = NDArray[Any]
 BOX_BATTING_FIELDS = (
@@ -222,7 +223,7 @@ class KBOGraphDataset:
         self.directory = Path(directory).expanduser().resolve()
         with (self.directory / "manifest.json").open(encoding="utf-8") as handle:
             self.manifest: dict[str, Any] = json.load(handle)
-        if self.manifest.get("dataset_version") not in (2, 3, GRAPH_DATASET_VERSION):
+        if self.manifest.get("dataset_version") not in (2, 3, 4, GRAPH_DATASET_VERSION):
             raise ValueError("unsupported KBO graph dataset version")
         self._entries = {entry["day"]: entry for entry in self.manifest["days"]}
         if len(self._entries) != len(self.manifest["days"]):
@@ -351,12 +352,14 @@ class _History:
             eligible = [
                 record
                 for record in self.versions[key]
-                if earliest <= record.day < day
-                and record.available_at <= cutoff
-                and record.valid_from <= cutoff
-                and (record.valid_to is None or cutoff < record.valid_to)
+                if record.available_at <= cutoff and record.valid_from <= cutoff
             ]
             selected = max(eligible, key=lambda item: item.rank) if eligible else None
+            if selected is not None and (
+                not earliest <= selected.day < day
+                or (selected.valid_to is not None and cutoff >= selected.valid_to)
+            ):
+                selected = None
             previous = self.active.get(key)
             if previous is selected:
                 continue
@@ -418,6 +421,8 @@ class _History:
         elif record.kind.startswith("box_"):
             self._track_box_input(record, data["role"], data["team_id"], add)
         else:
+            if not _has_final_score(data):
+                return  # A cancellation/withdrawal still supersedes the old source row.
             home, away = data["home_team_id"], data["away_team_id"]
             home_runs, away_runs = data["home_score"], data["away_score"]
             for team, own, opponent, is_home in (
@@ -453,8 +458,12 @@ class _History:
         identity = _box_history_id(data)
         update = self._update_bucket
         update(getattr(self, f"box_{role}"), identity, record, record.box_values, add)
-        if not data.get("skip_team_history", False):
-            update(getattr(self, f"box_team_{role}"), team, record, record.box_values, add)
+        team_values = record.box_values
+        if "team_history_field_mask" in data:
+            mask = np.asarray(data["team_history_field_mask"], dtype=np.float64)
+            team_values = team_values * np.tile(mask, 2)
+        if team_values[len(team_values) // 2 :].any():
+            update(getattr(self, f"box_team_{role}"), team, record, team_values, add)
         if data.get("derived_from_pa", False):
             # PA already populated individual legacy features and actual routes.
             return
@@ -468,8 +477,11 @@ class _History:
                 "batter_participation_team" if role == "batting" else "pitcher_participation_team"
             )
             update(
-                self.routes[route], (identity, team), record,
-                values if values is not None else np.zeros(7), add,
+                self.routes[route],
+                (identity, team),
+                record,
+                values if values is not None else np.zeros(7),
+                add,
             )
 
 
@@ -487,7 +499,8 @@ def build_kbo_graph_dataset(
     The output contains ``manifest.json`` and ``days/YYYY-MM-DD.npz``. Sidecars
     allow interrupted builds and appended source days to reuse verified caches.
     Labels are the latest final rows visible at the database knowledge snapshot.
-    The default knowledge snapshot is all rows already ingested into this DB.
+    The default knowledge snapshot is captured once at build start. Source
+    snapshot selection, ingestion, publication and label validity share it.
     """
     if isinstance(rolling_days, bool) or not isinstance(rolling_days, int) or rolling_days < 1:
         raise ValueError("rolling_days must be a positive integer")
@@ -499,8 +512,9 @@ def build_kbo_graph_dataset(
     database = Path(database_path).expanduser().resolve()
     if not database.is_file():
         raise FileNotFoundError(database)
-    records, sources, source_digest = _read_records(database, knowledge_at)
-    labels = _label_records(records)
+    label_snapshot_at = knowledge_at or datetime.now(timezone.utc)
+    records, sources, source_digest = _read_records(database, label_snapshot_at)
+    labels = _label_records(records, label_snapshot_at)
     selected_days = sorted(
         day
         for day, rows in labels.items()
@@ -516,8 +530,9 @@ def build_kbo_graph_dataset(
         "dataset_version": GRAPH_DATASET_VERSION,
         "rolling_days": rolling_days,
         "pa_incomplete_transition_context": "mask_pre_scores_unknown",
-        "boxscore_history_policy": "common_player_game_observed_fields_v2",
+        "boxscore_history_policy": "common_player_game_observed_fields_v3",
         "boxscore_identity_policy": "unmerged_observations_name_team_role_cohorts_v1",
+        "label_snapshot_policy": "latest_known_valid_entity_in_latest_annual_source_v1",
         "cutoff_timezone": "Asia/Seoul",
         "cutoff_time": "00:00:00",
         "knowledge_at": knowledge_at.isoformat()
@@ -544,21 +559,16 @@ def build_kbo_graph_dataset(
         games = {row.entity for row in labels[day] if row.kind == "game"}
         pa_games = {row.data["game_id"] for row in labels[day] if row.kind == "pa"}
         box_games = {row.data["game_id"] for row in labels[day] if row.kind.startswith("box_")}
+        raw_audit = _box_label_audit(labels[day])
         coverage = {
             "games_with_pa": len(games & pa_games),
             "games_with_boxscore": len(games & box_games),
             "boxscore_only_games": len((games & box_games) - pa_games),
             "game_only_games": len(games - pa_games - box_games),
             "observed_completed_pa": sum(row.kind == "pa" for row in labels[day]),
-            **_box_label_audit(labels[day]),
-            "pa_derived_batting_queries": sum(
-                row.data.get("derived_from_pa", False) and row.data["role"] == "batting"
-                for row in _label_boxes(labels[day])
-            ),
-            "pa_derived_pitching_queries": sum(
-                row.data.get("derived_from_pa", False) and row.data["role"] == "pitching"
-                for row in _label_boxes(labels[day])
-            ),
+            **raw_audit,
+            **_target_coverage(labels[day]),
+            "raw_archive_boxscore": raw_audit,
         }
         cached = _read_valid_cache(sidecar, path, input_fingerprint)
         if cached is not None:
@@ -594,9 +604,12 @@ def build_kbo_graph_dataset(
             "feature_coverage": {
                 name: int(np.any(graph.arrays[name] != 0, axis=1).sum())
                 for name in (
-                    "player_batting_features", "player_pitching_features",
-                    "player_box_batting_features", "player_box_pitching_features",
-                    "team_box_batting_features", "team_box_pitching_features",
+                    "player_batting_features",
+                    "player_pitching_features",
+                    "player_box_batting_features",
+                    "player_box_pitching_features",
+                    "team_box_batting_features",
+                    "team_box_pitching_features",
                 )
             },
             **coverage,
@@ -614,6 +627,7 @@ def build_kbo_graph_dataset(
             }
         ),
         "built_at": datetime.now(timezone.utc).isoformat(),
+        "label_snapshot_at": label_snapshot_at.isoformat(),
         "days": entries,
         "season_coverage": _season_coverage(entries),
         "cache_reused_days": reused,
@@ -641,6 +655,12 @@ def build_kbo_graph_dataset(
         "match_target_classes": ("away_win", "draw", "home_win"),
         "source_provenance": sources,
         "label_quality": {
+            "training_targets": {
+                name: sum(entry[name] for entry in entries) for name in _TRAINING_COUNT_FIELDS
+            },
+            "raw_archive_boxscore": _sum_archive_audits(
+                [entry["raw_archive_boxscore"] for entry in entries]
+            ),
             "historical_boxscore_identity": _identity_audit(
                 [row for day in selected_days for row in labels[day]]
             ),
@@ -667,7 +687,7 @@ def build_kbo_graph_dataset(
             "unlabelled_source_pa": None,
             "unlabelled_source_note": "not in canonical completed-PA table; see import report",
             "historical_boxscore": {
-                name: sum(entry[name] for entry in entries)
+                name: sum(entry["raw_archive_boxscore"][name] for entry in entries)
                 for name in (
                     "box_batting_rows",
                     "box_pitching_rows",
@@ -706,10 +726,13 @@ def build_kbo_graph_dataset(
                 "at cutoff before aggregation; raw source records remain unchanged"
             ),
             "overlap": (
-                "verified same-player archive fields precede PA-derived missing fields; "
-                "unresolved archive team totals precede PA-derived team totals; individual "
-                "PA history and PA labels remain; overlapping unresolved LiveHit/box targets "
-                "use archive rows for that game/team instead of counting both sources"
+                "usable archive fields precede PA-derived team fields; independent PA player "
+                "history remains; each auxiliary task/field requires usable archive evidence "
+                "before suppressing PA targets; incomplete PA never verifies full box totals"
+            ),
+            "label_snapshot": (
+                "latest known annual source snapshot, then latest available/valid entity; "
+                "expired latest rows are withdrawn, not replaced by older superseded truth"
             ),
             "boxscore_pa": "verified actual outcome totals only; no invented ordered PA or pitcher",
             "boxscore_live_hit": (
@@ -747,6 +770,7 @@ def _season_coverage(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "box_pitch_observed_counts",
         "pa_derived_batting_queries",
         "pa_derived_pitching_queries",
+        "live_hit_unknown_pa_queries",
     )
     return [
         {
@@ -755,6 +779,9 @@ def _season_coverage(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "date_start": min(row["day"] for row in rows),
             "date_end": max(row["day"] for row in rows),
             **{name: sum(row[name] for row in rows) for name in counts},
+            "raw_archive_boxscore": _sum_archive_audits(
+                [row["raw_archive_boxscore"] for row in rows]
+            ),
             "box_target_missing_reasons": {
                 reason: sum(row["box_target_missing_reasons"].get(reason, 0) for row in rows)
                 for reason in sorted(
@@ -778,9 +805,10 @@ def _read_records(
             connection, "SELECT * FROM source_revision ORDER BY source_revision_id"
         )
         source_lookup = {row["source_revision_id"]: row for row in sources}
+        superseded = superseded_source_ids(connection, knowledge_at)
         records: list[_Record] = []
         queries = [
-            ("game", "SELECT * FROM game WHERE game_status = 'final' ORDER BY game_id, valid_from"),
+            ("game", "SELECT * FROM game ORDER BY game_id, valid_from"),
             (
                 "pa",
                 "SELECT * FROM observed_plate_appearance ORDER BY plate_appearance_id, valid_from",
@@ -793,9 +821,9 @@ def _read_records(
             )
         for kind, query in queries:
             for row in _iter_dicts(connection, query):
-                if knowledge_at is not None and row["ingested_at"] > knowledge_at:
+                if row["source_revision_id"] in superseded:
                     continue
-                if kind == "game" and (row["home_score"] is None or row["away_score"] is None):
+                if knowledge_at is not None and row["ingested_at"] > knowledge_at:
                     continue
                 source = source_lookup.get(row["source_revision_id"])
                 if source is None:
@@ -857,7 +885,7 @@ def _read_records(
                     # Keep only model/audit fields in hundreds of thousands of
                     # in-memory records, not raw JSON or inning-token objects.
                     record.data = _box_graph_data(row)
-                else:
+                elif _has_final_score(row):
                     home, away = row["home_score"], row["away_score"]
                     record.values = np.array(
                         [1, home > away, home == away, home, away, home - away, 1],
@@ -873,9 +901,10 @@ def _read_records(
                 "source_locator": row["source_locator"],
                 "content_sha256": row["content_sha256"],
                 "metadata": json.loads(row["metadata_json"]),
+                "superseded_at_knowledge_snapshot": row["source_revision_id"] in superseded,
             }
             for row in sources
-            if row["source_revision_id"] in used_sources
+            if row["source_revision_id"] in used_sources | superseded
         ]
         source_digest = _json_sha256([f"{record.digest:064x}" for record in records])
         return records, provenance, source_digest
@@ -924,21 +953,46 @@ def _box_graph_data(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _label_records(records: list[_Record]) -> dict[date, list[_Record]]:
+def _label_records(
+    records: list[_Record], knowledge_at: datetime | None = None
+) -> dict[date, list[_Record]]:
+    snapshot = knowledge_at or datetime.now(timezone.utc)
+    if snapshot.utcoffset() is None:
+        raise ValueError("label knowledge snapshot must be timezone-aware")
     latest: dict[tuple[str, str], _Record] = {}
     for record in records:
+        if any(
+            value > snapshot
+            for value in (record.ingested_at, record.available_at, record.valid_from)
+        ):
+            continue
         key = (record.kind, record.entity)
         previous = latest.get(key)
         if previous is None or record.rank > previous.rank:
             latest[key] = record
-    final_games = {row.entity for row in latest.values() if row.kind == "game"}
+    current = [
+        record
+        for record in latest.values()
+        if record.valid_to is None or snapshot < record.valid_to
+    ]
+    final_games = {
+        row.entity for row in current if row.kind == "game" and _has_final_score(row.data)
+    }
     labels: dict[date, list[_Record]] = defaultdict(list)
-    for record in latest.values():
+    for record in current:
         if record.data["game_id"] in final_games:
             labels[record.day].append(record)
     for rows in labels.values():
         rows.sort(key=lambda item: (item.kind, item.entity, item.row_id))
     return labels
+
+
+def _has_final_score(row: Mapping[str, Any]) -> bool:
+    return (
+        row.get("game_status") == "final"
+        and row.get("home_score") is not None
+        and row.get("away_score") is not None
+    )
 
 
 def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay:
@@ -1078,7 +1132,12 @@ def _complete_legacy_box_values(row: Mapping[str, Any]) -> Array | None:
     stats = _box_stat_fields(row)
     fields = (
         "plate_appearances" if row["role"] == "batting" else "batters_faced",
-        "at_bats", "hits", "total_bases", "walks_hbp", "strikeouts", "home_runs",
+        "at_bats",
+        "hits",
+        "total_bases",
+        "walks_hbp",
+        "strikeouts",
+        "home_runs",
     )
     if not all(_observed_nonnegative(stats.get(name)) for name in fields):
         return None
@@ -1088,18 +1147,29 @@ def _complete_legacy_box_values(row: Mapping[str, Any]) -> Array | None:
 
 
 def _aggregate_record(data: dict[str, Any], components: list[_Record]) -> _Record:
-    digest = int(_json_sha256({
-        "policy": "common_player_game_v1", "data": data,
-        "components": sorted(f"{row.digest:064x}" for row in components),
-    }), 16)
+    digest = int(
+        _json_sha256(
+            {
+                "policy": "common_player_game_v1",
+                "data": data,
+                "components": sorted(f"{row.digest:064x}" for row in components),
+            }
+        ),
+        16,
+    )
     return _Record(
-        kind="box_" + data["role"], entity=data["observation_id"],
-        row_id=f"pa-box:{digest:064x}", day=components[0].day,
+        kind="box_" + data["role"],
+        entity=data["observation_id"],
+        row_id=f"pa-box:{digest:064x}",
+        day=components[0].day,
         event_at=max(row.event_at for row in components),
         available_at=max(row.available_at for row in components),
         ingested_at=max(row.ingested_at for row in components),
-        valid_from=max(row.valid_from for row in components), valid_to=None,
-        source_id=components[0].source_id, data=data, digest=digest,
+        valid_from=max(row.valid_from for row in components),
+        valid_to=None,
+        source_id=components[0].source_id,
+        data=data,
+        digest=digest,
         box_values=_box_record_values(data),
     )
 
@@ -1122,15 +1192,26 @@ def _pa_box_records(pas: list[_Record], role: str) -> list[_Record]:
         first = components[0].data
         if any(
             (row.data[team_field], row.data[opponent_field])
-            != (first[team_field], first[opponent_field]) for row in components
+            != (first[team_field], first[opponent_field])
+            for row in components
         ):
             raise ValueError(f"conflicting PA teams for player-game {(game, player)}")
         totals = np.sum([row.values for row in components], axis=0)
-        stats: dict[str, Any] = dict(zip(
-            ("plate_appearances" if role == "batting" else "batters_faced",
-             "at_bats", "hits", "total_bases", "walks_hbp", "strikeouts", "home_runs"),
-            (int(value) for value in totals), strict=True,
-        ))
+        stats: dict[str, Any] = dict(
+            zip(
+                (
+                    "plate_appearances" if role == "batting" else "batters_faced",
+                    "at_bats",
+                    "hits",
+                    "total_bases",
+                    "walks_hbp",
+                    "strikeouts",
+                    "home_runs",
+                ),
+                (int(value) for value in totals),
+                strict=True,
+            )
+        )
         if role == "batting":
             counts = [0] * len(NEURAL_PA_OUTCOMES)
             for row in components:
@@ -1142,10 +1223,16 @@ def _pa_box_records(pas: list[_Record], role: str) -> list[_Record]:
             stats.update(outcome_counts=counts, counts_verified=True, hits_verified=True)
         observation = f"observed-pa-box:{role}:{game}:{player}"
         data = {
-            "game_id": game, "observation_id": observation, "role": role,
-            "player_id": player, "identity_status": "canonical_verified",
-            "team_id": first[team_field], "opponent_team_id": first[opponent_field],
-            "stats_json": stats, "quality_json": [], "derived_from_pa": True,
+            "game_id": game,
+            "observation_id": observation,
+            "role": role,
+            "player_id": player,
+            "identity_status": "canonical_verified",
+            "team_id": first[team_field],
+            "opponent_team_id": first[opponent_field],
+            "stats_json": stats,
+            "quality_json": [],
+            "derived_from_pa": True,
         }
         result.append(_aggregate_record(data, components))
     return result
@@ -1166,35 +1253,97 @@ def _common_box_records(records: list[_Record], role: str) -> list[_Record]:
     result = []
     for record in boxes:
         row = record.data
-        pa = by_player.pop(row["player_id"], None) if (
-            row.get("identity_status") == "canonical_verified"
-        ) else None
+        pa = (
+            by_player.pop(row["player_id"], None)
+            if (row.get("identity_status") == "canonical_verified")
+            else None
+        )
         if pa is None:
             result.append(record)
             continue
         stats = _box_stat_fields(row)
         pa_stats = pa.data["stats_json"]
-        if not _observed_nonnegative(stats.get("hits")) and _observed_nonnegative(
-            pa_stats.get("hits")
-        ):
-            stats["hits"] = pa_stats["hits"]
-            stats["hits_verified"] = True
-        if role == "batting" and not stats.get("counts_verified"):
-            stats["outcome_counts"] = pa_stats["outcome_counts"]
-            stats["counts_verified"] = True
-        for key, value in pa_stats.items():
-            if stats.get(key) is None:
-                stats[key] = value
-        result.append(_aggregate_record(
-            {**row, "stats_json": stats, "has_pa_history": True}, [record, pa]
-        ))
-    unresolved = any(row.data.get("identity_status") != "canonical_verified" for row in boxes)
+        # Observed PAs can be incomplete relative to an official box score.
+        # Never turn a smaller PA histogram into a verified complete box total
+        # (for example H=2 beside a one-single histogram and TB=1).
+        compatible = all(
+            not _observed_nonnegative(stats.get(key)) or stats[key] == value
+            for key, value in pa_stats.items()
+            if _observed_nonnegative(value)
+        )
+        if compatible:
+            if not _observed_nonnegative(stats.get("hits")):
+                stats["hits"] = pa_stats.get("hits")
+                stats["hits_verified"] = True
+            if role == "batting" and not stats.get("counts_verified"):
+                stats["outcome_counts"] = pa_stats["outcome_counts"]
+                stats["counts_verified"] = True
+            for key, value in pa_stats.items():
+                if stats.get(key) is None:
+                    stats[key] = value
+        result.append(
+            _aggregate_record({**row, "stats_json": stats, "has_pa_history": True}, [record, pa])
+        )
+    unresolved = [row for row in boxes if row.data.get("identity_status") != "canonical_verified"]
+    team_mask = _fallback_field_mask(unresolved, list(by_player.values()), role)
     for record in by_player.values():
-        if unresolved:
-            record.data["skip_team_history"] = True
-            record.data["overlap_unresolved"] = True
+        record.data["team_history_field_mask"] = team_mask
         result.append(record)
     return result
+
+
+def _fallback_field_mask(
+    preferred: list[_Record], fallback: list[_Record], role: str
+) -> list[bool]:
+    """Prefer only actually observed fields, not the existence of a source row.
+
+    An unknown identity prevents assigning archive rows to individual PA
+    players. Team source precedence therefore applies field by field. Do not
+    fill an unavailable official count with a smaller, contradictory PA total.
+    Both sources still retain their separate personal observed history.
+    """
+    fields = BOX_BATTING_FIELDS if role == "batting" else BOX_PITCHING_FIELDS
+    width = len(fields)
+    primary = (
+        np.sum([row.box_values for row in preferred], axis=0) if preferred else np.zeros(2 * width)
+    )
+    secondary = (
+        np.sum([row.box_values for row in fallback], axis=0) if fallback else np.zeros(2 * width)
+    )
+    mask = primary[width:] == 0
+    combined = {
+        name: primary[index] if not mask[index] else secondary[index]
+        for index, name in enumerate(fields)
+        if primary[index + width] > 0 or secondary[index + width] > 0
+    }
+    constraints = (
+        (
+            ("hits", "at_bats"),
+            ("at_bats", "plate_appearances"),
+            ("hits", "total_bases"),
+            ("home_runs", "hits"),
+            ("strikeouts", "at_bats"),
+        )
+        if role == "batting"
+        else (
+            ("hits", "at_bats"),
+            ("at_bats", "batters_faced"),
+            ("home_runs", "hits"),
+            ("strikeouts", "batters_faced"),
+            ("earned_runs", "runs"),
+        )
+    )
+    for numerator, denominator in constraints:
+        if (
+            numerator in combined
+            and denominator in combined
+            and combined[numerator] > combined[denominator]
+        ):
+            for name in (numerator, denominator):
+                index = fields.index(name)
+                if primary[index + width] == 0:
+                    mask[index] = False
+    return [bool(value) for value in mask]
 
 
 def _label_boxes(labels: list[_Record]) -> list[_Record]:
@@ -1206,11 +1355,35 @@ def _label_boxes(labels: list[_Record]) -> list[_Record]:
                 grouped[(row["game_id"], row[field], role)].append(record)
         elif record.kind.startswith("box_"):
             grouped[(row["game_id"], row["team_id"], row["role"])].append(record)
-    return [
-        record for group, inputs in sorted(grouped.items())
-        for record in _common_box_records(inputs, group[2])
-        if not record.data.get("overlap_unresolved", False)
-    ]
+    result = []
+    for group, inputs in sorted(grouped.items()):
+        role = group[2]
+        boxes = [row for row in inputs if row.kind == "box_" + role]
+        result.extend(boxes)
+        derived = _pa_box_records([row for row in inputs if row.kind == "pa"], role)
+        for record in derived:
+            preferred = [
+                row
+                for row in boxes
+                if row.data.get("identity_status") != "canonical_verified"
+                or row.data["player_id"] == record.data["player_id"]
+            ]
+            data = dict(record.data)
+            if role == "batting":
+                data["box_pa_target_enabled"] = not any(
+                    stats.get("counts_verified") and sum(stats.get("outcome_counts", ())) > 0
+                    for stats in (_box_stat_fields(row.data) for row in preferred)
+                )
+            else:
+                data["box_pitch_target_mask"] = [
+                    not any(
+                        _observed_nonnegative(_box_stat_fields(row.data).get(name))
+                        for row in preferred
+                    )
+                    for name in BOX_PITCHING_FIELDS
+                ]
+            result.append(replace(record, data=data))
+    return result
 
 
 def _box_stat_fields(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1368,6 +1541,7 @@ def _queries(
             pa_rows.append(row)
             pa_targets.append(outcome)
     pa_live_keys = set(live)
+    archive_live_keys: set[tuple[str, str]] = set()
     archive_live_scopes: set[tuple[str, str]] = set()
     for record in boxes or ():
         row = record.data
@@ -1387,8 +1561,9 @@ def _queries(
         if (known_pa and hits > observed_pa) or (observed_ab >= 0 and hits > observed_ab):
             raise ValueError("historical hits exceed observed opportunities")
         key = (row["game_id"], row["player_id"])
-        if key in live:
-            continue  # Already supervised by actual PA events for this verified identity.
+        if key in live and row.get("derived_from_pa", False):
+            continue
+        archive_live_keys.add(key)
         if row.get("identity_status") != "canonical_verified":
             archive_live_scopes.add((row["game_id"], row["team_id"]))
         live[key] = [
@@ -1399,7 +1574,7 @@ def _queries(
             observed_pa if known_pa else observed_ab,
         ]
     for key in pa_live_keys:
-        if (key[0], live[key][0]) in archive_live_scopes:
+        if key not in archive_live_keys and (key[0], live[key][0]) in archive_live_scopes:
             del live[key]
     live_keys = sorted(live)
     context = []
@@ -1485,7 +1660,7 @@ def _box_queries(
     for record in boxes:
         row, stats = record.data, _box_stat_fields(record.data)
         if row["role"] == "batting":
-            if not stats.get("counts_verified"):
+            if not stats.get("counts_verified") or not row.get("box_pa_target_enabled", True):
                 continue
             counts = np.asarray(stats.get("outcome_counts"), dtype=np.float32)
             if counts.shape != (10,) or np.any(counts < 0) or not np.isfinite(counts).all():
@@ -1496,7 +1671,11 @@ def _box_queries(
                 batting.append(row)
                 pa_counts.append(counts)
         else:
-            known = [_observed_nonnegative(stats.get(name)) for name in BOX_PITCHING_FIELDS]
+            permitted = row.get("box_pitch_target_mask", [True] * len(BOX_PITCHING_FIELDS))
+            known = [
+                allowed and _observed_nonnegative(stats.get(name))
+                for name, allowed in zip(BOX_PITCHING_FIELDS, permitted, strict=True)
+            ]
             if any(known):
                 pitching.append(row)
                 pitch_targets.append(
@@ -1536,6 +1715,72 @@ def _add_box_defaults(arrays: dict[str, Array], players: int, teams: int) -> Non
             )
     for name, value in _box_queries([], {}, {}).items():
         arrays.setdefault(name, value)
+
+
+_TRAINING_COUNT_FIELDS = (
+    "live_hit_queries",
+    "live_hit_unknown_pa_queries",
+    "pa_queries",
+    "box_pa_queries",
+    "box_pa_outcomes",
+    "box_pitch_queries",
+    "box_pitch_observed_counts",
+    "pa_derived_batting_queries",
+    "pa_derived_pitching_queries",
+)
+
+
+def _target_coverage(labels: list[_Record]) -> dict[str, int]:
+    """Count emitted task arrays, including modern PA-derived aggregates."""
+    games = [row for row in labels if row.kind == "game"]
+    pas = [row for row in labels if row.kind == "pa"]
+    boxes = _label_boxes(labels)
+    players = sorted(
+        {row.data["player_id"] for row in boxes}
+        | {row.data[field] for row in pas for field in ("batter_id", "pitcher_id")}
+    )
+    teams = sorted(
+        {row.data[field] for row in games for field in ("home_team_id", "away_team_id")}
+        | {row.data[field] for row in pas for field in ("batting_team_id", "fielding_team_id")}
+        | {row.data[field] for row in boxes for field in ("team_id", "opponent_team_id")}
+    )
+    arrays = _queries(
+        games,
+        pas,
+        {key: index for index, key in enumerate(players)},
+        {key: index for index, key in enumerate(teams)},
+        boxes,
+    )
+    derived_ids = {
+        row.data["observation_id"] for row in boxes if row.data.get("derived_from_pa", False)
+    }
+    return {
+        "live_hit_queries": len(arrays["live_hit_query_ids"]),
+        "live_hit_unknown_pa_queries": int(np.sum(arrays["live_hit_pa"] < 0)),
+        "pa_queries": len(arrays["pa_targets"]),
+        "box_pa_queries": len(arrays["box_pa_counts"]),
+        "box_pa_outcomes": int(arrays["box_pa_counts"].sum()),
+        "box_pitch_queries": len(arrays["box_pitch_targets"]),
+        "box_pitch_observed_counts": int(arrays["box_pitch_mask"].sum()),
+        "pa_derived_batting_queries": sum(key in derived_ids for key in arrays["box_pa_query_ids"]),
+        "pa_derived_pitching_queries": sum(
+            key in derived_ids for key in arrays["box_pitch_query_ids"]
+        ),
+    }
+
+
+def _sum_archive_audits(audits: list[dict[str, Any]]) -> dict[str, Any]:
+    names = {name for audit in audits for name in audit if name != "box_target_missing_reasons"}
+    reasons = {name for audit in audits for name in audit.get("box_target_missing_reasons", {})}
+    return {
+        **{name: sum(audit.get(name, 0) for audit in audits) for name in sorted(names)},
+        "box_target_missing_reasons": {
+            reason: sum(
+                audit.get("box_target_missing_reasons", {}).get(reason, 0) for audit in audits
+            )
+            for reason in sorted(reasons)
+        },
+    }
 
 
 def _box_label_audit(labels: list[_Record]) -> dict[str, Any]:
@@ -1603,8 +1848,10 @@ def _box_label_audit(labels: list[_Record]) -> dict[str, Any]:
 
 def _identity_audit(labels: list[_Record]) -> dict[str, int]:
     counts = {
-        "source_observation_rows": 0, "name_team_cohort_rows": 0,
-        "team_role_fallback_rows": 0, "canonical_verified_rows": 0,
+        "source_observation_rows": 0,
+        "name_team_cohort_rows": 0,
+        "team_role_fallback_rows": 0,
+        "canonical_verified_rows": 0,
         "same_game_cohort_collision_groups": 0,
     }
     cohorts: dict[tuple[str, str], int] = defaultdict(int)

@@ -545,6 +545,45 @@ def test_requested_training_or_validation_year_cannot_be_silently_skipped(
     assert splits["test"] == ()
 
 
+@pytest.mark.parametrize("manifest_version", [2, 3, 4, 5])
+def test_split_summary_counts_actual_modern_box_targets(
+    graph_directory: Path, manifest_version: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = runner_module.KBOGraphDataset(graph_directory)
+    config = KBOTrainingConfig(
+        train_seasons=(2023, 2024), validation_season=2025, test_season=2026,
+    )
+    splits = _split_days(dataset, config)
+    keys = ("box_pa_queries", "box_pa_outcomes", "box_pitch_queries", "box_pitch_observed_counts")
+    expected: dict[str, dict[str, int]] = {}
+    for split, days in splits.items():
+        totals = dict.fromkeys(keys, 0)
+        for day in days:
+            graph = dataset.load_day(day)
+            totals["box_pa_queries"] += len(graph.box_pa_counts)
+            totals["box_pa_outcomes"] += int(graph.box_pa_counts.sum())
+            totals["box_pitch_queries"] += len(graph.box_pitch_mask)
+            totals["box_pitch_observed_counts"] += int(graph.box_pitch_mask.sum())
+        assert all(value > 0 for value in totals.values())
+        expected[split] = totals
+    dataset.manifest["dataset_version"] = manifest_version
+    if manifest_version < 5:
+        for entry in dataset.manifest["days"]:
+            entry.update(dict.fromkeys(keys, 0))
+    else:
+        def unexpected_load(day: object) -> None:
+            raise AssertionError("v5 coverage must use complete manifest counts")
+
+        monkeypatch.setattr(dataset, "load_day", unexpected_load)
+    result = _split_summary(dataset, {**splits, "empty": ()})
+    for split, totals in expected.items():
+        assert {key: result[split][key] for key in keys} == totals
+        assert result[split]["box_coverage_source"] == (
+            "manifest_all_sources" if manifest_version >= 5 else "graph_arrays_legacy_manifest"
+        )
+    assert all(result["empty"][key] == 0 for key in keys)
+
+
 @pytest.mark.parametrize(
     ("chronological", "training", "expected_shuffle"),
     [(True, True, False), (False, True, True), (False, False, False)],

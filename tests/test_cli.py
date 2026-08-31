@@ -245,6 +245,27 @@ def test_kbo_import_explains_missing_source(tmp_path: Path, monkeypatch: MonkeyP
     assert "cpv26 kbo-fetch" in result.output
 
 
+@pytest.mark.parametrize("target", ["database", "source", "source_directory"])
+def test_kbo_import_report_cannot_overwrite_database_or_source(
+    tmp_path: Path, monkeypatch: MonkeyPatch, target: str,
+) -> None:
+    runtime = tmp_path / "runtime"
+    sources = runtime / "datasets" / "kbo_playbyplay" / "v0"
+    sources.mkdir(parents=True)
+    database = runtime / "cpv26.duckdb"
+    source = sources / "kbo_pbp_2023.parquet"
+    database.write_bytes(b"preserve database")
+    source.write_bytes(b"preserve source")
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    monkeypatch.setenv("CPV26_DB_PATH", str(database))
+    output = {"database": database, "source": source, "source_directory": sources}[target]
+    result = CliRunner().invoke(app, ["kbo-import", "--year", "2023", "--report", str(output)])
+    assert result.exit_code != 0
+    assert "must not overwrite" in result.output
+    assert database.read_bytes() == b"preserve database"
+    assert source.read_bytes() == b"preserve source"
+
+
 @pytest.mark.parametrize("years", [(2001, 2022), (2001, 2001), (2021, 2022)])
 def test_kbo_history_fetch_uses_inclusive_year_range_and_destination(
     tmp_path: Path, monkeypatch: MonkeyPatch, years: tuple[int, int]

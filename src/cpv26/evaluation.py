@@ -251,7 +251,9 @@ def _metric_inputs(
         raise ValueError("each probability row must sum to one")
     values = values / row_sums[:, None]
 
-    target_values = np.asarray(targets)
+    # Explicit labels may mix Python types; do not coerce [1, "home"] into
+    # strings before looking up the caller's original labels.
+    target_values = np.asarray(targets, dtype=object if labels is not None else None)
     if target_values.ndim != 1 or target_values.shape[0] != values.shape[0]:
         raise ValueError("targets must contain one class label per probability row")
     target_indices = _target_indices(target_values, values.shape[1], labels)
@@ -278,7 +280,7 @@ def _target_indices(
     mapped_indices: list[int] = []
     for target in targets:
         try:
-            mapped_indices.append(lookup[target.item()])
+            mapped_indices.append(lookup[target])
         except KeyError as exc:
             raise ValueError(f"unknown target label: {target!r}") from exc
     return np.asarray(mapped_indices, dtype=np.int64)
@@ -288,15 +290,20 @@ def _probability_weights(
     sample_weight: ArrayLike | None, row_count: int
 ) -> NDArray[np.float64]:
     if sample_weight is None:
-        return np.ones(row_count, dtype=np.float64)
+        return np.full(row_count, 1.0 / row_count, dtype=np.float64)
     weights = np.asarray(sample_weight, dtype=np.float64)
     if weights.ndim != 1 or weights.shape[0] != row_count:
         raise ValueError("sample_weight must contain one value per row")
     if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
         raise ValueError("sample_weight must be finite and non-negative")
-    if weights.sum() <= 0.0:
+    maximum = float(weights.max())
+    if maximum <= 0.0:
         raise ValueError("sample_weight must contain positive total weight")
-    return weights
+    # Both the raw sum and loss * weight can overflow for valid finite weights.
+    # Scaling first preserves their ratios, including subnormal weights, and
+    # keeps all downstream weighted metrics and ECE bins bounded.
+    scaled = weights / maximum
+    return np.asarray(scaled / scaled.sum(), dtype=np.float64)
 
 
 def _weighted_mean(

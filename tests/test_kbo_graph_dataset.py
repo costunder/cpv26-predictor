@@ -174,6 +174,33 @@ def test_daily_cutoff_isolated_newcomers_and_safe_npz(tmp_path: Path) -> None:
                 assert np.isfinite(array).all()
 
 
+@pytest.mark.parametrize("status,score", [("cancelled", 1), ("final", None)])
+def test_game_correction_without_final_score_does_not_resurrect_prior_final(
+    tmp_path: Path, status: str, score: int | None
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "INSERT INTO game SELECT game_id,scheduled_start,home_team_id,away_team_id,"
+            "?, ?, away_score,source_revision_id,event_at,"
+            "TIMESTAMPTZ '2023-04-02 12:00:00+09',ingested_at,"
+            "TIMESTAMPTZ '2023-04-02 12:00:00+09',NULL FROM game WHERE game_id='g1'",
+            [status, score],
+        )
+    dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
+    assert date(2023, 4, 1) not in dataset.days()
+    early = dataset.load_day("2023-04-02")
+    later = dataset.load_day("2023-04-03")
+    # Before publication the prior final was still available. Afterwards only
+    # g2, not the withdrawn/cancelled g1 final, contributes to team game totals.
+    assert early.team_features[early.team_ids.index("home"), 0] > 0
+    assert later.team_features[later.team_ids.index("home"), 0] == pytest.approx(
+        np.log1p(1) / np.log1p(90)
+    )
+    assert len(later.routes["home_team_game_away_team"]["source_index"]) == 1
+
+
 def test_2001_game_only_graph_preserves_scores_without_fabricating_player_labels(
     tmp_path: Path,
 ) -> None:
@@ -204,6 +231,17 @@ def test_2001_game_only_graph_preserves_scores_without_fabricating_player_labels
     home = second.team_ids.index("home")
     np.testing.assert_allclose(second.node_features["team"][home, 1:6], [0, 1, 0.1, 0.1, 0])
     assert len(second.routes["home_team_game_away_team"]["source_index"]) == 1
+    expected_archive = {
+        "box_batting_rows": 0,
+        "box_pitching_rows": 0,
+        "box_pa_queries": 0,
+        "box_pitch_queries": 0,
+        "box_live_hit_queries": 0,
+        "box_live_hit_unknown_pa_queries": 0,
+        "box_pa_outcomes": 0,
+        "box_pitch_observed_counts": 0,
+        "box_target_missing_reasons": {},
+    }
     assert dataset.manifest["season_coverage"] == [
         {
             "season": 2001,
@@ -220,6 +258,8 @@ def test_2001_game_only_graph_preserves_scores_without_fabricating_player_labels
             "pa_queries": 0,
             "pa_derived_batting_queries": 0,
             "pa_derived_pitching_queries": 0,
+            "live_hit_unknown_pa_queries": 0,
+            "raw_archive_boxscore": expected_archive,
             "box_batting_rows": 0,
             "box_pitching_rows": 0,
             "box_pa_queries": 0,
@@ -435,7 +475,7 @@ def test_knowledge_snapshot_and_conditional_pa10_exclusions(tmp_path: Path) -> N
         tmp_path / "graph",
         knowledge_at=datetime(2023, 4, 2, tzinfo=_KST),
     )
-    assert dataset.days() == (date(2023, 4, 1), date(2023, 4, 2))
+    assert dataset.days() == (date(2023, 4, 1),)
     graph = dataset.load_day("2023-04-01")
     assert graph.live_hit_pa.tolist() == [1, 1]
     assert len(graph.pa_targets) == 1
@@ -463,7 +503,7 @@ def test_incomplete_transition_masks_only_pa_score_context(tmp_path: Path) -> No
     """)
     connection.close()
     after = build_kbo_graph_dataset(database, tmp_path / "after")
-    assert after.manifest["dataset_version"] == 4
+    assert after.manifest["dataset_version"] == 5
     assert after.manifest["pa_incomplete_transition_context"] == "mask_pre_scores_unknown"
     assert after.manifest["fingerprint"] != before.manifest["fingerprint"]
     quality = after.manifest["label_quality"]

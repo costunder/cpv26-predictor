@@ -22,10 +22,11 @@ from .kbo_playbyplay import (
     KBO_PLAYBYPLAY_REVISION,
     sha256_file,
 )
+from .kbo_source_snapshots import ANNUAL_SNAPSHOT_POLICY
 from .store import DuckDBStore
 
 DEFAULT_DATASET_REVISION = KBO_PLAYBYPLAY_REVISION
-KBO_ADAPTER_VERSION = 1
+KBO_ADAPTER_VERSION = 2
 DATASET_NAME = "slothman3878/kbo_playbyplay"
 DATASET_PAGE = KBO_PLAYBYPLAY_REPOSITORY_URL
 UPSTREAM_REPOSITORY = "https://github.com/slothman3878/kbo_pbp_naver_sports"
@@ -277,6 +278,11 @@ def import_kbo_playbyplay(
                             "dataset_revision": revision,
                             "adapter_version": KBO_ADAPTER_VERSION,
                             "season": item.season,
+                            "snapshot_policy": ANNUAL_SNAPSHOT_POLICY,
+                            "snapshot_scope": "provider_and_season",
+                            "doubleheader_policy": (
+                                "validated_game_id_suffix_0_null_1_first_2_second"
+                            ),
                             "license_declared_by_dataset": "CC-BY-4.0",
                             "upstream_repository": UPSTREAM_REPOSITORY,
                             "pitch_rows": item.pitch_rows,
@@ -547,6 +553,20 @@ def _validate_reduced_tables(connection: Any) -> None:
     ).fetchone()
     if invalid_games is not None:
         raise KBOIngestError(f"ambiguous or incomplete game: {invalid_games[0]}")
+    invalid_game_id = connection.execute(
+        """
+        SELECT game_pk FROM _kbo_game
+        WHERE game_pk IS NULL
+           OR NOT regexp_full_match(game_pk, '[0-9]{8}[A-Z]{4}[012][0-9]{4}')
+           OR substr(game_pk, 1, 8) <> strftime(game_date, '%Y%m%d')
+           OR substr(game_pk, 9, 2) <> away_team OR away_team IS NULL
+           OR substr(game_pk, 11, 2) <> home_team OR home_team IS NULL
+           OR substr(game_pk, 14, 4) <> strftime(game_date, '%Y')
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_game_id is not None:
+        raise KBOIngestError(f"game ID/date/team contract mismatch: {invalid_game_id[0]}")
     invalid_pa = connection.execute(
         """
         SELECT game_pk, at_bat_number, events
@@ -689,7 +709,7 @@ def _insert_games(connection: Any) -> None:
             'kbo-team:' || home_team,
             'kbo-team:' || away_team,
             NULL,
-            NULL,
+            nullif(CAST(substr(game_pk, 13, 1) AS INTEGER), 0),
             NULL,
             'final',
             home_score,

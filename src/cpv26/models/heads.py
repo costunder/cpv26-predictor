@@ -83,6 +83,32 @@ class DirectPlayerGameHead(ModuleBase):
             dim=-1,
         )
 
+        masked_hit_logits = self._masked_hit_logits(plate_appearance_logits, hit_count_logits)
+        conditional_hit_probabilities = torch.softmax(masked_hit_logits, dim=-1)
+        joint_probabilities = (
+            plate_appearance_probabilities.unsqueeze(-1)
+            * conditional_hit_probabilities
+        )
+        hit_count_probabilities = joint_probabilities.sum(dim=-2)
+        hit_support = torch.arange(
+            self.max_hits + 2,
+            dtype=hit_count_probabilities.dtype,
+            device=hit_count_probabilities.device,
+        )
+        expected_hits = (hit_count_probabilities * hit_support).sum(dim=-1)
+        return {
+            "appearance_probability": appearance_probability,
+            "plate_appearance_probabilities": plate_appearance_probabilities,
+            "conditional_hit_probabilities": conditional_hit_probabilities,
+            "joint_plate_appearance_hit_probabilities": joint_probabilities,
+            "hit_count_probabilities": hit_count_probabilities,
+            "expected_hits": expected_hits,
+        }
+
+    def _masked_hit_logits(self, plate_appearance_logits: Any, hit_count_logits: Any) -> Any:
+        """Use the same H <= PA support for inference and log-space training."""
+
+        torch, _ = require_torch()
         pa_bucket_count = self.max_plate_appearances + 2
         hit_bucket_count = self.max_hits + 2
         allowed = torch.zeros(
@@ -107,30 +133,7 @@ class DirectPlayerGameHead(ModuleBase):
                 "hit_count_logits must have shape "
                 f"{expected_hit_logit_shape}; received {tuple(hit_count_logits.shape)}"
             )
-        masked_hit_logits = hit_count_logits.masked_fill(
-            ~allowed,
-            torch.finfo(hit_count_logits.dtype).min,
-        )
-        conditional_hit_probabilities = torch.softmax(masked_hit_logits, dim=-1)
-        joint_probabilities = (
-            plate_appearance_probabilities.unsqueeze(-1)
-            * conditional_hit_probabilities
-        )
-        hit_count_probabilities = joint_probabilities.sum(dim=-2)
-        hit_support = torch.arange(
-            hit_bucket_count,
-            dtype=hit_count_probabilities.dtype,
-            device=hit_count_probabilities.device,
-        )
-        expected_hits = (hit_count_probabilities * hit_support).sum(dim=-1)
-        return {
-            "appearance_probability": appearance_probability,
-            "plate_appearance_probabilities": plate_appearance_probabilities,
-            "conditional_hit_probabilities": conditional_hit_probabilities,
-            "joint_plate_appearance_hit_probabilities": joint_probabilities,
-            "hit_count_probabilities": hit_count_probabilities,
-            "expected_hits": expected_hits,
-        }
+        return hit_count_logits.masked_fill(~allowed, -torch.inf)
 
     def forward(self, candidate_embedding: Any) -> dict[str, Any]:
         require_torch()
@@ -200,27 +203,48 @@ class DirectPlayerGameHead(ModuleBase):
         *,
         reduction: str = "mean",
     ) -> Any:
-        """Train the same constrained joint PA/hit distribution used at inference."""
+        """Train the inference distribution in log space, at least in FP32."""
 
         torch, _ = require_torch()
         if reduction not in {"none", "mean", "sum"}:
             raise ValueError("reduction must be 'none', 'mean', or 'sum'")
-        probabilities = self.probabilities(candidate_embedding)
-        joint = probabilities["joint_plate_appearance_hit_probabilities"]
+        output = self.forward(candidate_embedding)
+        # Multiplying probabilities and then clamping before log() loses the
+        # gradient for confidently wrong outcomes (notably 1 - sigmoid(x)).
+        # Preserve float64 callers while doing half-precision likelihood math
+        # in float32, including under autocast.
+        dtype = torch.promote_types(output["appearance_logit"].dtype, torch.float32)
+        appearance_logit = output["appearance_logit"].to(dtype=dtype)
+        pa_logits = output["plate_appearance_logits"].to(dtype=dtype)
+        hit_logits = output["hit_count_logits"].to(dtype=dtype)
+        pa_log_probabilities = torch.cat(
+            (
+                torch.nn.functional.logsigmoid(-appearance_logit).unsqueeze(-1),
+                torch.nn.functional.logsigmoid(appearance_logit).unsqueeze(-1)
+                + torch.log_softmax(pa_logits, dim=-1),
+            ),
+            dim=-1,
+        )
+        conditional_hit_log_probabilities = torch.log_softmax(
+            self._masked_hit_logits(pa_logits, hit_logits), dim=-1
+        )
+        joint_log_probabilities = (
+            pa_log_probabilities.unsqueeze(-1) + conditional_hit_log_probabilities
+        )
         pa_bucket, hit_bucket = self.target_bucket_indices(plate_appearances, hits)
-        pa_bucket = pa_bucket.to(device=joint.device)
-        hit_bucket = hit_bucket.to(device=joint.device)
-        expected_target_shape = joint.shape[:-2]
+        pa_bucket = pa_bucket.to(device=joint_log_probabilities.device)
+        hit_bucket = hit_bucket.to(device=joint_log_probabilities.device)
+        expected_target_shape = joint_log_probabilities.shape[:-2]
         if pa_bucket.shape != expected_target_shape:
             raise ValueError(f"target tensors must have shape {tuple(expected_target_shape)}")
-        flat_joint = joint.reshape(-1, joint.shape[-2], joint.shape[-1])
+        flat_joint = joint_log_probabilities.reshape(
+            -1, self.max_plate_appearances + 2, self.max_hits + 2
+        )
         flat_pa = pa_bucket.reshape(-1)
         flat_hits = hit_bucket.reshape(-1)
-        row_index = torch.arange(flat_joint.shape[0], device=joint.device)
+        row_index = torch.arange(flat_joint.shape[0], device=flat_joint.device)
         selected = flat_joint[row_index, flat_pa, flat_hits]
-        losses = -torch.log(selected.clamp_min(torch.finfo(joint.dtype).tiny)).reshape(
-            expected_target_shape
-        )
+        losses = -selected.reshape(expected_target_shape)
         if reduction == "none":
             return losses
         if reduction == "sum":

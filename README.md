@@ -5,9 +5,9 @@ RelGNN 프로젝트입니다. 설치 명령은 Linux/Bash 기준이며, Python�
 
 V26 계정별 당일 추천 기능은 아직 구현되지 않았습니다.
 
-v4는 과거 박스스코어와 최근 타석 기록의 통계 입력을 연결합니다. 기존 v3 학습자는
-`git pull --ff-only` 후 4절의 그래프 생성부터 실행합니다. 환경 재설치·원천 재다운로드·
-DB 재적재는 필요 없습니다. 기존 그래프와 checkpoint는 보존하고 새 경로를 사용합니다.
+v5는 더블헤더 구분, 원천 스냅샷 선택, 겹치는 기록 처리와 사용 건수 보고를 수정합니다.
+기존 v3/v4 사용자는 [캐시를 이용한 v5 갱신](#4-1-기존-v3v4에서-v5로-갱신)을 실행합니다.
+환경 재설치·원천 재다운로드·파일 삭제 없이, 캐시 재수입 후 새 그래프를 만듭니다.
 
 ## 1. 프로젝트 받기
 
@@ -117,6 +117,8 @@ cpv26 db-check
 
 ## 4. KBO 데이터와 그래프 생성
 
+처음 적재한다면 아래를 실행합니다. 기존 v3/v4 사용자는 [4-1절](#4-1-기존-v3v4에서-v5로-갱신)로 이동합니다.
+
 ~~~bash
 cpv26 kbo-history-fetch &&
 cpv26 kbo-history-import &&
@@ -124,7 +126,7 @@ cpv26 kbo-fetch --year 2023 --year 2024 --year 2025 --year 2026 &&
 cpv26 kbo-import --year 2023 --year 2024 --year 2025 --year 2026 &&
 cpv26 db-check &&
 cpv26 kbo-graph-build \
-  --output var/datasets/kbo_graph_2001_2026_v4 \
+  --output var/datasets/kbo_graph_2001_2026_v5 \
   --start-date 2001-01-01 \
   --end-date 2026-07-26
 ~~~
@@ -160,7 +162,7 @@ cpv26 kbo-graph-build \
 | var/cpv26.duckdb | 정규화한 선수·팀·경기·타석 DB |
 | var/reports/kbo_history_import.json | 역사 경기 적재·중복·연도별 제공 범위 |
 | var/reports/kbo_import.json | 타석 원천 적재 결과와 품질 검사 |
-| var/datasets/kbo_graph_2001_2026_v4/ | 시기 간 통계 입력을 연결한 v4 날짜별 그래프 |
+| var/datasets/kbo_graph_2001_2026_v5/ | 정정된 원천 선택·중복 처리 기준을 적용한 v5 날짜별 그래프 |
 
 두 fetch 명령은 고정된 공개 파일과 SHA-256을 확인합니다. 같은 파일과 적재 행은
 재실행 시 재사용합니다. 기존 `var/datasets/kbo_graph/`와 checkpoint는 건드리지 않습니다.
@@ -179,12 +181,45 @@ kbo-graph-build는 대상 날짜 이전의 최대 90일 관계를 사용해 날�
 입력의 다양성을 검사하며, 최근 자료의 통계 입력이 비어 있으면 오류로 종료합니다.
 
 ~~~bash
-python scripts/audit_cross_era_graph.py var/datasets/kbo_graph_2001_2026_v4 \
-  --output var/reports/cross_era_v4.json
+python scripts/audit_cross_era_graph.py var/datasets/kbo_graph_2001_2026_v5 \
+  --output var/reports/cross_era_v5.json
 ~~~
 
 검사는 입력 연결을 확인하는 것이며 예측 성능 향상을 입증하는 검사는 아닙니다.
-[실데이터 3,968일 대조 결과](docs/CROSS_ERA_VALIDATION.md)에 수정 전후 입력과 정답 보존 검사를 기록했습니다.
+[v5 오류 수정 검증](docs/ERROR_FIX_VALIDATION.md)에서 전 기간 대조와 검사 범위를 확인합니다.
+[v3→v4 입력 연결 기록](docs/CROSS_ERA_VALIDATION.md)은 이전 검사로 보존합니다.
+
+### 4-1. 기존 v3/v4에서 v5로 갱신
+
+기존 학습 프로세스가 끝난 뒤 프로젝트 폴더에서 실행합니다. 같은 Conda 환경과
+이미 받은 2023~2026 Parquet를 사용합니다. `kbo-fetch`, `kbo-history-fetch`,
+`kbo-history-import`, 환경 재설치는 다시 하지 않습니다.
+
+~~~bash
+git pull --ff-only
+conda activate cpv26
+source scripts/activate.sh
+cpv26 kbo-import --year 2023 --year 2024 --year 2025 --year 2026 &&
+cpv26 db-check &&
+cpv26 kbo-graph-build \
+  --output var/datasets/kbo_graph_2001_2026_v5 \
+  --start-date 2001-01-01 \
+  --end-date 2026-07-26 &&
+python scripts/audit_cross_era_graph.py var/datasets/kbo_graph_2001_2026_v5 \
+  --output var/reports/cross_era_v5.json
+~~~
+
+`kbo-import`는 더블헤더 번호를 반영한 adapter v2 revision을 추가합니다. DB schema는
+기존과 같은 **5**이며 이전 원천 행은 삭제하지 않습니다. 같은 배포자·연도의 파일은
+전체 스냅샷으로 취급하고, `knowledge_at`까지 적재된 최신 스냅샷만 현재 조회에 사용합니다.
+새 스냅샷에서 빠진 경기·타석을 옛 행에서 되살려 합산하지 않습니다.
+
+겹치는 자료는 실제 관측된 필드와 학습 항목별로 우선순위를 적용합니다. 불완전한
+PA 집계를 완전한 박스스코어로 간주하지 않습니다. 집계 사용 건수는 두 출처 전체를
+보고하고, 아카이브 원문 기준 건수는 `raw_archive_boxscore`로 따로 남깁니다.
+
+그래프 reader는 v2/v3/v4/v5를 읽습니다. 기존 그래프·run·checkpoint는 그대로 보관하고,
+5절에서 **새 v5 run**을 시작합니다. 옛 checkpoint를 새 그래프에 `--resume`하지 않습니다.
 
 ## 5. 2001년부터 RelGNN 학습
 
@@ -192,8 +227,8 @@ python scripts/audit_cross_era_graph.py var/datasets/kbo_graph_2001_2026_v4 \
 
 ~~~bash
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph_2001_2026_v4 \
-  --run-dir var/runs/relgnn/kbo_2001_2024_v4 \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --run-dir var/runs/relgnn/kbo_2001_2024_v5 \
   --train-start-year 2001 \
   --train-end-year 2024 \
   --validation-year 2025 \
@@ -231,11 +266,11 @@ LiveHit는 관측 PA가 한 개 이상임을 확인할 수 있는 선수-경기�
 learning rate 0.0003, weight decay 0.0001입니다. 상세 구조는 [GPU 학습 설명](docs/GPU_TRAINING.md)에 있습니다.
 
 위 run 이름은 이번 실험용입니다. 같은 이름으로 이미 실행했다면 새 이름을 사용합니다.
-기존 v2/v3 checkpoint를 이번 v4 데이터에 `--resume`하지 않습니다.
+기존 v2/v3/v4 checkpoint를 이번 v5 데이터에 `--resume`하지 않습니다.
 기존 checkpoint는 기존 그래프에서 계속 평가할 수 있습니다.
 
 ~~~text
-var/runs/relgnn/kbo_2001_2024_v4/
+var/runs/relgnn/kbo_2001_2024_v5/
 ├── config.json
 ├── history.jsonl
 ├── last.pt
@@ -247,7 +282,7 @@ history.jsonl에서 진행 기록을, training_report.json에서 학습 요약�
 best.pt는 validation으로 선택한 평가용 모델이고, last.pt는 학습 재개용입니다.
 GPU를 사용할 수 없으면 오류로 끝나며 CPU 학습으로 자동 전환하지 않습니다.
 
-기본 선택 기준은 기존과 같은 가중 손실입니다. v4는 최근 연도에도 집계 정답이 있으므로
+기본 선택 기준은 기존과 같은 가중 손실입니다. v4부터 최근 연도에도 집계 정답이 있으므로
 해당 손실도 포함됩니다. `training_report.json`과 평가 출력에 각 손실·관측 수·가중 기여도를
 남깁니다. 승무패 log loss로 best.pt를 고르려면 새 학습에 `--selection-target match`를
 명시합니다. 안타/타격 성능까지 동시에 좋아진다는 의미는 아닙니다.
@@ -262,7 +297,7 @@ GPU를 사용할 수 없으면 오류로 끝나며 CPU 학습으로 자동 전�
 
 ~~~bash
 cpv26 relgnn-evaluate \
-  --checkpoint var/runs/relgnn/kbo_2001_2024_v4/best.pt \
+  --checkpoint var/runs/relgnn/kbo_2001_2024_v5/best.pt \
   --split test \
   --device cuda:0
 ~~~
@@ -289,8 +324,8 @@ best.pt는 재개용으로 사용하지 않습니다.
 
 ~~~bash
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph_2001_2026_full \
-  --resume var/runs/relgnn/kbo_2001_2024_full_v1/last.pt \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --resume var/runs/relgnn/kbo_2001_2024_v5/last.pt \
   --train-start-year 2001 \
   --train-end-year 2024 \
   --validation-year 2025 \
@@ -306,7 +341,8 @@ cpv26 relgnn-train \
 
 --run-dir를 생략하면 checkpoint의 부모 폴더를 사용합니다. --epochs 50은 추가
 50 epoch가 아니라 전체 목표 50 epoch입니다. 30 epoch까지 저장됐다면 최대 20 epoch를
-더 실행합니다. 재개할 때는 같은 데이터셋과 모델 설정을 유지합니다.
+더 실행합니다. 이 예시는 5절의 v5 run을 재개하며 같은 데이터셋과 모델 설정을 유지합니다.
+이전 버전의 run은 그 run을 만들 때 사용한 그래프 경로와 설정으로만 재개합니다.
 이 명령은 같은 실행의 중단 지점을 잇습니다. 새 경기 자동 수집·추가 학습은 하지 않습니다.
 재개는 마지막 checkpoint에 저장된 지점부터이며, 이후 저장되지 않은 batch의 진행은
 복구하지 않습니다. 기존 프로세스가 종료됐는지 확인한 뒤 재개합니다.
@@ -340,28 +376,15 @@ source scripts/activate.sh
 ~~~bash
 cd ~/projects/cpv26-predictor
 git pull --ff-only
-~~~
-
-Conda로 처음 전환한다면 [Conda 설치](#2-conda-설치)를 진행합니다.
-이미 설치했다면 다음 명령으로 패키지를 갱신합니다. `.env`와 `var/`는 그대로 둡니다.
-
-~~~bash
 conda activate cpv26
-bash scripts/setup.sh ml-cuda
-~~~
-
-`Conda environment ready: ...`를 확인한 뒤 실행합니다.
-
-~~~bash
 source scripts/activate.sh
 cpv26 gpu-check --device cuda:0
-cpv26 db-init
-cpv26 db-check
 ~~~
 
-기존 CUDA PyTorch가 정상이라면 이 명령은 해당 설치를 보존합니다. 새 graph 생성에
-영향을 주는 코드가 바뀌었다면 새 데이터셋과 새 run으로 실험하고 기존 checkpoint와
-섞지 않습니다.
+이번 v5 갱신에는 패키지 재설치가 필요 없습니다. 기존 v3/v4 데이터는
+[4-1절](#4-1-기존-v3v4에서-v5로-갱신)의 캐시 재수입부터 이어갑니다.
+`.env`, 기존 그래프와 checkpoint는 그대로 둡니다. Conda로 처음 전환한다면
+[Conda 설치](#2-conda-설치)를 진행합니다.
 
 전체 코드 검사는 다음과 같습니다.
 
@@ -412,8 +435,8 @@ bash scripts/setup.sh ml-cpu
 ~~~bash
 source scripts/activate.sh
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph_2001_2026_full \
-  --run-dir var/runs/relgnn/cpu_validation \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --run-dir var/runs/relgnn/kbo_2001_2024_v5_cpu_smoke \
   --train-start-year 2001 \
   --train-end-year 2024 \
   --validation-year 2025 \

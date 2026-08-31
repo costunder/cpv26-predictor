@@ -26,6 +26,7 @@ from .integrity import (
     find_composite_reference_violations,
     find_reference_violations,
 )
+from .kbo_source_snapshots import source_snapshot_filter_sql
 from .schema import (
     DOMAIN_TIMESTAMP_COLUMNS,
     TABLE_DEFINITIONS,
@@ -319,6 +320,12 @@ class DuckDBStore:
             raise ValueError("knowledge_at cannot be earlier than cutoff_at")
         eligibility_clauses = ["available_at <= ?", "ingested_at <= ?"]
         parameters: list[Any] = [cutoff, knowledge]
+        if table != "source_revision" and "source_revision_id" in columns:
+            # A replacement annual source can remove an entity altogether.
+            # Exclude its older snapshot before ranking entity revisions, but
+            # retain every physical row and earlier knowledge-time replay.
+            eligibility_clauses.append(source_snapshot_filter_sql(knowledge_bound=True))
+            parameters.append(knowledge)
         final_clauses = ["_pit_rank = 1"]
         if current_only:
             parameters.extend([cutoff, cutoff])

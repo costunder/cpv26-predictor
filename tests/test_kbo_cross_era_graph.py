@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
+import runpy
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -315,3 +318,80 @@ def test_missing_historical_name_uses_an_explicit_team_fallback_not_a_person_id(
         graph.player_box_batting_features[player], graph.team_box_batting_features[team]
     )
     assert historical_player_prior("away", "batting", None).identity_status == "team_role_fallback"
+
+
+def test_actual_modern_aggregate_targets_are_counted_separately_from_raw_archive(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
+    for entry in dataset.manifest["days"]:
+        graph = dataset.load_day(entry["day"])
+        assert entry["box_pa_queries"] == len(graph.box_pa_counts)
+        assert entry["box_pa_outcomes"] == int(graph.box_pa_counts.sum())
+        assert entry["box_pitch_queries"] == len(graph.box_pitch_targets)
+        assert entry["box_pitch_observed_counts"] == int(graph.box_pitch_mask.sum())
+        assert entry["raw_archive_boxscore"]["box_pa_queries"] == 0
+        assert entry["raw_archive_boxscore"]["box_pitch_queries"] == 0
+    season = dataset.manifest["season_coverage"][0]
+    assert season["box_pa_queries"] == season["pa_derived_batting_queries"] == 4
+    assert season["box_pa_outcomes"] == 4
+    assert season["box_pitch_queries"] == season["pa_derived_pitching_queries"] == 4
+    assert season["box_pitch_observed_counts"] == 24
+    assert dataset.manifest["label_quality"]["training_targets"]["box_pa_queries"] == 4
+    assert dataset.manifest["label_quality"]["historical_boxscore"]["box_pa_queries"] == 0
+
+
+def test_ci_only_pa_group_is_not_counted_as_emitted_batting_histogram(tmp_path: Path) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    with duckdb.connect(str(database)) as connection:
+        _pa(connection, "ci", "g1", 1, "ci-only-batter", "old-pitcher", "catcher_interference")
+        connection.execute(
+            "UPDATE observed_plate_appearance SET is_at_bat=false WHERE plate_appearance_id='ci'"
+        )
+    dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
+    first = dataset.manifest["days"][0]
+    graph = dataset.load_day(first["day"])
+    assert first["live_hit_queries"] == 2
+    assert first["pa_derived_batting_queries"] == first["box_pa_queries"] == 1
+    assert first["box_pa_queries"] == len(graph.box_pa_counts)
+
+
+@pytest.mark.parametrize("target", ["manifest", "npz", "directory"])
+def test_audit_cli_cannot_overwrite_its_graph_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    directory = tmp_path / "graph"
+    dataset = build_kbo_graph_dataset(database, directory)
+    manifest = directory / "manifest.json"
+    npz = directory / dataset.manifest["days"][0]["file"]
+    before = (manifest.read_bytes(), npz.read_bytes())
+    output = {"manifest": manifest, "npz": npz, "directory": directory}[target]
+    script = Path(__file__).parents[1] / "scripts" / "audit_cross_era_graph.py"
+    monkeypatch.setattr(sys, "argv", [str(script), str(directory), "--output", str(output)])
+    with pytest.raises(SystemExit) as error:
+        runpy.run_path(str(script), run_name="__main__")
+    assert error.value.code == 2
+    assert (manifest.read_bytes(), npz.read_bytes()) == before
+
+
+def test_audit_cli_checks_all_source_counts_and_writes_only_external_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    directory = tmp_path / "graph"
+    build_kbo_graph_dataset(database, directory)
+    output = tmp_path / "audit.json"
+    script = Path(__file__).parents[1] / "scripts" / "audit_cross_era_graph.py"
+    monkeypatch.setattr(sys, "argv", [str(script), str(directory), "--output", str(output)])
+    with pytest.raises(SystemExit) as error:
+        runpy.run_path(str(script), run_name="__main__")
+    assert error.value.code == 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["validation"]["target_count_mismatches"] == 0
+    assert report["training_targets_from_arrays"]["box_pa_queries"] == 4

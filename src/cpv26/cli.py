@@ -246,6 +246,13 @@ def kbo_import(
     settings.ensure_runtime_directories()
     selected_years = tuple(year) if year else COMPLETE_KBO_SEASONS
     directory = (source_dir or _kbo_dataset_directory(settings)).expanduser().resolve()
+    output = (report_path or settings.home / "reports" / "kbo_import.json").expanduser().resolve()
+    if (
+        output == settings.database_path.resolve()
+        or output == directory
+        or directory in output.parents
+    ):
+        raise typer.BadParameter("--report must not overwrite the database or source archive")
     files = tuple(directory / f"kbo_pbp_{season}.parquet" for season in selected_years)
     missing = tuple(path for path in files if not path.is_file())
     if missing:
@@ -254,7 +261,6 @@ def kbo_import(
             error_console.print(f"  {path}")
         error_console.print("Run `cpv26 kbo-fetch` first.")
         raise typer.Exit(code=1)
-    output = (report_path or settings.home / "reports" / "kbo_import.json").expanduser().resolve()
     try:
         with DuckDBStore(settings.database_path) as store:
             report = import_kbo_playbyplay(store, files)

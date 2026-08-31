@@ -37,6 +37,7 @@ def _new_season() -> dict[str, Any]:
             name: {"nonzero_days": 0, "nonzero_rows": 0, "rows": 0} for name in _BLOCKS
         },
         "queries": {},
+        "training_targets": {},
         "player_node_days_by_identifier_kind": {},
     }
 
@@ -110,8 +111,11 @@ def audit_dataset(directory: str | Path) -> dict[str, Any]:
     """Check file integrity/PIT and return reproducible coverage, not model scores."""
     dataset = KBOGraphDataset(directory)
     manifest = dataset.manifest
+    version = int(manifest["dataset_version"])
+    entries = {entry["day"]: entry for entry in manifest["days"]}
     seasons: dict[str, dict[str, Any]] = {}
     gaps: list[dict[str, Any]] = []
+    count_mismatches: list[dict[str, Any]] = []
     arrays_checked = routes_checked = 0
     for day in dataset.days():
         # load_day validates the exact NPZ SHA, dimensions, numeric finiteness,
@@ -128,6 +132,32 @@ def audit_dataset(directory: str | Path) -> dict[str, Any]:
         season["days"] += 1
         season["games"] += len(graph.match_targets)
         season["pa_queries"] += len(graph.pa_targets)
+        actual_counts = {
+            "live_hit_queries": len(graph.live_hit_query_ids),
+            "live_hit_unknown_pa_queries": int(np.sum(graph.live_hit_pa < 0)),
+            "pa_queries": len(graph.pa_targets),
+            "box_pa_queries": len(graph.box_pa_counts),
+            "box_pa_outcomes": int(graph.box_pa_counts.sum()),
+            "box_pitch_queries": len(graph.box_pitch_targets),
+            "box_pitch_observed_counts": int(graph.box_pitch_mask.sum()),
+            "pa_derived_batting_queries": sum(
+                str(key).startswith("observed-pa-box:") for key in graph.box_pa_query_ids
+            ),
+            "pa_derived_pitching_queries": sum(
+                str(key).startswith("observed-pa-box:") for key in graph.box_pitch_query_ids
+            ),
+        }
+        for name, actual in actual_counts.items():
+            season["training_targets"][name] = season["training_targets"].get(name, 0) + actual
+            if version >= 5 and entries[graph.day_id].get(name) != actual:
+                count_mismatches.append(
+                    {
+                        "scope": graph.day_id,
+                        "field": name,
+                        "actual": actual,
+                        "manifest": entries[graph.day_id].get(name),
+                    }
+                )
         for name in _BLOCKS:
             values = graph.arrays[name]
             nonzero = int(np.any(values != 0, axis=1).sum())
@@ -159,7 +189,32 @@ def audit_dataset(directory: str | Path) -> dict[str, Any]:
                 gap = {"day": graph.day_id, "missing_blocks": missing}
                 season["modern_missing_box_blocks"].append(gap)
                 gaps.append(gap)
-    version = int(manifest["dataset_version"])
+    totals: dict[str, int] = {}
+    season_entries = {str(row["season"]): row for row in manifest.get("season_coverage", [])}
+    for year, season in seasons.items():
+        for name, actual in season["training_targets"].items():
+            totals[name] = totals.get(name, 0) + actual
+            if version >= 5 and season_entries.get(year, {}).get(name) != actual:
+                count_mismatches.append(
+                    {
+                        "scope": year,
+                        "field": name,
+                        "actual": actual,
+                        "manifest": season_entries.get(year, {}).get(name),
+                    }
+                )
+    reported_totals = manifest.get("label_quality", {}).get("training_targets", {})
+    if version >= 5:
+        for name, actual in totals.items():
+            if reported_totals.get(name) != actual:
+                count_mismatches.append(
+                    {
+                        "scope": "all",
+                        "field": name,
+                        "actual": actual,
+                        "manifest": reported_totals.get(name),
+                    }
+                )
     identity_audit = manifest.get("label_quality", {}).get("historical_boxscore_identity")
     failures = gaps if version >= 4 else []
     return {
@@ -167,14 +222,21 @@ def audit_dataset(directory: str | Path) -> dict[str, Any]:
         "dataset_version": version,
         "fingerprint": manifest["fingerprint"],
         "validation": {
-            "passed": not failures,
+            "passed": not failures and not count_mismatches,
             "sha_verified_npz_files": len(dataset.days()),
             "arrays_checked": arrays_checked,
             "past_only_route_edges_checked": routes_checked,
             "modern_zero_block_days": len(gaps),
             "v4_bridge_requirement_enforced": version >= 4,
             "v4_bridge_failure_days": len(failures),
+            "v5_all_source_target_counts_enforced": version >= 5,
+            "target_count_mismatches": len(count_mismatches),
         },
+        "training_targets_from_arrays": totals,
+        "target_count_mismatch_details": count_mismatches,
+        "raw_archive_boxscore_from_manifest": manifest.get("label_quality", {}).get(
+            "raw_archive_boxscore"
+        ),
         "source_identity_counts_from_manifest": identity_audit,
         "identity_policy": manifest.get("policies", {}).get("boxscore_identity"),
         "identity_count_note": (
@@ -193,6 +255,14 @@ def main() -> int:
     parser.add_argument("graph", type=Path, help="Completed graph cache directory")
     parser.add_argument("--output", type=Path, help="Also write the JSON audit to this path")
     args = parser.parse_args()
+    if args.output is not None:
+        graph_directory = args.graph.expanduser().resolve()
+        destination = args.output.expanduser().resolve()
+        if destination == graph_directory or graph_directory in destination.parents:
+            parser.error(
+                "--output must be outside the graph directory; input artifacts are read-only"
+            )
+        args.output = destination
     report = audit_dataset(args.graph)
     encoded = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output is not None:

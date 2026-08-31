@@ -24,6 +24,7 @@ from typing import Any, Protocol, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from cpv26.data.kbo_source_snapshots import source_snapshot_filter_sql
 from cpv26.evaluation import evaluate_probabilities
 from cpv26.models.baseline import DEFAULT_CATBOOST_PARAMETERS, CatBoostClassifierBaseline
 
@@ -34,9 +35,10 @@ HOME_RESULT_LABELS: tuple[str, str, str] = ("L", "D", "W")
 
 # Pick the latest revision before filtering its state or season. Filtering
 # first could resurrect an older final result after a cancellation/correction.
-MATCH_CANONICAL_SQL = """
+MATCH_CANONICAL_SQL = f"""
 WITH latest_game AS (
     SELECT * FROM game
+    WHERE {source_snapshot_filter_sql()}
     QUALIFY row_number() OVER (
         PARTITION BY game_id
         ORDER BY available_at DESC, ingested_at DESC, valid_from DESC, game_row_id DESC

@@ -8,6 +8,9 @@ import pytest
 
 from cpv26.data import DuckDBStore
 from cpv26.data.kbo_ingest import KBOIngestError, import_kbo_playbyplay
+from cpv26.data.kbo_source_snapshots import source_snapshot_filter_sql
+from cpv26.pipelines.kbo_live_hit_baseline import LIVE_HIT_CANONICAL_SQL
+from cpv26.pipelines.kbo_match_baseline import MATCH_CANONICAL_SQL
 
 PITCH_COLUMNS = (
     "game_pk VARCHAR, game_date VARCHAR, home_team VARCHAR, away_team VARCHAR, "
@@ -327,3 +330,102 @@ def test_import_rejects_a_parquet_file_with_missing_columns(tmp_path: Path) -> N
 
     with DuckDBStore() as store, pytest.raises(KBOIngestError, match="missing required"):
         import_kbo_playbyplay(store, [source], revision="test-revision")
+
+
+@pytest.mark.parametrize("number", [0, 1, 2])
+def test_import_decodes_doubleheader_number_from_validated_game_id(
+    tmp_path: Path, number: int,
+) -> None:
+    source = tmp_path / "kbo_pbp_2023.parquet"
+    row = list(_pitch(
+        at_bat_number=1, pitch_number=1, inning_topbot="top", batter="b1",
+        batter_name="Batter", events="single", outs_before=0, post_outs=0,
+        home_score=0, away_score=0, post_home_score=0, post_away_score=0,
+    ))
+    row[0] = f"20230401AAHH{number}2023"
+    _write_rows(source, [tuple(row)])
+    with DuckDBStore() as store:
+        import_kbo_playbyplay(store, [source], revision="doubleheader-test")
+        assert store.connection.execute(
+            "SELECT doubleheader_number FROM game"
+        ).fetchone() == (number or None,)
+
+
+@pytest.mark.parametrize("game_id", [
+    "20230401AAHH32023", "20230402AAHH12023", "20230401HHA A12023",
+    "20230401AAHH12024", "20230401HHAA12023",
+])
+def test_import_rejects_game_id_date_team_or_doubleheader_mismatch(
+    tmp_path: Path, game_id: str,
+) -> None:
+    source = tmp_path / "kbo_pbp_2023.parquet"
+    row = list(_pitch(
+        at_bat_number=1, pitch_number=1, inning_topbot="top", batter="b1",
+        batter_name="Batter", events="single", outs_before=0, post_outs=0,
+        home_score=0, away_score=0, post_home_score=0, post_away_score=0,
+    ))
+    row[0] = game_id
+    _write_rows(source, [tuple(row)])
+    with DuckDBStore() as store:
+        with pytest.raises(KBOIngestError, match="game ID/date/team"):
+            import_kbo_playbyplay(store, [source], revision="invalid-id-test")
+        assert store.connection.execute("SELECT count(*) FROM game").fetchone() == (0,)
+        assert store.connection.execute("SELECT count(*) FROM source_revision").fetchone() == (0,)
+
+
+def test_annual_snapshot_removals_keep_provenance_without_resurrecting_labels(
+    tmp_path: Path,
+) -> None:
+    paths = []
+    for revision in ("old", "new"):
+        directory = tmp_path / revision
+        directory.mkdir()
+        paths.append(directory / "kbo_pbp_2023.parquet")
+    rows = [list(_pitch(
+        at_bat_number=index, pitch_number=1, inning_topbot="top", batter=f"b{index}",
+        batter_name=f"Batter {index}", events="single", outs_before=0, post_outs=0,
+        home_score=0, away_score=0, post_home_score=0, post_away_score=0,
+    )) for index in (1, 2, 3)]
+    for row in rows[:2]:
+        row[0], row[1] = "20230402AAHH02023", "2023-04-02"
+    _write_rows(paths[0], [tuple(row) for row in rows])
+    rows[1][19] = None  # Corrected source no longer classifies this PA.
+    _write_rows(paths[1], [tuple(row) for row in rows[:2]])  # Season's earliest game removed.
+    old_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    new_at = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    with DuckDBStore() as store:
+        import_kbo_playbyplay(store, [paths[0]], revision="old", ingested_at=old_at)
+        before = store.connection.execute(
+            "SELECT * FROM observed_plate_appearance ORDER BY observed_pa_row_id"
+        ).fetchall()
+        report = import_kbo_playbyplay(store, [paths[1]], revision="new", ingested_at=new_at)
+        assert report.completed_plate_appearances == 1
+        assert report.unlabelled_plate_appearances == 1
+        assert store.connection.execute(
+            "SELECT count(*) FROM observed_plate_appearance"
+        ).fetchone() == (4,)
+        assert store.connection.execute("SELECT count(*) FROM game").fetchone() == (3,)
+        assert store.connection.execute(
+            "SELECT * FROM observed_plate_appearance WHERE source_revision_id LIKE '%:old:%' "
+            "ORDER BY observed_pa_row_id"
+        ).fetchall() == before
+        predicate = source_snapshot_filter_sql(knowledge_bound=True)
+        for at, pa_count, game_count in ((old_at, 3, 2), (new_at, 1, 1)):
+            for table, expected in (("observed_plate_appearance", pa_count), ("game", game_count)):
+                assert store.connection.execute(
+                    f"SELECT count(*) FROM {table} WHERE ingested_at <= ? AND {predicate}",
+                    [at, at],
+                ).fetchone() == (expected,)
+                assert len(store.fetch_as_of(
+                    table, cutoff_at=datetime(2023, 4, 5, tzinfo=timezone.utc), knowledge_at=at,
+                )) == expected
+        # New source starts later than this forecast cutoff. Its snapshot still
+        # removes the old earliest game once the correction is known.
+        early_cutoff = datetime(2023, 4, 2, tzinfo=timezone.utc)
+        assert len(store.fetch_as_of("game", cutoff_at=early_cutoff, knowledge_at=old_at)) == 1
+        assert store.fetch_as_of("game", cutoff_at=early_cutoff, knowledge_at=new_at) == []
+        matches = store.connection.execute(MATCH_CANONICAL_SQL).fetchall()
+        live_hit = store.connection.execute(LIVE_HIT_CANONICAL_SQL).fetchall()
+        assert len(matches) == len(live_hit) == 1
+        assert matches[0][0] == "kbo-game:20230402AAHH02023"
+        assert live_hit[0][0] == "kbo-pa:20230402AAHH02023:1"

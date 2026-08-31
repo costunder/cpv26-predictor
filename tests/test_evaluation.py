@@ -101,6 +101,76 @@ def test_probability_metrics_support_explicit_string_labels() -> None:
         multiclass_log_loss([0], [[0.8, 0.3]])
 
 
+@pytest.mark.parametrize(
+    ("targets", "labels"),
+    [
+        (np.array(["away", "home"], dtype=object), ("away", "home")),
+        (np.array([1, 2], dtype=object), (1, 2)),
+        (np.array([1, "home"], dtype=object), (1, "home")),
+        ([1, "home"], (1, "home")),
+        (np.array([np.int64(1), np.str_("home")], dtype=object), (1, "home")),
+        (np.array([None, "home"], dtype=object), (None, "home")),
+        (np.array([b"away", b"home"]), (b"away", b"home")),
+    ],
+)
+def test_probability_metrics_preserve_object_and_mixed_labels(
+    targets: object, labels: tuple[object, object]
+) -> None:
+    probabilities = [[0.75, 0.25], [0.2, 0.8]]
+    expected = evaluate_probabilities([0, 1], probabilities, n_bins=2)
+
+    actual = evaluate_probabilities(targets, probabilities, labels=labels, n_bins=2)
+
+    assert actual.log_loss == pytest.approx(expected.log_loss)
+    assert actual.brier_score == pytest.approx(expected.brier_score)
+    assert actual.expected_calibration_error == pytest.approx(expected.expected_calibration_error)
+
+
+def test_probability_metrics_unknown_object_label_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="unknown target label"):
+        evaluate_probabilities(
+            np.array(["unknown"], dtype=object), [[0.75, 0.25]], labels=("away", "home")
+        )
+
+
+@pytest.mark.parametrize("strategy", ["uniform", "quantile"])
+@pytest.mark.parametrize("scale", [1e308, 1e-300, np.nextafter(0.0, 1.0) * 8])
+def test_probability_metrics_are_invariant_to_extreme_finite_weight_scale(
+    strategy: str, scale: float
+) -> None:
+    probabilities = np.array([[0.5, 0.5], [0.1, 0.9], [1.0, 0.0], [0.0, 1.0]])
+    targets = np.array([0, 1, 1, 0])
+    relative_weights = np.array([1.0, 0.5, 0.0, 1.0])
+    weights = relative_weights * scale
+    expected_log_loss = float(np.average(-np.log([0.5, 0.9, 1e-15, 1e-15]),
+                                         weights=relative_weights))
+    expected_brier = float(np.average([0.5, 0.02, 2.0, 2.0], weights=relative_weights))
+    # One bin checks the weighted global mean for either strategy.
+    expected_ece = abs((1.0 + 0.5) / 2.5 - (0.5 + 0.45 + 1.0) / 2.5)
+
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        actual = evaluate_probabilities(
+            targets, probabilities, sample_weight=weights, n_bins=1,
+            calibration_strategy=strategy,
+        )
+
+    assert actual.log_loss == pytest.approx(expected_log_loss)
+    assert actual.brier_score == pytest.approx(expected_brier)
+    assert actual.expected_calibration_error == pytest.approx(expected_ece)
+    # Distinct bins must remain scale-invariant too, not only a global mean.
+    assert expected_calibration_error(
+        targets, probabilities, sample_weight=weights, n_bins=4, strategy=strategy,
+    ) == pytest.approx(expected_calibration_error(
+        targets, probabilities, sample_weight=relative_weights, n_bins=4, strategy=strategy,
+    ))
+
+
+@pytest.mark.parametrize("weights", [[0.0, 0.0], [-1.0, 1.0], [np.inf, 1.0], [np.nan, 1.0]])
+def test_probability_metrics_reject_invalid_sample_weights(weights: list[float]) -> None:
+    with pytest.raises(ValueError, match="sample_weight"):
+        evaluate_probabilities([0, 1], [[0.8, 0.2], [0.1, 0.9]], sample_weight=weights)
+
+
 def test_catboost_baseline_reports_missing_optional_dependency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
