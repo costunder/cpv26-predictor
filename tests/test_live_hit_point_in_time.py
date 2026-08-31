@@ -162,7 +162,7 @@ def _append_live_hit_inputs(
 
 
 def test_live_hit_tables_have_explicit_point_in_time_natural_keys() -> None:
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     assert TABLE_DEFINITIONS["v26_live_hit_rule_set"].natural_identity == (
         "rule_version",
     )

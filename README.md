@@ -120,7 +120,7 @@ cpv26 kbo-fetch --year 2023 --year 2024 --year 2025 --year 2026 &&
 cpv26 kbo-import --year 2023 --year 2024 --year 2025 --year 2026 &&
 cpv26 db-check &&
 cpv26 kbo-graph-build \
-  --output var/datasets/kbo_graph_2001_2026 \
+  --output var/datasets/kbo_graph_2001_2026_full \
   --start-date 2001-01-01 \
   --end-date 2026-07-26
 ~~~
@@ -129,13 +129,18 @@ cpv26 kbo-graph-build \
 
 | 기간 | 학습에 쓰는 기록 |
 |---|---|
-| 2001~2022 | 실제 정규시즌 경기 결과·최종 득점 → Match·득점 헤드 |
+| 2001~2022 | 경기·득점, 선수별 타격·투구 합계, 확인된 이닝별 타격 결과 → 경기·안타·타격 집계·투구 헤드 |
 | 2023~2025 | 경기 결과와 관측 타석 → Match·득점·PA·LiveHit 헤드 |
 | 2026 | 7월 26일까지의 같은 항목, 별도 테스트 |
 
-과거 박스스코어를 타석 순서로 복원하거나 없는 PA·선수 안타 라벨을 만들지 않습니다.
-`kbo-history-import`가 연도별 경기 수를 출력하고, 그래프의 `manifest.json`에는
-`season_coverage`로 경기만 있는 수와 PA가 있는 수를 나눠 기록합니다.
+타자·투수 원문을 전부 보존하고, 읽을 수 있는 항목은 각각 학습에 연결합니다.
+안타 수는 있지만 정확한 PA가 없는 행도 사용합니다. 확인되지 않은 타석 순서·상대 투수·
+주자 상태는 만들지 않습니다. `kbo-history-import`와 그래프 `manifest.json`에 연도별
+타자·투수·안타·타격 결과 사용 건수와 사용할 수 없는 항목의 사유를 남깁니다.
+
+옛 원천에는 고유 선수 ID가 없어 이름이 같다고 동일 선수로 합치지 않습니다.
+각 원천 행을 별도로 유지하며, 이 행의 예측 입력은 과거 팀별 타격·투구 이력입니다.
+따라서 아직 선수 개인의 2001~2026 경력을 연결한 모델은 아닙니다.
 
 생성 위치는 다음과 같습니다.
 
@@ -146,11 +151,15 @@ cpv26 kbo-graph-build \
 | var/cpv26.duckdb | 정규화한 선수·팀·경기·타석 DB |
 | var/reports/kbo_history_import.json | 역사 경기 적재·중복·연도별 제공 범위 |
 | var/reports/kbo_import.json | 타석 원천 적재 결과와 품질 검사 |
-| var/datasets/kbo_graph_2001_2026/ | 2001년부터의 날짜별 RelGNN 그래프 |
+| var/datasets/kbo_graph_2001_2026_full/ | 선수 박스스코어를 포함한 v3 날짜별 그래프 |
 
 두 fetch 명령은 고정된 공개 파일과 SHA-256을 확인합니다. 같은 파일과 적재 행은
 재실행 시 재사용합니다. 기존 `var/datasets/kbo_graph/`와 checkpoint는 건드리지 않습니다.
 역사 원천의 출처와 보완 기록은 [데이터 설명](docs/GPU_TRAINING.md#데이터-출처와-고정-스냅샷)에 있습니다.
+
+기존 경기 점수만 적재했던 DB는 `cpv26 db-init` 후 `cpv26 kbo-history-import`를
+다시 실행합니다. schema v5가 기존 경기·타석을 보존하면서 선수 기록을 추가합니다.
+이미 내려받은 원천은 다시 받을 필요가 없습니다. 그래프와 학습 run은 새 경로를 사용합니다.
 
 kbo-graph-build는 대상 날짜 이전의 최대 90일 관계를 사용해 날짜별 그래프를 만듭니다.
 그날의 경기 결과는 정답이며, 같은 날의 결과를 과거 관계 입력으로 사용하지 않습니다.
@@ -163,8 +172,8 @@ kbo-graph-build는 대상 날짜 이전의 최대 90일 관계를 사용해 날�
 
 ~~~bash
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph_2001_2026 \
-  --run-dir var/runs/relgnn/kbo_2001_2024_v1 \
+  --dataset var/datasets/kbo_graph_2001_2026_full \
+  --run-dir var/runs/relgnn/kbo_2001_2024_full_v1 \
   --train-start-year 2001 \
   --train-end-year 2024 \
   --validation-year 2025 \
@@ -173,6 +182,8 @@ cpv26 relgnn-train \
   --device cuda:0 \
   --epochs 30 \
   --batch-days 1 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
   --amp auto
 ~~~
 
@@ -190,19 +201,21 @@ cpv26 relgnn-train \
 early stopping하며, `--patience 0`은 이를 끕니다. `--epochs`는 최대 전체 epoch 수입니다.
 이미 결과를 확인한 2025년은 여기서 검증용으로 사용하고 독립적인 최종 테스트로 부르지 않습니다.
 
-2001~2022년은 경기·득점 손실만 계산합니다. PA·LiveHit 손실을 0점 정답으로 채우는 것이
-아니라, 해당 질의 자체가 없습니다. 2023년부터는 관측 타석이 있는 날짜에서 네 헤드를 학습합니다.
-현재 LiveHit는 완료된 관측 PA가 한 개 이상인 선수-경기에 조건부인 분포입니다.
+2001~2022년 타격 합계는 안타 분포와 타격 결과 집계를, 투구 합계는 관측된 수치별
+투구 손실을 학습합니다. 정확한 PA가 없으면 가능한 PA에 걸쳐 안타 likelihood를 합산합니다.
+빠진 항목만 손실에서 마스킹하며, 해당 선수 행 전체를 버리지 않습니다.
+LiveHit는 관측 PA가 한 개 이상임을 확인할 수 있는 선수-경기에 조건부인 분포입니다.
 미출장 확률이나 V26 계정별 최종 추천과 같지 않습니다.
 
 기본 모델은 hidden dimension 64, 관계 layer 2개, attention head 4개이며,
 learning rate 0.0003, weight decay 0.0001입니다. 상세 구조는 [GPU 학습 설명](docs/GPU_TRAINING.md)에 있습니다.
 
 위 run 이름은 이번 실험용입니다. 같은 이름으로 이미 실행했다면 새 이름을 사용합니다.
-이전에 2023년부터 학습한 checkpoint를 이번 데이터에 `--resume`하지 않습니다.
+기존 경기 점수 전용 v2 checkpoint를 이번 v3 데이터에 `--resume`하지 않습니다.
+기존 checkpoint는 기존 그래프에서 계속 평가할 수 있습니다.
 
 ~~~text
-var/runs/relgnn/kbo_2001_2024_v1/
+var/runs/relgnn/kbo_2001_2024_full_v1/
 ├── config.json
 ├── history.jsonl
 ├── last.pt
@@ -220,7 +233,7 @@ GPU를 사용할 수 없으면 오류로 끝나며 CPU 학습으로 자동 전�
 
 ~~~bash
 cpv26 relgnn-evaluate \
-  --checkpoint var/runs/relgnn/kbo_2001_2024_v1/best.pt \
+  --checkpoint var/runs/relgnn/kbo_2001_2024_full_v1/best.pt \
   --split test \
   --device cuda:0
 ~~~
@@ -247,8 +260,8 @@ best.pt는 재개용으로 사용하지 않습니다.
 
 ~~~bash
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph_2001_2026 \
-  --resume var/runs/relgnn/kbo_2001_2024_v1/last.pt \
+  --dataset var/datasets/kbo_graph_2001_2026_full \
+  --resume var/runs/relgnn/kbo_2001_2024_full_v1/last.pt \
   --train-start-year 2001 \
   --train-end-year 2024 \
   --validation-year 2025 \
@@ -257,6 +270,8 @@ cpv26 relgnn-train \
   --device cuda:0 \
   --epochs 50 \
   --batch-days 1 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
   --amp auto
 ~~~
 
@@ -269,11 +284,12 @@ cpv26 relgnn-train \
 
 ## 8. VRAM 부족
 
-5절은 이미 `--batch-days 1`입니다. 학습 PA 질의에서 메모리가 부족하면
-`--max-pa-per-day 64`를 추가하고 새 run 이름으로 실행합니다.
+5절은 이미 `--batch-days 1`입니다. 메모리가 부족하면 `--hidden-dim 32`처럼 모델 크기를
+줄이고 새 run 이름으로 실행합니다.
 
---max-pa-per-day의 기본값은 128이며 훈련 PA query만 표본화합니다. validation과
-test PA는 전부 평가하므로 이 옵션이 평가 메모리까지 제한하지는 않습니다.
+CLI의 `--max-pa-per-day`와 `--max-edges-per-route` 기본값은 `0`으로, 질의·관계를
+전부 사용합니다. 양수를 직접 지정한 경우에만 표본화하며, 그 제한을 학습 보고서에 기록합니다.
+기존 제한 학습을 재개할 때는 원래 값(예: 128, 20000)을 명시합니다.
 --amp auto는 GPU가 지원하는 혼합정밀도를 선택합니다. 데이터 로딩 프로세스가
 문제라면 --workers 0으로 확인할 수 있습니다.
 
@@ -367,7 +383,7 @@ bash scripts/setup.sh ml-cpu
 ~~~bash
 source scripts/activate.sh
 cpv26 relgnn-train \
-  --dataset var/datasets/kbo_graph_2001_2026 \
+  --dataset var/datasets/kbo_graph_2001_2026_full \
   --run-dir var/runs/relgnn/cpu_validation \
   --train-start-year 2001 \
   --train-end-year 2024 \

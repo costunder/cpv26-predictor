@@ -302,13 +302,91 @@ def test_training_config_accepts_historical_years_and_reads_legacy_checkpoints()
     assert KBOTrainingConfig.from_dict(asdict(expanded)) == expanded
     legacy = asdict(KBOTrainingConfig())
     del legacy["chronological"]
+    del legacy["box_pa_weight"]
+    del legacy["box_pitch_weight"]
     assert KBOTrainingConfig.from_dict(legacy).chronological is False
+    assert KBOTrainingConfig.from_dict(legacy).box_pa_weight == 0.2
+    assert KBOTrainingConfig.from_dict(legacy).box_pitch_weight == 0.1
     _resume_compatible({"training_config": legacy, "epoch": 1}, KBOTrainingConfig(epochs=2))
     with pytest.raises(ValueError, match="chronological"):
         _resume_compatible(
             {"training_config": legacy, "epoch": 1},
             KBOTrainingConfig(epochs=2, chronological=True),
         )
+
+
+def test_training_config_supports_all_records_without_silent_sampling() -> None:
+    config = KBOTrainingConfig(max_pa_per_day=0, max_edges_per_route_per_day=0)
+    assert config.max_pa_per_day == config.max_edges_per_route_per_day == 0
+    for key in ("max_pa_per_day", "max_edges_per_route_per_day"):
+        for value in (-1, True, 1.5):
+            with pytest.raises(ValueError, match="non-negative"):
+                KBOTrainingConfig(**{key: value})
+    for key in ("box_pa_weight", "box_pitch_weight"):
+        with pytest.raises(ValueError, match="non-negative"):
+            KBOTrainingConfig(**{key: -1})
+
+
+def test_model_config_enables_boxscore_features_only_for_v3_graphs(graph_directory: Path) -> None:
+    dataset = runner_module.KBOGraphDataset(graph_directory)
+    current = runner_module._model_config(dataset, KBOTrainingConfig())
+    assert current.include_boxscore_heads is True
+    assert current.box_batting_feature_dim == 19
+    assert current.box_pitching_feature_dim == 21
+    legacy = SimpleNamespace(manifest={**dataset.manifest, "dataset_version": 2})
+    old = runner_module._model_config(legacy, KBOTrainingConfig())
+    assert old.include_boxscore_heads is False
+    assert old.node_feature_dims == current.node_feature_dims
+    assert old.role_feature_dims == current.role_feature_dims
+
+
+def test_nullable_prediction_export_does_not_replace_unknown_labels_with_zero(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "partial.parquet"
+    runner_module._write_prediction_parquet(output, [
+        {"query_id": "first", "observed_pa": None, "observed_pa_lower_bound": 3,
+         "observed_pitches_thrown": None, "expected_hits_lower_bound": 1.2},
+        {"query_id": "second", "observed_pa": 4, "observed_pa_lower_bound": 4,
+         "observed_pitches_thrown": None, "expected_hits_lower_bound": 1.5},
+    ])
+    with duckdb.connect() as connection:
+        rows = connection.execute(
+            "SELECT observed_pa, observed_pitches_thrown FROM read_parquet(?) ORDER BY query_id",
+            [str(output)],
+        ).fetchall()
+        types = connection.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?)", [str(output)]
+        ).fetchall()
+    assert rows == [(None, None), (4, None)]
+    assert {row[0]: row[1] for row in types}["observed_pa"] == "BIGINT"
+    assert {row[0]: row[1] for row in types}["observed_pitches_thrown"] == "BIGINT"
+
+
+def test_v2_checkpoint_without_boxscore_fields_still_resumes_and_evaluates(
+    graph_directory: Path, tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    manifest_path = graph_directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["dataset_version"] = 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    run = tmp_path / "legacy-run"
+    train_kbo_relgnn(graph_directory, run, config=_config(), progress=lambda _: None)
+    state = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+    for key in ("include_boxscore_heads", "box_batting_feature_dim", "box_pitching_feature_dim"):
+        state["model_config"].pop(key)
+    for key in ("box_pa_weight", "box_pitch_weight"):
+        state["training_config"].pop(key)
+    torch.save(state, run / "last.pt")
+    resumed = train_kbo_relgnn(
+        graph_directory, run, config=_config(epochs=2), resume=run / "last.pt",
+        progress=lambda _: None,
+    )
+    assert resumed["completed_epochs"] == 2
+    assert set(resumed["history"][-1]["training_samples"]) == {"match", "live_hit", "pa", "run"}
+    report = evaluate_kbo_relgnn(run / "best.pt", device="cpu", amp="off", workers=0)
+    assert set(report["metrics"]["losses"]) == {"match", "live_hit", "pa", "run"}
 
 
 def test_multi_year_splits_are_complete_ordered_and_disjoint(graph_directory: Path) -> None:

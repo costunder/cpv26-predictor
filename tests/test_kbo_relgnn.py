@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 import numpy as np
@@ -16,6 +16,7 @@ from cpv26.models.kbo_relgnn import (  # noqa: E402
     collate_kbo_day_graphs,
     encode_live_hit_targets,
     kbo_multitask_loss,
+    live_hit_observed_nll,
 )
 
 
@@ -106,11 +107,241 @@ def _game_only_day(day_id: str = "2001-04-05", *, with_history: bool = True) -> 
     return day
 
 
+def _box_day(day_id: str = "2001-04-05") -> dict[str, Any]:
+    day = _day(day_id)
+    day["box_pa_player_index"] = np.asarray([0], dtype=np.int64)
+    day["box_pa_team_index"] = np.asarray([0], dtype=np.int64)
+    day["box_pa_opponent_index"] = np.asarray([1], dtype=np.int64)
+    day["box_pa_counts"] = np.asarray([[2, 1, 1, 0, 0, 0, 0, 0, 0, 0]], dtype=np.float32)
+    day["box_pa_query_ids"] = (f"{day_id}:box-pa",)
+    day["box_pitch_player_index"] = np.asarray([1], dtype=np.int64)
+    day["box_pitch_team_index"] = np.asarray([1], dtype=np.int64)
+    day["box_pitch_opponent_index"] = np.asarray([0], dtype=np.int64)
+    day["box_pitch_targets"] = np.asarray([[5, 3, 21, 4, 1, 0, 1, 2, 1, 1]], dtype=np.float32)
+    day["box_pitch_mask"] = np.ones((1, 10), dtype=bool)
+    day["box_pitch_mask"][0, 2] = False
+    day["box_pitch_query_ids"] = (f"{day_id}:box-pitch",)
+    rng = np.random.default_rng(13)
+    for kind, count in (("player", 3), ("team", 2)):
+        for role, width in (("batting", 19), ("pitching", 21)):
+            day[f"{kind}_box_{role}_features"] = rng.random((count, width)).astype(np.float32)
+    return day
+
+
+def test_unknown_pa_uses_observed_hit_and_minimum_constraint_without_fabricating_pa() -> None:
+    day = _day()
+    day["live_hit_pa"] = np.asarray([-1, 4], dtype=np.int64)
+    day["live_hit_pa_min"] = np.asarray([3, 1], dtype=np.int64)
+    day["live_hit_hits"] = np.asarray([2, 0], dtype=np.int64)
+    model = _model()
+    batch = collate_kbo_day_graphs([day])
+    output = model(batch)
+    joint = output["live_hit_joint_probabilities"]
+    expected = -torch.stack((joint[0, 2:, 2].sum(), joint[1, 3, 0])).log()
+    actual = live_hit_observed_nll(output["live_hit_joint_logits"], batch)
+    torch.testing.assert_close(actual, expected)
+    losses = kbo_multitask_loss(output, batch)
+    torch.testing.assert_close(losses["live_hit_loss"], expected.mean())
+    assert batch["live_hit_pa"].tolist() == [-1, 4]
+    tightened = dict(batch, live_hit_pa_min=torch.tensor([6, 1]))
+    assert live_hit_observed_nll(output["live_hit_joint_logits"], tightened)[0] >= actual[0]
+    losses["loss"].backward()
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.grad is not None
+    )
+
+
+def test_unknown_pa_minimum_above_support_uses_overflow_without_fake_exact_count() -> None:
+    day = _day()
+    day["live_hit_pa"] = np.asarray([-1, -1], dtype=np.int64)
+    day["live_hit_pa_min"] = np.asarray([12, 1], dtype=np.int64)
+    day["live_hit_hits"] = np.asarray([9, 0], dtype=np.int64)
+    batch = collate_kbo_day_graphs([day])
+    output = _model()(batch)
+    losses = live_hit_observed_nll(output["live_hit_joint_logits"], batch)
+    joint = output["live_hit_joint_probabilities"]
+    torch.testing.assert_close(losses[0], -joint[0, -1, -1].log())
+    torch.testing.assert_close(losses[1], -joint[1, :, 0].sum().log())
+    assert batch["live_hit_pa"].tolist() == [-1, -1]
+    assert batch["live_hit_pa_min"].tolist() == [12, 1]
+
+
+@pytest.mark.parametrize(
+    ("pa", "minimum", "hits"), [(0, 1, 0), (-2, 1, 0), (-1, 0, 0), (2, 3, 1), (2, 1, 3)]
+)
+def test_partial_pa_collator_rejects_invalid_evidence(pa: int, minimum: int, hits: int) -> None:
+    day = _day()
+    day["live_hit_pa"] = np.asarray([pa, 3], dtype=np.int64)
+    day["live_hit_pa_min"] = np.asarray([minimum, 1], dtype=np.int64)
+    day["live_hit_hits"] = np.asarray([hits, 0], dtype=np.int64)
+    with pytest.raises(ValueError, match="Live Hit labels"):
+        collate_kbo_day_graphs([day])
+
+
+def test_boxscore_heads_train_verified_histograms_and_masked_pitch_counts() -> None:
+    day = _box_day()
+    config = replace(_config(), include_boxscore_heads=True)
+    model = KBORelGNNModel(config)
+    batch = collate_kbo_day_graphs([day])
+    output = model(batch)
+    assert output["box_pa_logits"].shape == (1, 10)
+    assert output["box_pitch_rates"].shape == (1, 10)
+    assert batch["box_pitch_targets"][0, 2] == 0
+    losses = kbo_multitask_loss(output, batch)
+    histogram_nll = -(
+        batch["box_pa_counts"] * torch.log_softmax(output["box_pa_logits"], dim=-1)
+    ).sum() / 4
+    torch.testing.assert_close(losses["box_pa_loss"], histogram_nll)
+    mask = batch["box_pitch_mask"]
+    rates = output["box_pitch_rates"]
+    target = batch["box_pitch_targets"]
+    pitch_nll = rates - target * rates.log() + torch.lgamma(target + 1)
+    torch.testing.assert_close(losses["box_pitch_loss"], pitch_nll[mask].mean())
+    changed = copy.deepcopy(day)
+    changed["box_pitch_targets"][0, 2] = 900
+    changed_batch = collate_kbo_day_graphs([changed])
+    assert torch.equal(batch["box_pitch_targets"], changed_batch["box_pitch_targets"])
+    aggregate_loss = losses["box_pa_loss"] + losses["box_pitch_loss"]
+    aggregate_loss.backward()
+    for head in (model.box_pa_head, model.box_pitch_head):
+        assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0
+                   for parameter in head.parameters())
+    gradient = model.backbone.player_encoder.shared_core[0].weight.grad
+    assert gradient is not None and gradient[:, -40:].abs().sum() > 0
+    assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters()
+               if parameter.grad is not None)
+
+
+def test_boxscore_and_legacy_days_collate_without_cross_graph_offsets_or_feature_leakage() -> None:
+    first, second = _day("2023-04-01"), _box_day()
+    model = KBORelGNNModel(replace(_config(), include_boxscore_heads=True)).eval()
+    union = collate_kbo_day_graphs([first, second], max_pa_per_day=0,
+                                  max_edges_per_route_per_day=0)
+    assert union["box_pa_player_index"].tolist() == [3]
+    assert union["box_pitch_player_index"].tolist() == [4]
+    assert union["box_pa_team_index"].tolist() == [2]
+    assert union["box_pitch_opponent_index"].tolist() == [2]
+    output = model(union)
+    separate = [model(collate_kbo_day_graphs([day])) for day in (first, second)]
+    for key in ("match_logits", "box_pa_logits", "box_pitch_rates"):
+        torch.testing.assert_close(output[key], torch.cat([part[key] for part in separate]),
+                                   atol=2e-6, rtol=1e-5)
+    changed = copy.deepcopy(second)
+    changed["player_box_batting_features"] *= 100
+    altered = model(collate_kbo_day_graphs([first, changed]))
+    torch.testing.assert_close(output["match_logits"][:1], altered["match_logits"][:1])
+    with pytest.raises(ValueError, match="include_boxscore_heads"):
+        _model()(collate_kbo_day_graphs([second]))
+
+
+@pytest.mark.parametrize("limit", [None, 0])
+def test_unlimited_pa_and_edge_mode_retains_every_query_and_relation(limit: int | None) -> None:
+    batch = collate_kbo_day_graphs([_day()], max_pa_per_day=limit,
+                                  max_edges_per_route_per_day=limit)
+    assert len(batch["pa_targets"]) == 6
+    assert [route.num_edges for route in batch["routes"]] == [3, 2, 1, 2]
+
+
+def test_boxscore_evaluation_separates_aggregates_and_masks_unknown_pa_from_mae() -> None:
+    from cpv26.training.kbo_runner import KBOTrainingConfig, _evaluate_model
+
+    day = _box_day()
+    day["live_hit_pa"] = np.asarray([-1, 4], dtype=np.int64)
+    day["live_hit_pa_min"] = np.asarray([12, 1], dtype=np.int64)
+    model = KBORelGNNModel(replace(_config(), include_boxscore_heads=True)).eval()
+    batch = collate_kbo_day_graphs([day])
+    output = model(batch)
+    expected_pa_mae = abs(float(output["live_hit_expected_pa"][1].detach()) - 4)
+    report, predictions = _evaluate_model(
+        model, [batch], KBOTrainingConfig(device="cpu"), torch.device("cpu"), None,
+        collect_predictions=True,
+    )
+    live = report["live_hit"]
+    assert live["known_pa_samples"] == live["unknown_pa_samples"] == 1
+    assert live["unknown_pa_minimum_overflow_samples"] == 1
+    assert live["expected_pa_lower_bound_mae"] == pytest.approx(expected_pa_mae)
+    assert np.isfinite(live["partial_pa_nll"])
+    assert predictions["live_hit"][0]["observed_pa"] is None
+    assert predictions["live_hit"][0]["observed_pa_lower_bound"] == 12
+    assert predictions["live_hit"][1]["observed_pa"] == 4
+    assert report["box_pa"]["observed_outcomes"] == 4
+    assert report["box_pa"]["player_game_queries"] == 1
+    assert report["box_pitch"]["observed_counts"] == 9
+    assert report["box_pitch"]["per_field"]["pitches_thrown"]["samples"] == 0
+    assert report["box_pitch"]["per_field"]["pitches_thrown"]["mae"] is None
+    assert predictions["box_pitch"][0]["observed_pitches_thrown"] is None
+    assert len(predictions["box_pa"]) == len(predictions["box_pitch"]) == 1
+    assert np.isfinite(report["selection_loss"])
+
+
+def test_all_unknown_pa_evaluation_has_no_pa_mae_or_joint_nll() -> None:
+    from cpv26.training.kbo_runner import KBOTrainingConfig, _evaluate_model
+
+    day = _day()
+    day["live_hit_pa"] = np.asarray([-1, -1], dtype=np.int64)
+    batch = collate_kbo_day_graphs([day])
+    report, _ = _evaluate_model(
+        _model(), [batch], KBOTrainingConfig(device="cpu"), torch.device("cpu"), None
+    )
+    assert report["live_hit"]["samples"] == 2
+    assert report["live_hit"]["expected_pa_lower_bound_mae"] is None
+    assert report["live_hit"]["joint_nll"] is None
+    assert report["live_hit"]["unknown_pa_samples"] == 2
+
+
+def test_boxscore_targets_cannot_change_pregame_predictions() -> None:
+    original = _box_day()
+    changed = copy.deepcopy(original)
+    changed["box_pa_counts"] *= 2
+    changed["box_pitch_targets"] *= 3
+    model = KBORelGNNModel(replace(_config(), include_boxscore_heads=True)).eval()
+    first = model(collate_kbo_day_graphs([original]))
+    second = model(collate_kbo_day_graphs([changed]))
+    for key in ("match_logits", "live_hit_joint_probabilities", "box_pa_logits", "box_pitch_rates"):
+        torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
+
+
+def test_boxscore_config_default_keeps_old_state_dict_compatible() -> None:
+    legacy = _config().to_dict()
+    for key in ("include_boxscore_heads", "box_batting_feature_dim", "box_pitching_feature_dim"):
+        legacy.pop(key)
+    restored = KBORelGNNConfig(**legacy)
+    assert restored.include_boxscore_heads is False
+    source = _model()
+    target = KBORelGNNModel(restored)
+    target.load_state_dict(source.state_dict(), strict=True)
+    assert all(
+        not key.startswith(("box_pa_head.", "box_pitch_head.")) for key in source.state_dict()
+    )
+
+
+def test_legacy_decoder_mixed_partial_pa_predictions_have_consistent_columns() -> None:
+    from cpv26.training.kbo_runner import KBOTrainingConfig, _evaluate_model
+
+    known = _day("2023-04-01")
+    partial = _day("2001-04-05")
+    partial["live_hit_pa"] = np.asarray([-1, 3], dtype=np.int64)
+    partial["live_hit_pa_min"] = np.asarray([2, 3], dtype=np.int64)
+    batches = [collate_kbo_day_graphs([day]) for day in (known, partial)]
+    _, predictions = _evaluate_model(
+        _model(), batches, KBOTrainingConfig(device="cpu"), torch.device("cpu"), None,
+        collect_predictions=True,
+    )
+    rows = predictions["live_hit"]
+    assert all(set(row) == set(rows[0]) for row in rows)
+    assert [row["observed_pa"] for row in rows] == [4, 3, None, 3]
+    assert [row["observed_pa_lower_bound"] for row in rows] == [4, 3, 2, 3]
+
+
 @pytest.mark.parametrize("with_history", [False, True])
+@pytest.mark.parametrize("include_boxscore", [False, True])
 def test_game_only_day_without_players_trains_match_and_run_without_optional_labels(
     with_history: bool,
+    include_boxscore: bool,
 ) -> None:
-    model = _model()
+    model = KBORelGNNModel(replace(_config(), include_boxscore_heads=include_boxscore))
     batch = collate_kbo_day_graphs([_game_only_day(with_history=with_history)])
     assert batch["node_features"]["player"].shape == (0, 4)
     assert batch["node_graph_index"]["player"].numel() == 0
@@ -125,6 +356,9 @@ def test_game_only_day_without_players_trains_match_and_run_without_optional_lab
     assert losses["pa_loss"].item() == 0
     assert losses["match_loss"].item() > 0
     assert losses["run_loss"].item() > 0
+    if include_boxscore:
+        assert output["box_pa_logits"].shape == output["box_pitch_rates"].shape == (0, 10)
+        assert losses["box_pa_loss"].item() == losses["box_pitch_loss"].item() == 0
     losses["loss"].backward()
     assert all(parameter.grad is None for parameter in model.live_hit_head.parameters())
     assert all(parameter.grad is None for parameter in model.pa_head.parameters())

@@ -81,7 +81,7 @@ def _type_map(store: DuckDBStore, table: str) -> dict[str, str]:
 
 
 def test_schema_v4_fresh_install_has_fourteen_tables_keys_and_timezone_columns() -> None:
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     assert len(V4_NATURAL_IDENTITIES) == 14
 
     with DuckDBStore() as store:
@@ -93,7 +93,7 @@ def test_schema_v4_fresh_install_has_fourteen_tables_keys_and_timezone_columns()
         ).fetchall()
 
         assert set(V4_NATURAL_IDENTITIES) <= installed
-        assert migration_versions == [(4,)]
+        assert migration_versions == [(5,)]
         for table, natural_identity in V4_NATURAL_IDENTITIES.items():
             assert TABLE_DEFINITIONS[table].natural_identity == natural_identity
             column_types = _type_map(store, table)
@@ -131,8 +131,8 @@ def test_v3_migration_adds_v4_contract_and_preserves_legacy_rows(tmp_path: Path)
             "SELECT schema_version FROM schema_migration ORDER BY schema_version"
         ).fetchall()
 
-        assert version == (4,)
-        assert migration_versions == [(3,), (4,)]
+        assert version == (5,)
+        assert migration_versions == [(3,), (4,), (5,)]
         assert pa == ("legacy-pa", 0, False, None, None, None, None, None, None)
         assert eligibility == ("legacy-player", legacy_at)
         assert selection == ("legacy-player", legacy_at, "unspecified")

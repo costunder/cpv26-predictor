@@ -86,6 +86,9 @@ class KBORelGNNConfig:
     max_hits: int = 5
     pa_context_dim: int = 10
     include_run_head: bool = True
+    include_boxscore_heads: bool = False
+    box_batting_feature_dim: int = 19
+    box_pitching_feature_dim: int = 21
 
     def __post_init__(self) -> None:
         for name in ("node_feature_dims", "role_feature_dims", "route_feature_dims"):
@@ -117,6 +120,10 @@ class KBORelGNNConfig:
             raise ValueError("count supports require 1 <= max_hits <= max_plate_appearances")
         if self.pa_context_dim < 0:
             raise ValueError("pa_context_dim cannot be negative")
+        if not isinstance(self.include_boxscore_heads, bool):
+            raise ValueError("include_boxscore_heads must be boolean")
+        if self.box_batting_feature_dim < 1 or self.box_pitching_feature_dim < 1:
+            raise ValueError("box-score feature widths must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +138,9 @@ class KBORelGNNConfig:
             "max_hits": self.max_hits,
             "pa_context_dim": self.pa_context_dim,
             "include_run_head": self.include_run_head,
+            "include_boxscore_heads": self.include_boxscore_heads,
+            "box_batting_feature_dim": self.box_batting_feature_dim,
+            "box_pitching_feature_dim": self.box_pitching_feature_dim,
         }
 
 
@@ -141,14 +151,26 @@ class KBORelGNNModel(ModuleBase):
         torch, _ = require_torch()
         super().__init__()
         self.config = config
+        node_widths = dict(config.node_feature_dims)
+        role_widths = dict(config.role_feature_dims)
+        if config.include_boxscore_heads:
+            for kind in node_widths:
+                node_widths[kind] += (
+                    config.box_batting_feature_dim + config.box_pitching_feature_dim
+                )
+            for role, width in (
+                ("batting", config.box_batting_feature_dim),
+                ("pitching", config.box_pitching_feature_dim),
+            ):
+                role_widths[role] = role_widths.get(role, 0) + width
         encoder = RoleAwarePlayerEncoder(
-            config.node_feature_dims["player"],
-            config.role_feature_dims,
+            node_widths["player"],
+            role_widths,
             hidden_dim=config.hidden_dim,
             dropout=config.dropout,
         )
         self.backbone: Any = CompositeRelGNNBackbone(
-            node_feature_dims=config.node_feature_dims,
+            node_feature_dims=node_widths,
             route_feature_dims=config.route_feature_dims,
             hidden_dim=config.hidden_dim,
             num_layers=config.num_layers,
@@ -186,6 +208,25 @@ class KBORelGNNModel(ModuleBase):
             if config.include_run_head
             else None
         )
+        # Separate aggregate decoders never invent a particular opposing pitcher
+        # or a current-PA base/out state from a historical box score.
+        self.box_pa_head: Any = None
+        self.box_pitch_head: Any = None
+        if config.include_boxscore_heads:
+            self.box_pa_head = nn.Sequential(
+                nn.Linear(config.hidden_dim * 5, config.hidden_dim * 2),
+                nn.LayerNorm(config.hidden_dim * 2),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.hidden_dim * 2, 10),
+            )
+            self.box_pitch_head = nn.Sequential(
+                nn.Linear(config.hidden_dim * 5, config.hidden_dim * 2),
+                nn.LayerNorm(config.hidden_dim * 2),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.hidden_dim * 2, 10),
+            )
         pa_support = torch.arange(1, config.max_plate_appearances + 2, dtype=torch.float32)
         hit_support = torch.arange(config.max_hits + 2, dtype=torch.float32)
         # Final supports are overflow-bucket lower bounds (9+ PA, 6+ H by default).
@@ -198,10 +239,30 @@ class KBORelGNNModel(ModuleBase):
         torch, _ = require_torch()
         if batch.get("_validated_on_cpu") is not True:
             raise ValueError("use collate_kbo_day_graphs to validate graph indices before forward")
+        nodes = batch["node_features"]
+        roles = batch["role_features"]
+        if self.config.include_boxscore_heads:
+            nodes = {
+                kind: torch.cat(
+                    (
+                        values,
+                        batch[f"{kind}_box_batting_features"],
+                        batch[f"{kind}_box_pitching_features"],
+                    ),
+                    dim=-1,
+                )
+                for kind, values in nodes.items()
+            }
+            roles = {
+                role: torch.cat((roles[role], batch[f"player_box_{role}_features"]), dim=-1)
+                for role in ("batting", "pitching")
+            }
+        elif any(batch[f"{task}_player_index"].numel() for task in ("box_pa", "box_pitch")):
+            raise ValueError("historical box-score queries require include_boxscore_heads")
         state = self.backbone.forward_relational_state(
-            batch["node_features"],
+            nodes,
             batch["routes"],
-            player_role_features=batch["role_features"],
+            player_role_features=roles,
             validate_routes=False,
         )
         teams = state.node_states["team"]
@@ -242,6 +303,21 @@ class KBORelGNNModel(ModuleBase):
         }
         if self.run_head is not None:
             output["match_run_parameters"] = self.run_head(home, away)
+        if self.config.include_boxscore_heads:
+            for task, player_states, head in (
+                ("box_pa", batting, self.box_pa_head),
+                ("box_pitch", pitching, self.box_pitch_head),
+            ):
+                player = player_states[batch[f"{task}_player_index"]]
+                team = teams[batch[f"{task}_team_index"]]
+                opponent = teams[batch[f"{task}_opponent_index"]]
+                values = head(
+                    torch.cat((player, team, opponent, player * opponent, team - opponent), dim=-1)
+                ).float()
+                if task == "box_pa":
+                    output["box_pa_logits"] = values
+                else:
+                    output["box_pitch_rates"] = torch.nn.functional.softplus(values) + 1e-6
         return output
 
 
@@ -278,11 +354,15 @@ def kbo_multitask_loss(
     live_hit_weight: float = 1.0,
     pa_weight: float = 0.2,
     run_weight: float = 0.0,
+    box_pa_weight: float = 0.2,
+    box_pitch_weight: float = 0.1,
 ) -> dict[str, Any]:
     """Distinct task means plus their weighted sum; NB2 run NLL is optional."""
 
     torch, _ = require_torch()
-    weights = (match_weight, live_hit_weight, pa_weight, run_weight)
+    weights = (
+        match_weight, live_hit_weight, pa_weight, run_weight, box_pa_weight, box_pitch_weight
+    )
     if any(not math.isfinite(value) or value < 0 for value in weights):
         raise ValueError("loss weights must be finite and non-negative")
     if batch.get("_validated_on_cpu") is not True:
@@ -295,10 +375,7 @@ def kbo_multitask_loss(
     )
     joint_logits = outputs["live_hit_joint_logits"]
     if batch["live_hit_pa"].numel():
-        pa_bucket = batch["live_hit_pa"].clamp_max(joint_logits.shape[1]) - 1
-        hit_bucket = batch["live_hit_hits"].clamp_max(joint_logits.shape[2] - 1)
-        joint_target = pa_bucket * joint_logits.shape[2] + hit_bucket
-        live = torch.nn.functional.cross_entropy(joint_logits.flatten(1).float(), joint_target)
+        live = live_hit_observed_nll(joint_logits, batch).mean()
     else:
         live = zero
     pa = (
@@ -322,13 +399,57 @@ def kbo_multitask_loss(
                 parameters["away_dispersion"].float(),
             )
         ).mean()
-    return {
+    result = {
         "loss": match_weight * match + live_hit_weight * live + pa_weight * pa + run_weight * run,
         "match_loss": match,
         "live_hit_loss": live,
         "pa_loss": pa,
         "run_loss": run,
     }
+    if "box_pa_logits" in outputs:
+        counts = batch["box_pa_counts"].float()
+        box_pa = zero
+        if counts.numel():
+            log_probabilities = torch.log_softmax(outputs["box_pa_logits"].float(), dim=-1)
+            box_pa = -(counts * log_probabilities).sum() / counts.sum().clamp_min(1)
+        mask = batch["box_pitch_mask"]
+        box_pitch = zero
+        if mask.numel():
+            rates = outputs["box_pitch_rates"].float()
+            targets = batch["box_pitch_targets"].float()
+            # Full Poisson NLL; unobserved cells have no likelihood contribution.
+            nll = rates - targets * rates.log() + torch.lgamma(targets + 1)
+            box_pitch = nll.masked_fill(~mask, 0).sum() / mask.sum().clamp_min(1)
+        result.update(box_pa_loss=box_pa, box_pitch_loss=box_pitch)
+        result["loss"] = result["loss"] + box_pa_weight * box_pa + box_pitch_weight * box_pitch
+    return result
+
+
+def live_hit_observed_nll(joint_logits: Any, batch: Mapping[str, Any]) -> Any:
+    """Score exact PA/H or the observed event {PA >= minimum, H = observed}.
+
+    Unknown PA is -1, never a fabricated count. Counts above the final support
+    use the existing overflow bucket; that bucket cannot resolve its interior.
+    """
+    torch, _ = require_torch()
+    logits = joint_logits.float()
+    pa = batch["live_hit_pa"]
+    hits = batch["live_hit_hits"]
+    minimum = batch.get("live_hit_pa_min", torch.ones_like(pa))
+    minimum = torch.maximum(minimum, hits).clamp_max(logits.shape[1])
+    support = torch.arange(1, logits.shape[1] + 1, device=logits.device)
+    allowed_pa = torch.where(
+        (pa >= 1)[:, None],
+        support[None, :] == pa.clamp_max(logits.shape[1])[:, None],
+        support[None, :] >= minimum[:, None],
+    )
+    hit_bucket = hits.clamp_max(logits.shape[2] - 1)
+    selected = logits.gather(
+        2, hit_bucket[:, None, None].expand(-1, logits.shape[1], 1)
+    ).squeeze(-1)
+    return torch.logsumexp(logits.flatten(1), dim=1) - torch.logsumexp(
+        selected.masked_fill(~allowed_pa, -torch.inf), dim=1
+    )
 
 
 def _get(day: Any, name: str, default: Any = None) -> Any:
@@ -380,17 +501,26 @@ def collate_kbo_day_graphs(
         ("max_edges_per_route_per_day", max_edges_per_route_per_day),
     ):
         if limit is not None and (
-            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
         ):
-            raise ValueError(f"{name} must be a positive integer or None")
+            raise ValueError(f"{name} must be non-negative (0 is unlimited), or None")
+    max_pa_per_day = max_pa_per_day or None
+    max_edges_per_route_per_day = max_edges_per_route_per_day or None
     registry = kbo_route_registry()
     node_parts: dict[str, list[Any]] = {"player": [], "team": []}
     role_parts: dict[str, list[Any]] = {}
+    box_feature_parts: dict[str, list[Any]] = {}
+    box_feature_widths: dict[str, int] = {}
     node_graph_parts: dict[str, list[Any]] = {"player": [], "team": []}
     route_parts: dict[str, dict[str, list[Any]]] = {}
     vector_parts: dict[str, list[Any]] = {}
-    matrix_parts: dict[str, list[Any]] = {"match_runs": [], "pa_context": []}
-    query_ids: dict[str, list[str]] = {"match": [], "live_hit": [], "pa": []}
+    matrix_parts: dict[str, list[Any]] = {
+        "match_runs": [], "pa_context": [], "box_pa_counts": [], "box_pitch_targets": [],
+    }
+    box_pitch_masks: list[Any] = []
+    query_ids: dict[str, list[str]] = {
+        name: [] for name in ("match", "live_hit", "pa", "box_pa", "box_pitch")
+    }
     day_ids: list[str] = []
     offsets = {"player": 0, "team": 0}
     node_widths: dict[str, int] = {}
@@ -430,6 +560,18 @@ def collate_kbo_day_graphs(
             if role_widths.setdefault(role, values.shape[1]) != values.shape[1]:
                 raise ValueError("role feature widths must agree across days")
             role_parts.setdefault(role, []).append(values)
+        for kind in ("player", "team"):
+            for role, default_width in (("batting", 19), ("pitching", 21)):
+                name = f"{kind}_box_{role}_features"
+                values = _float_array(
+                    _get(day, name, np.zeros((counts[kind], default_width), dtype=np.float32)),
+                    name, ndim=2,
+                )
+                if values.shape[0] != counts[kind] or values.shape[1] < 1:
+                    raise ValueError(f"{name} must have one feature row per {kind} node")
+                if box_feature_widths.setdefault(name, values.shape[1]) != values.shape[1]:
+                    raise ValueError("box-score feature widths must agree across days")
+                box_feature_parts.setdefault(name, []).append(values)
         routes = _get(day, "routes", {})
         if not isinstance(routes, Mapping):
             raise ValueError("routes must map reviewed names to numeric arrays")
@@ -481,6 +623,16 @@ def collate_kbo_day_graphs(
                 ("live_hit_opponent_index", "team"),
             ),
             "pa": (("pa_batter_index", "player"), ("pa_pitcher_index", "player")),
+            "box_pa": (
+                ("box_pa_player_index", "player"),
+                ("box_pa_team_index", "team"),
+                ("box_pa_opponent_index", "team"),
+            ),
+            "box_pitch": (
+                ("box_pitch_player_index", "player"),
+                ("box_pitch_team_index", "team"),
+                ("box_pitch_opponent_index", "team"),
+            ),
         }
         for task, specifications in query_specs.items():
             indices = {
@@ -512,17 +664,26 @@ def collate_kbo_day_graphs(
             if task == "live_hit":
                 pa_count = _integer_vector(_get(day, "live_hit_pa", []), "live_hit_pa")
                 hits = _integer_vector(_get(day, "live_hit_hits", []), "live_hit_hits")
+                minimum = _integer_vector(
+                    _get(day, "live_hit_pa_min", np.maximum(pa_count, 1)), "live_hit_pa_min"
+                )
                 if (
                     pa_count.size != count
                     or hits.size != count
-                    or np.any(pa_count < 1)
+                    or minimum.size != count
+                    or np.any((pa_count < 1) & (pa_count != -1))
+                    or np.any(minimum < 1)
                     or np.any(hits < 0)
-                    or np.any(hits > pa_count)
+                    or np.any((pa_count >= 1) & ((hits > pa_count) | (minimum > pa_count)))
                 ):
-                    raise ValueError("Live Hit labels require observed PA >= 1 and 0 <= H <= PA")
+                    raise ValueError(
+                        "Live Hit labels require PA >= 1 or unknown -1, positive PA minimum, "
+                        "and 0 <= H <= known PA"
+                    )
                 append_vector("live_hit_pa", pa_count)
+                append_vector("live_hit_pa_min", minimum)
                 append_vector("live_hit_hits", hits)
-            else:
+            elif task in {"match", "pa"}:
                 targets = _integer_vector(_get(day, f"{task}_targets", []), f"{task}_targets")
                 classes = 3 if task == "match" else 10
                 if targets.size != count or np.any(targets < 0) or np.any(targets >= classes):
@@ -547,6 +708,39 @@ def collate_kbo_day_graphs(
                         raise ValueError("pa_context width must agree across days")
                     pa_context_width = context.shape[1]
                     matrix_parts["pa_context"].append(context[selected])
+            elif task == "box_pa":
+                counts_array = _float_array(
+                    _get(day, "box_pa_counts", np.empty((0, 10))), "box_pa_counts", ndim=2
+                )
+                if (
+                    counts_array.shape != (count, 10)
+                    or np.any(counts_array < 0)
+                    or np.any(counts_array != np.floor(counts_array))
+                    or np.any(counts_array.sum(axis=1) < 1)
+                ):
+                    raise ValueError("box_pa_counts must contain observed integer outcome counts")
+                matrix_parts["box_pa_counts"].append(counts_array)
+            else:
+                pitch_targets = _float_array(
+                    _get(day, "box_pitch_targets", np.empty((0, 10))), "box_pitch_targets", ndim=2
+                )
+                raw_mask = np.asarray(_get(day, "box_pitch_mask", np.empty((0, 10), dtype=bool)))
+                if (
+                    pitch_targets.shape != (count, 10)
+                    or raw_mask.shape != (count, 10)
+                    or np.any((raw_mask != 0) & (raw_mask != 1))
+                    or np.any(pitch_targets[raw_mask.astype(bool)] < 0)
+                    or np.any(
+                        pitch_targets[raw_mask.astype(bool)]
+                        != np.floor(pitch_targets[raw_mask.astype(bool)])
+                    )
+                    or np.any(raw_mask.sum(axis=1) < 1)
+                ):
+                    raise ValueError("box_pitch requires observed integer counts and a valid mask")
+                mask = raw_mask.astype(bool)
+                # Placeholder zeros are explicitly masked, never target observations.
+                matrix_parts["box_pitch_targets"].append(np.where(mask, pitch_targets, 0))
+                box_pitch_masks.append(mask)
         for kind in offsets:
             offsets[kind] += counts[kind]
 
@@ -567,6 +761,10 @@ def collate_kbo_day_graphs(
     }
     tensors.update({name: tensor(parts, integer=True) for name, parts in vector_parts.items()})
     tensors.update({name: tensor(parts) for name, parts in matrix_parts.items()})
+    tensors.update({name: tensor(parts) for name, parts in box_feature_parts.items()})
+    tensors["box_pitch_mask"] = torch.as_tensor(
+        np.concatenate(box_pitch_masks, axis=0), dtype=torch.bool, device=device
+    )
     tensors.update({f"{task}_query_ids": tuple(ids) for task, ids in query_ids.items()})
     torch_routes = []
     for name, columns in route_parts.items():
@@ -597,4 +795,5 @@ __all__ = [
     "encode_live_hit_targets",
     "kbo_multitask_loss",
     "kbo_route_registry",
+    "live_hit_observed_nll",
 ]

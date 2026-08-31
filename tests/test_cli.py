@@ -295,7 +295,9 @@ def test_kbo_history_import_forwards_years_checks_references_and_writes_coverage
     report = {
         "games": 532,
         "season_coverage": [
-            {"year": 2001, "games": 532, "date_start": "2001-04-05", "date_end": "2001-10-04"}
+            {"year": 2001, "games": 532, "date_start": "2001-04-05", "date_end": "2001-10-04",
+             "batter_rows": 13000, "pitcher_rows": 4000, "hit_labels": 12990,
+             "verified_batting_outcomes": 41000}
         ],
         "inserted_rows": {"game": 532},
         "total_rows": {"game": 532},
@@ -325,7 +327,7 @@ def test_kbo_history_import_forwards_years_checks_references_and_writes_coverage
     assert checks == ["assert_referential_integrity", "assert_composite_referential_integrity"]
     assert json.loads(output.read_text(encoding="utf-8")) == report
     assert "Historical games: 532" in result.output
-    assert "no PA or LiveHit labels created" in result.output
+    assert "partial player records retained" in result.output
     assert not list(output.parent.glob("*.part"))
 
 

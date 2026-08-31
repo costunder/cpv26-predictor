@@ -51,10 +51,12 @@ def test_history_import_is_atomic_idempotent_and_does_not_create_player_events(
         assert report["games"] == 1
         assert report["season_coverage"][0]["year"] == 2001
         assert report["inserted_rows"] == {
-            "source_revision": 1,
+            "source_revision": 2,
             "team": 2,
             "game": 1,
             "team_game": 2,
+            "historical_boxscore": 0,
+            "historical_game_detail": 1,
         }
         assert store.connection.execute("SELECT count(*) FROM player").fetchone() == (0,)
         assert store.connection.execute(
@@ -147,7 +149,7 @@ def test_blank_archived_heroes_display_name_keeps_original_game_identity() -> No
     assert game.home_score == 11
 
 
-def test_tie_breaker_is_not_imported_as_a_regular_game(tmp_path: Path) -> None:
+def test_tie_breaker_is_retained_with_its_actual_game_type(tmp_path: Path) -> None:
     game = {
         "scoreboard": [
             {"팀": "KT", "승패": "승", "R": 1},
@@ -164,8 +166,13 @@ def test_tie_breaker_is_not_imported_as_a_regular_game(tmp_path: Path) -> None:
     artifact = replace(artifact, year=2021)
     with DuckDBStore() as store:
         report = import_kbo_history(store, tmp_path, artifacts=(artifact,))
-        assert report["games"] == 1
-        assert report["files"][0]["excluded_non_regular_game_ids"] == ["20211031_KTSS0"]
+        assert report["games"] == 2
+        assert report["season_coverage"][0]["regular_games"] == 1
+        assert report["season_coverage"][0]["non_regular_games"] == 1
+        assert report["files"][0]["retained_non_regular_game_ids"] == ["20211031_KTSS0"]
+        assert store.connection.execute(
+            "SELECT game_type FROM game WHERE game_id='kbo-game:20211031KTSS02021'"
+        ).fetchone() == ("tiebreaker",)
 
 
 def test_existing_score_conflict_rolls_back_the_entire_import(tmp_path: Path) -> None:
@@ -175,7 +182,7 @@ def test_existing_score_conflict_rolls_back_the_entire_import(tmp_path: Path) ->
         changed = _artifact(tmp_path, {"20010405_LGSK0": _contents(home_score=12)})
         with pytest.raises(ValueError, match="existing canonical score conflict"):
             import_kbo_history(store, tmp_path, artifacts=(changed,))
-        assert store.connection.execute("SELECT count(*) FROM source_revision").fetchone() == (1,)
+        assert store.connection.execute("SELECT count(*) FROM source_revision").fetchone() == (2,)
         assert store.connection.execute("SELECT home_score FROM game").fetchone() == (11,)
 
 

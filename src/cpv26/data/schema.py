@@ -18,8 +18,9 @@ from .schema_v4 import (
     V4_TABLE_SPECS,
     V4_TIMEZONE_COLUMNS,
 )
+from .schema_v5 import V5_DDL, V5_REQUIRED_COLUMNS, V5_REQUIRED_INDEXES, V5_TABLE_SPECS
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 TEMPORAL_COLUMNS = (
     "event_at",
@@ -125,7 +126,7 @@ TABLE_DEFINITIONS: dict[str, TableDefinition] = {
 TABLE_DEFINITIONS.update(
     {
         name: TableDefinition(name, row_identity, natural_identity)
-        for name, row_identity, natural_identity in V4_TABLE_SPECS
+        for name, row_identity, natural_identity in (*V4_TABLE_SPECS, *V5_TABLE_SPECS)
     }
 )
 
@@ -757,11 +758,12 @@ DDL: tuple[str, ...] = (
         "ON model_prediction (prediction_run_id, prediction_kind, entity_id)"
     ),
     *V4_DDL,
+    *V5_DDL,
 )
 
 
 def install_schema(connection: Any) -> None:
-    """Install schema v4 or transactionally migrate a compatible v1/v2/v3 database."""
+    """Install schema v5 or transactionally migrate a compatible v1-v4 database."""
 
     connection.execute("BEGIN TRANSACTION")
     try:
@@ -797,17 +799,22 @@ def install_schema(connection: Any) -> None:
                 "replay events, dataset reconciliation, weather, and V26 slate state",
             )
             installed = 4
+        if installed == 4:
+            for statement in V5_DDL:
+                connection.execute(statement)
+            _record_migration(connection, 5, "lossless partial historical player box scores")
+            installed = 5
         if installed is not None and installed != SCHEMA_VERSION:
             raise RuntimeError(
                 "database schema version is "
-                f"{installed!r}; expected 1, 2, 3, or {SCHEMA_VERSION}"
+                f"{installed!r}; expected 1, 2, 3, 4, or {SCHEMA_VERSION}"
             )
         for statement in DDL:
             connection.execute(statement)
         _record_migration(
             connection,
             SCHEMA_VERSION,
-            "replay events, dataset reconciliation, weather, and V26 slate state",
+            "lossless partial historical player box scores",
         )
         assert_schema_current(connection)
         connection.execute("COMMIT")
@@ -959,6 +966,8 @@ def assert_schema_current(connection: Any) -> None:
         _assert_required_columns(connection, table, set(required_columns))
     for table, required_columns in V4_REQUIRED_COLUMNS.items():
         _assert_required_columns(connection, table, set(required_columns))
+    for table, required_columns in V5_REQUIRED_COLUMNS.items():
+        _assert_required_columns(connection, table, set(required_columns))
     for table, timestamp_columns in V4_TIMEZONE_COLUMNS.items():
         _assert_timezone_columns(connection, table, set(timestamp_columns))
     _assert_required_indexes(
@@ -969,6 +978,7 @@ def assert_schema_current(connection: Any) -> None:
             "idx_v26_selection_snapshot",
             "idx_user_collection_asof",
             *V4_REQUIRED_INDEXES,
+            *V5_REQUIRED_INDEXES,
         },
     )
 

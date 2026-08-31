@@ -274,10 +274,11 @@ def download_kbo_history(
             "719 games each. The 2021 monthly files contain 721 records but 713 unique IDs, "
             "including the October 31 first-place tiebreaker and eight duplicate records. "
             "Ten missing finals are supplied as small, independently verified factual records, "
-            "with official response hashes and request details. Deduplication and exclusion of "
-            "the tiebreaker yield full regular-season final-score coverage from 2001 to 2022. "
-            "Canonical import verifies each year's expected game count. Missing PA events "
-            "are not fabricated."
+            "with official response hashes and request details. Deduplication yields full "
+            "regular-season final-score coverage from 2001 to 2022; the tiebreaker is retained "
+            "with its own game type. Canonical import verifies regular-season counts separately, "
+            "retains every player box-score row and records partial-field quality masks. "
+            "Missing PA sequence, identities and game state are not fabricated."
         ),
         "expected_regular_season_games": {
             str(year): count

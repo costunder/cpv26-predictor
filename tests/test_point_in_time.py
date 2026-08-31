@@ -361,7 +361,7 @@ def test_v1_database_migrates_run_and_status_through_v2_v3_to_v4(tmp_path: Path)
         ).fetchall()
 
         assert version == (SCHEMA_VERSION,)
-        assert migration_versions == [(1,), (2,), (3,), (4,)]
+        assert migration_versions == [(1,), (2,), (3,), (4,), (5,)]
         assert "status" not in columns
         assert run["target_game_id"] == "legacy-game"
         assert len(status_rows) == 1

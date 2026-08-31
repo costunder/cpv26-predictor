@@ -84,6 +84,16 @@ class CompositeReferentialIntegrityError(RuntimeError):
 
 
 REFERENCE_RULES: tuple[ReferenceRule, ...] = (
+    ReferenceRule("historical_boxscore", "game_id", "game", "game_id"),
+    ReferenceRule("historical_boxscore", "team_id", "team", "team_id"),
+    ReferenceRule("historical_boxscore", "opponent_team_id", "team", "team_id"),
+    ReferenceRule(
+        "historical_boxscore", "source_revision_id", "source_revision", "source_revision_id"
+    ),
+    ReferenceRule("historical_game_detail", "game_id", "game", "game_id"),
+    ReferenceRule(
+        "historical_game_detail", "source_revision_id", "source_revision", "source_revision_id"
+    ),
     ReferenceRule("prediction_run", "target_game_id", "game", "game_id"),
     ReferenceRule(
         "prediction_run_status_event",
@@ -347,6 +357,10 @@ REFERENCE_RULES: tuple[ReferenceRule, ...] = (
 
 
 COMPOSITE_REFERENCE_RULES: tuple[CompositeReferenceRule, ...] = (
+    CompositeReferenceRule(
+        "historical_boxscore", ("team_game_id", "game_id", "team_id", "opponent_team_id"),
+        "team_game", ("team_game_id", "game_id", "team_id", "opponent_team_id"),
+    ),
     CompositeReferenceRule(
         "lineup_entry",
         ("lineup_version_id", "game_id", "team_id"),

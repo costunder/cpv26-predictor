@@ -1,7 +1,8 @@
-"""Import archived final scores without manufacturing historical player events."""
+"""Import historical games and lossless, partially observed player box scores."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import Counter
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .kbo_history_boxscore import parse_historical_boxscore
 from .kbo_history_source import (
     EXPECTED_HISTORY_GAMES,
     KBO_HISTORY_FILES,
@@ -23,7 +25,8 @@ from .store import DuckDBStore
 
 _KST = ZoneInfo("Asia/Seoul")
 _GAME_KEY = re.compile(r"^(\d{8})_([A-Z]{2})([A-Z]{2})([012])$")
-_TABLES = ("source_revision", "team", "game", "team_game")
+_CORE_TABLES = ("source_revision", "team", "game", "team_game")
+_TABLES = (*_CORE_TABLES, "historical_boxscore", "historical_game_detail")
 # The published official schedule marks this tie-breaker SR_ID=6, not regular SR_ID=0.
 _NON_REGULAR = frozenset({"20211031_KTSS0"})
 _TEAM_NAMES = {
@@ -125,10 +128,10 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def read_history_artifact(
+def _read_history_records(
     path: Path,
     artifact: KBOHistoryArtifact,
-) -> tuple[list[HistoricalGame], list[str]]:
+) -> list[tuple[str, dict[str, Any]]]:
     if sha256_file(path) != artifact.sha256:
         raise ValueError(f"historical source SHA-256 mismatch: {path.name}")
     payload = json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=_unique_object)
@@ -144,11 +147,20 @@ def read_history_artifact(
         raise ValueError(f"unexpected historical source structure: {path.name}")
     if len(records) != artifact.game_count:
         raise ValueError(f"historical source record count mismatch: {path.name}")
+    if any(not isinstance(key, str) or not isinstance(value, dict) for key, value in records):
+        raise ValueError(f"malformed historical game contents: {path.name}")
+    return records
+
+
+def read_history_artifact(
+    path: Path,
+    artifact: KBOHistoryArtifact,
+) -> tuple[list[HistoricalGame], list[str]]:
+    records = _read_history_records(path, artifact)
     games, excluded = [], []
     for key, contents in records:
         if key in _NON_REGULAR:
             excluded.append(key)
-            continue
         games.append(parse_historical_game(key, contents, artifact.year))
     return games, excluded
 
@@ -173,6 +185,122 @@ def _table_counts(store: DuckDBStore) -> dict[str, int]:
     return counts
 
 
+def _import_boxscores(
+    store: DuckDBStore,
+    root: Path,
+    selected: tuple[KBOHistoryArtifact, ...],
+    games: dict[str, HistoricalGame],
+    now: datetime,
+) -> dict[int, dict[str, Any]]:
+    """Append one archive at a time, preserving raw rows and field-level masks.
+
+    A separate source revision upgrades a v1 import without rewriting its game
+    rows, source provenance or identities. Equal cross-file duplicates count once;
+    differing box-score payloads fail the entire import instead of choosing one.
+    """
+    seen: dict[str, str] = {}
+    coverage: dict[int, dict[str, Any]] = {}
+    for artifact in selected:
+        source_id = f"kbo-history-box:v1:{artifact.filename}:{artifact.sha256}"
+        box_rows: list[dict[str, Any]] = []
+        details = []
+        season = coverage.setdefault(artifact.year, {
+            "batter_rows": 0, "pitcher_rows": 0, "games_with_boxscores": 0,
+            "hit_labels": 0, "known_pa_hit_labels": 0, "partial_pa_hit_labels": 0,
+            "verified_batting_outcome_rows": 0, "verified_batting_outcomes": 0,
+            "quality_reasons": Counter(), "source_fields": Counter(),
+        })
+        first: date | None = None
+        for key, contents in _read_history_records(root / artifact.filename, artifact):
+            payload_hash = hashlib.sha256(json.dumps(
+                contents, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            if key in seen:
+                if seen[key] != payload_hash:
+                    raise ValueError(f"conflicting historical box-score payloads: {key}")
+                continue
+            seen[key] = payload_hash
+            game = games[key]
+            first = min(first, game.day) if first is not None else game.day
+            parsed = parse_historical_boxscore(key, contents)
+            game_id = f"kbo-game:{game.game_pk}"
+            times = _timestamps(game.day, now)
+            details.append({
+                "detail_row_id": f"{source_id}:detail:{game.game_pk}",
+                "game_id": game_id,
+                "metadata_json": {
+                    field: value for field, value in parsed.raw.items()
+                    if field not in {"away_batter", "home_batter", "away_pitcher", "home_pitcher"}
+                },
+                "quality_json": list(parsed.quality_reasons),
+                "source_revision_id": source_id,
+                **times,
+            })
+            season["games_with_boxscores"] += bool(parsed.batters or parsed.pitchers)
+            season["quality_reasons"].update(parsed.quality_reasons)
+            for role, observations in (("batting", parsed.batters), ("pitching", parsed.pitchers)):
+                season["batter_rows" if role == "batting" else "pitcher_rows"] += len(observations)
+                for observation in observations:
+                    stats = asdict(observation)
+                    raw = stats.pop("raw")
+                    reasons = stats.pop("quality_reasons")
+                    season["quality_reasons"].update(reasons)
+                    season["source_fields"].update(f"{role}:{field}" for field in raw)
+                    team = observation.team_code
+                    opponent = game.home if observation.side == "away" else game.away
+                    box_rows.append({
+                        "boxscore_row_id": f"{source_id}:row:{observation.observation_id}",
+                        "observation_id": f"kbo-box:{observation.observation_id}",
+                        "game_id": game_id,
+                        "team_game_id": f"kbo-team-game:{game.game_pk}:{team}",
+                        "team_id": f"kbo-team:{team}",
+                        "opponent_team_id": f"kbo-team:{opponent}",
+                        # This is a source observation, NOT a resolved career player ID.
+                        "player_id": f"kbo-box-observation:{observation.observation_id}",
+                        "identity_status": "source_observation",
+                        "role": role, "side": observation.side,
+                        "display_name": observation.display_name,
+                        "row_index": observation.row_index,
+                        "stats_json": stats, "raw_json": raw, "quality_json": reasons,
+                        "source_revision_id": source_id,
+                        **times,
+                    })
+            for batter in parsed.batters:
+                positive_appearance = (
+                    batter.plate_appearances is not None and batter.plate_appearances >= 1
+                ) or (batter.at_bats is not None and batter.at_bats >= 1)
+                if batter.hits_verified and positive_appearance:
+                    season["hit_labels"] += 1
+                    season["known_pa_hit_labels" if batter.plate_appearances is not None
+                           else "partial_pa_hit_labels"] += 1
+                outcome_total: int = sum(batter.outcome_counts)
+                if batter.counts_verified and outcome_total:
+                    season["verified_batting_outcome_rows"] += 1
+                    season["verified_batting_outcomes"] += outcome_total
+        if first is None:
+            continue
+        store.append("source_revision", [{
+            "source_revision_id": source_id,
+            "source_name": "kbo_historical_boxscore",
+            "source_locator": artifact.url, "content_sha256": artifact.sha256,
+            "metadata_json": {
+                "adapter_version": 2, "boxscore_parser_version": 1,
+                "repository_url": artifact.repository_url, "revision": artifact.revision,
+                "filename": artifact.filename, "repository_license": artifact.repository_license,
+                "verification_provenance": artifact.provenance,
+                "identity_policy": "source observations; names are not canonical player IDs",
+                "timestamp_policy": "retrospective: labels available next day 00:00 KST",
+                "label_tier": "partial_player_boxscore",
+            }, **_timestamps(first, now),
+        }], ignore_existing=True)
+        store.append("historical_game_detail", details, ignore_existing=True, batch_size=256)
+        store.append("historical_boxscore", box_rows, ignore_existing=True, batch_size=256)
+    for season in coverage.values():
+        for field in ("quality_reasons", "source_fields"):
+            season[field] = dict(sorted(season[field].items()))
+    return coverage
+
+
 def import_kbo_history(
     store: DuckDBStore,
     directory: str | Path,
@@ -181,10 +309,10 @@ def import_kbo_history(
     artifacts: tuple[KBOHistoryArtifact, ...] = KBO_HISTORY_FILES,
     ingested_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Atomically append verified archived games, teams and team-game results.
+    """Atomically append archived games and every available player box-score row.
 
-    Actual source files remain unchanged. No player identities, plate appearances,
-    lineup announcements or hit-query labels are inferred from final scores.
+    Actual source files remain unchanged. Missing identities/event contexts are
+    not inferred. Partial observations retain usable fields and quality reasons.
     """
     if store.read_only:
         raise PermissionError("historical import requires a writable database")
@@ -242,16 +370,22 @@ def import_kbo_history(
                 continue
             unique[game.key] = game
             new_games += 1
+            # Legacy score-only source revisions excluded this non-regular game.
+            # Its new record belongs to the v2 box-score source, preserving v1 provenance.
+            game_source_id = (
+                f"kbo-history-box:v1:{artifact.filename}:{artifact.sha256}"
+                if game.key in _NON_REGULAR else source_id
+            )
             times = _timestamps(game.day, now)
             for team in (game.home, game.away):
                 teams[team] = min(teams.get(team, game.day), game.day)
             game_id = f"kbo-game:{game.game_pk}"
             rows["game"].append(
                 {
-                    "game_row_id": f"{source_id}:game:{game.game_pk}",
+                    "game_row_id": f"{game_source_id}:game:{game.game_pk}",
                     "game_id": game_id,
                     "season": game.day.year,
-                    "game_type": "regular",
+                    "game_type": "tiebreaker" if game.key in _NON_REGULAR else "regular",
                     "scheduled_start": datetime.combine(game.day, time(), _KST),
                     "home_team_id": f"kbo-team:{game.home}",
                     "away_team_id": f"kbo-team:{game.away}",
@@ -259,7 +393,7 @@ def import_kbo_history(
                     "game_status": "final",
                     "home_score": game.home_score,
                     "away_score": game.away_score,
-                    "source_revision_id": source_id,
+                    "source_revision_id": game_source_id,
                     **times,
                 }
             )
@@ -275,7 +409,7 @@ def import_kbo_history(
                 )
                 rows["team_game"].append(
                     {
-                        "team_game_row_id": f"{source_id}:team-game:{game.game_pk}:{team}",
+                        "team_game_row_id": f"{game_source_id}:team-game:{game.game_pk}:{team}",
                         "team_game_id": f"kbo-team-game:{game.game_pk}:{team}",
                         "game_id": game_id,
                         "team_id": f"kbo-team:{team}",
@@ -287,7 +421,7 @@ def import_kbo_history(
                         "result": "draw"
                         if score == other_score
                         else ("win" if score > other_score else "loss"),
-                        "source_revision_id": source_id,
+                        "source_revision_id": game_source_id,
                         **times,
                     }
                 )
@@ -306,24 +440,27 @@ def import_kbo_history(
         report_files.append(
             {
                 **asdict(artifact),
-                "unique_regular_games_added": new_games,
-                "excluded_non_regular_game_ids": excluded,
+                "unique_games_added": new_games,
+                "retained_non_regular_game_ids": excluded,
             }
         )
-    coverage = []
+    coverage: list[dict[str, Any]] = []
     for year in sorted({artifact.year for artifact in selected}):
         season = [game for game in unique.values() if game.day.year == year]
         if not season:
             raise ValueError(f"no historical games for requested year {year}")
         expected = EXPECTED_HISTORY_GAMES[year] if pinned_selection else None
-        if expected is not None and len(season) != expected:
-            raise ValueError(f"incomplete historical season {year}: {len(season)} != {expected}")
+        regular_count = sum(game.key not in _NON_REGULAR for game in season)
+        if expected is not None and regular_count != expected:
+            raise ValueError(f"incomplete historical season {year}: {regular_count} != {expected}")
         coverage.append(
             {
                 "year": year,
                 "games": len(season),
+                "regular_games": regular_count,
+                "non_regular_games": len(season) - regular_count,
                 "expected_regular_games": expected,
-                "regular_season_complete": len(season) == expected if expected else None,
+                "regular_season_complete": regular_count == expected if expected else None,
                 "duplicate_records": duplicates[year],
                 "date_start": min(game.day for game in season).isoformat(),
                 "date_end": max(game.day for game in season).isoformat(),
@@ -345,22 +482,36 @@ def import_kbo_history(
             if previous_facts is not None and previous_facts != facts:
                 raise ValueError(f"existing canonical score conflict: {row['game_id']}")
         before = _table_counts(store)
-        for table in _TABLES:
+        for table in _CORE_TABLES:
             store.append(table, rows[table], ignore_existing=True, batch_size=256)
+        box_coverage = _import_boxscores(store, root, selected, unique, now)
         store.assert_referential_integrity()
         store.assert_composite_referential_integrity()
         totals = _table_counts(store)
+    for season_report in coverage:
+        season_report.update(box_coverage.get(season_report["year"], {}))
+        season_report["live_hit_queries"] = season_report.get("hit_labels", 0)
     return {
-        "adapter_version": 1,
+        "adapter_version": 2,
         "files": report_files,
         "season_coverage": coverage,
         "inserted_rows": {table: totals[table] - before[table] for table in _TABLES},
         "total_rows": totals,
         "games": len(unique),
-        "label_tier": "final_game_score_only",
+        "label_tier": "partial_player_boxscore",
+        "field_usage": {
+            "final_scores": "match and run targets; subsequent-day team history",
+            "batting_totals": "observed hit/PA labels; masked subsequent-day batting history",
+            "inning_results": "verified aggregate outcome targets; raw tokens retained",
+            "pitching_totals": "masked count targets; subsequent-day pitching history",
+            "display_names": "display/audit only; no name-based player merge",
+            "other_fields": "lossless raw rows and game metadata; not guessed as pregame inputs",
+        },
         "notes": [
-            "Archived final scores train match/run tasks only.",
-            "No historical player IDs, PA targets or live-hit labels are synthesized.",
+            "Every player row is retained, including invalid/partial rows with quality reasons.",
+            "Unresolved player observations use past team-role history, not fabricated career IDs.",
+            "Known hits with unknown PA train a marginal likelihood, not an invented PA count.",
+            "Verified inning outcomes train aggregates, not invented full PA state/matchups.",
             "Same-day scores are labels, never prior-game features.",
             "Publication/start timestamps are reconstructed, not real-time observations.",
         ],

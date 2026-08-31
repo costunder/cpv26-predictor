@@ -26,10 +26,15 @@ from cpv26.models.kbo_relgnn import (
     KBORelGNNModel,
     collate_kbo_day_graphs,
     kbo_multitask_loss,
+    live_hit_observed_nll,
 )
 from cpv26.simulation.adapter import NEURAL_PA_OUTCOMES
 
 CHECKPOINT_VERSION = 1
+BOX_PITCH_TARGET_NAMES = (
+    "batters_faced", "outs_recorded", "pitches_thrown", "at_bats", "hits_allowed",
+    "home_runs_allowed", "walks_hbp", "strikeouts", "runs_allowed", "earned_runs",
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,8 @@ class KBOTrainingConfig:
     live_hit_weight: float = 1.0
     pa_weight: float = 0.2
     run_weight: float = 0.1
+    box_pa_weight: float = 0.2
+    box_pitch_weight: float = 0.1
     max_days_per_split: int | None = None
     train_seasons: tuple[int, ...] = (2023,)
     validation_season: int = 2024
@@ -69,12 +76,14 @@ class KBOTrainingConfig:
             "layers",
             "heads",
             "accumulate_steps",
-            "max_pa_per_day",
-            "max_edges_per_route_per_day",
         )
         for name in positive:
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        for name in ("max_pa_per_day", "max_edges_per_route_per_day"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be non-negative; 0 disables sampling")
         if self.hidden_dim % self.heads:
             raise ValueError("hidden_dim must be divisible by heads")
         if not 0 <= self.dropout < 1:
@@ -83,7 +92,10 @@ class KBOTrainingConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        for name in ("weight_decay", "match_weight", "live_hit_weight", "pa_weight", "run_weight"):
+        for name in (
+            "weight_decay", "match_weight", "live_hit_weight", "pa_weight", "run_weight",
+            "box_pa_weight", "box_pitch_weight",
+        ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
@@ -320,6 +332,14 @@ def _split_summary(
             "live_hit_queries": sum(row["live_hit_queries"] for row in rows),
             "pa_queries": sum(row["pa_queries"] for row in rows),
         }
+        for key in (
+            "games_with_pa", "game_only_games", "observed_completed_pa",
+            "box_batting_rows", "box_pitching_rows", "box_pa_queries", "box_pa_outcomes",
+            "box_pitch_queries", "box_pitch_observed_counts", "box_live_hit_queries",
+            "box_live_hit_unknown_pa_queries",
+        ):
+            if any(key in row for row in rows):
+                summary[name][key] = sum(row.get(key, 0) for row in rows)
     return summary
 
 
@@ -331,16 +351,22 @@ def _losses(outputs: Mapping[str, Any], batch: Mapping[str, Any], config: KBOTra
         live_hit_weight=config.live_hit_weight,
         pa_weight=config.pa_weight,
         run_weight=config.run_weight,
+        box_pa_weight=config.box_pa_weight,
+        box_pitch_weight=config.box_pitch_weight,
     )
 
 
-def _counts(batch: Mapping[str, Any]) -> dict[str, int]:
-    return {
+def _counts(batch: Mapping[str, Any], *, include_boxscore: bool = False) -> dict[str, int]:
+    counts = {
         "match": int(batch["match_targets"].numel()),
         "live_hit": int(batch["live_hit_pa"].numel()),
         "pa": int(batch["pa_targets"].numel()),
         "run": int(batch["match_targets"].numel()),
     }
+    if include_boxscore:
+        counts["box_pa"] = int(batch["box_pa_counts"].sum().item())
+        counts["box_pitch"] = int(batch["box_pitch_mask"].sum().item())
+    return counts
 
 
 def _model_config(dataset: KBOGraphDataset, config: KBOTrainingConfig) -> KBORelGNNConfig:
@@ -354,6 +380,9 @@ def _model_config(dataset: KBOGraphDataset, config: KBOTrainingConfig) -> KBORel
         num_attention_heads=config.heads,
         dropout=config.dropout,
         include_run_head=config.run_weight > 0,
+        include_boxscore_heads=manifest["dataset_version"] >= 3,
+        box_batting_feature_dim=manifest.get("boxscore_feature_dims", {}).get("batting", 19),
+        box_pitching_feature_dim=manifest.get("boxscore_feature_dims", {}).get("pitching", 21),
     )
 
 
@@ -399,20 +428,34 @@ def _evaluate_model(
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     torch, _ = require_torch()
     model.eval()
-    sums = dict.fromkeys(("match", "live_hit", "pa", "run"), 0.0)
+    include_boxscore = model.config.include_boxscore_heads
+    tasks = ("match", "live_hit", "pa", "run") + (
+        ("box_pa", "box_pitch") if include_boxscore else ()
+    )
+    sums = dict.fromkeys(tasks, 0.0)
     counts = dict.fromkeys(sums, 0)
     probabilities: dict[str, list[Any]] = {name: [] for name in ("match", "live_hit", "pa")}
     targets: dict[str, list[Any]] = {name: [] for name in probabilities}
     predictions: dict[str, list[dict[str, Any]]] = {name: [] for name in probabilities}
+    if include_boxscore:
+        predictions.update(box_pa=[], box_pitch=[])
     hit_absolute_error = 0.0
     pa_absolute_error = 0.0
+    known_pa_count = 0
+    known_pa_nll = 0.0
+    unknown_pa_nll = 0.0
+    unknown_pa_minimum_overflow = 0
+    box_pa_queries = 0
+    box_pitch_queries = 0
+    box_pitch_errors = np.zeros(10, dtype=np.float64)
+    box_pitch_counts = np.zeros(10, dtype=np.int64)
     with torch.inference_mode():
         for raw_batch in loader:
             batch = _move(raw_batch, device)
             with torch.autocast(device.type, enabled=dtype is not None, dtype=dtype):
                 outputs = model(batch)
                 losses = _losses(outputs, batch, config)
-            batch_counts = _counts(batch)
+            batch_counts = _counts(batch, include_boxscore=include_boxscore)
             for name, count in batch_counts.items():
                 value = float(losses[f"{name}_loss"].detach().cpu())
                 if not math.isfinite(value):
@@ -436,8 +479,55 @@ def _evaluate_model(
             expected_pa = outputs["live_hit_expected_pa"].float().cpu().numpy()
             actual_hits = batch["live_hit_hits"].cpu().numpy()
             actual_pa = batch["live_hit_pa"].cpu().numpy()
+            pa_minimum = batch["live_hit_pa_min"].cpu().numpy()
+            known_pa = actual_pa >= 1
+            unknown_pa_minimum_overflow += int(
+                ((~known_pa) & (np.maximum(pa_minimum, actual_hits)
+                               > outputs["live_hit_joint_logits"].shape[1])).sum()
+            )
+            known_pa_count += int(known_pa.sum())
+            live_nll = live_hit_observed_nll(outputs["live_hit_joint_logits"], batch).cpu().numpy()
+            known_pa_nll += float(live_nll[known_pa].sum())
+            unknown_pa_nll += float(live_nll[~known_pa].sum())
             hit_absolute_error += float(np.abs(expected_hits - actual_hits).sum())
-            pa_absolute_error += float(np.abs(expected_pa - actual_pa).sum())
+            pa_absolute_error += float(np.abs(expected_pa[known_pa] - actual_pa[known_pa]).sum())
+            if include_boxscore:
+                box_counts = batch["box_pa_counts"].cpu().numpy()
+                box_probabilities = torch.softmax(outputs["box_pa_logits"].float(), dim=-1)
+                box_probabilities_array = _float64_probabilities(box_probabilities.cpu().numpy())
+                box_pa_queries += box_counts.shape[0]
+                pitch_targets = batch["box_pitch_targets"].cpu().numpy()
+                pitch_mask = batch["box_pitch_mask"].cpu().numpy()
+                pitch_rates = outputs["box_pitch_rates"].float().cpu().numpy()
+                box_pitch_queries += pitch_targets.shape[0]
+                box_pitch_errors += (np.abs(pitch_rates - pitch_targets) * pitch_mask).sum(axis=0)
+                box_pitch_counts += pitch_mask.sum(axis=0)
+                if collect_predictions:
+                    for index, query_id in enumerate(raw_batch["box_pa_query_ids"]):
+                        predictions["box_pa"].append({
+                            "query_id": str(query_id),
+                            **{
+                                f"observed_count_{column}": int(value)
+                                for column, value in enumerate(box_counts[index])
+                            },
+                            **{
+                                f"probability_{column}": float(value)
+                                for column, value in enumerate(box_probabilities_array[index])
+                            },
+                        })
+                    for index, query_id in enumerate(raw_batch["box_pitch_query_ids"]):
+                        predictions["box_pitch"].append({
+                            "query_id": str(query_id),
+                            **{
+                                f"observed_{name}": int(pitch_targets[index, column])
+                                if pitch_mask[index, column] else None
+                                for column, name in enumerate(BOX_PITCH_TARGET_NAMES)
+                            },
+                            **{
+                                f"predicted_{name}": float(pitch_rates[index, column])
+                                for column, name in enumerate(BOX_PITCH_TARGET_NAMES)
+                            },
+                        })
             for name in probabilities:
                 probability = _float64_probabilities(values[name].float().cpu().numpy())
                 label = labels[name].cpu().numpy()
@@ -457,10 +547,12 @@ def _evaluate_model(
                         if name == "live_hit":
                             row.update(
                                 observed_hits=int(actual_hits[index]),
-                                observed_pa=int(actual_pa[index]),
+                                observed_pa=int(actual_pa[index]) if known_pa[index] else None,
                                 expected_hits_lower_bound=float(expected_hits[index]),
                                 expected_pa_lower_bound=float(expected_pa[index]),
                             )
+                            if include_boxscore or not known_pa[index]:
+                                row["observed_pa_lower_bound"] = int(pa_minimum[index])
                         predictions[name].append(row)
     means = {name: sums[name] / max(1, counts[name]) for name in sums}
     result: dict[str, Any] = {
@@ -476,12 +568,55 @@ def _evaluate_model(
         else:
             result[name] = None
     if result["live_hit"] is not None:
+        unknown_pa_count = counts["live_hit"] - known_pa_count
         result["live_hit"].update(
-            conditional_on="at_least_one_observed_plate_appearance",
-            joint_nll=means["live_hit"],
+            conditional_on=("verified_player_game_appearance" if include_boxscore
+                            else "at_least_one_observed_plate_appearance"),
+            joint_nll=known_pa_nll / known_pa_count if known_pa_count else None,
             expected_hits_lower_bound_mae=hit_absolute_error / counts["live_hit"],
-            expected_pa_lower_bound_mae=pa_absolute_error / counts["live_hit"],
+            expected_pa_lower_bound_mae=(
+                pa_absolute_error / known_pa_count if known_pa_count else None
+            ),
         )
+        if include_boxscore or unknown_pa_count:
+            result["live_hit"].update(
+                observed_nll=means["live_hit"],
+                known_pa_samples=known_pa_count,
+                unknown_pa_samples=unknown_pa_count,
+                unknown_pa_minimum_overflow_samples=unknown_pa_minimum_overflow,
+                partial_pa_nll=unknown_pa_nll / unknown_pa_count if unknown_pa_count else None,
+                partial_pa_policy="sum joint mass over observed H and PA >= verified minimum",
+                minimum_overflow_policy=(
+                    "minima above PA overflow start select that whole overflow bucket; "
+                    "no exact within-bucket PA is inferred"
+                ),
+            )
+    if include_boxscore:
+        result["box_pa"] = {
+            "player_game_queries": box_pa_queries,
+            "observed_outcomes": counts["box_pa"],
+            "cross_entropy": means["box_pa"],
+            "label_type": "verified player-game outcome histogram; not ordered PA events",
+        } if counts["box_pa"] else None
+        result["box_pitch"] = {
+            "player_game_queries": box_pitch_queries,
+            "observed_counts": counts["box_pitch"],
+            "poisson_nll": means["box_pitch"],
+            "per_field": {
+                name: {
+                    "samples": int(box_pitch_counts[index]),
+                    "mae": float(box_pitch_errors[index] / box_pitch_counts[index])
+                    if box_pitch_counts[index] else None,
+                }
+                for index, name in enumerate(BOX_PITCH_TARGET_NAMES)
+            },
+        } if counts["box_pitch"] else None
+    # A legacy decoder can also score partial PA observations. If any such row
+    # adds a minimum column, retain one consistent schema across all batches.
+    live_predictions = predictions["live_hit"]
+    if any("observed_pa_lower_bound" in row for row in live_predictions):
+        for row in live_predictions:
+            row.setdefault("observed_pa_lower_bound", row["observed_pa"])
     return result, predictions
 
 
@@ -580,7 +715,7 @@ def train_kbo_relgnn(
         state = _read_checkpoint(checkpoint)
         if state["dataset_fingerprint"] != dataset.manifest["fingerprint"]:
             raise ValueError("checkpoint dataset fingerprint differs from the graph dataset")
-        if state["model_config"] != model_config.to_dict():
+        if KBORelGNNConfig(**state["model_config"]).to_dict() != model_config.to_dict():
             raise ValueError("checkpoint model/feature/route configuration differs")
         _resume_compatible(state, options)
         model.load_state_dict(state["model"])
@@ -648,7 +783,10 @@ def train_kbo_relgnn(
         model.train()
         loader = _loader(directory, splits["train"], options, epoch=epoch, training=True)
         optimizer.zero_grad(set_to_none=True)
-        sums = dict.fromkeys(("match", "live_hit", "pa", "run"), 0.0)
+        task_names = ("match", "live_hit", "pa", "run") + (
+            ("box_pa", "box_pitch") if model_config.include_boxscore_heads else ()
+        )
+        sums = dict.fromkeys(task_names, 0.0)
         counts = dict.fromkeys(sums, 0)
         for index, raw_batch in enumerate(loader):
             batch = _move(raw_batch, device)
@@ -659,7 +797,7 @@ def train_kbo_relgnn(
             group_start = (index // options.accumulate_steps) * options.accumulate_steps
             group_size = min(options.accumulate_steps, len(loader) - group_start)
             scaler.scale(losses["loss"] / group_size).backward()
-            batch_counts = _counts(batch)
+            batch_counts = _counts(batch, include_boxscore=model_config.include_boxscore_heads)
             for name, count in batch_counts.items():
                 sums[name] += float(losses[f"{name}_loss"].detach().cpu()) * count
                 counts[name] += count
@@ -751,6 +889,13 @@ def train_kbo_relgnn(
         "split_summary": split_summary,
         "test_used_during_training": False,
         "smoke_test_only": options.max_days_per_split is not None,
+        "sampling_limits": {
+            "training_pa_per_day": options.max_pa_per_day or None,
+            "edges_per_route_per_day": options.max_edges_per_route_per_day or None,
+            "evaluation_pa_per_day": None,
+            "boxscore_queries": None,
+            "zero_means_unlimited": True,
+        },
         "completed_epochs": len(history),
         "best_epoch": best_epoch,
         "best_validation_loss": best_score,
@@ -760,7 +905,12 @@ def train_kbo_relgnn(
         "last_checkpoint": str(output / "last.pt"),
         "best_checkpoint_sha256": sha256_file(output / "best.pt"),
         "last_checkpoint_sha256": sha256_file(output / "last.pt"),
-        "live_hit_population": "observed_PA_at_least_one; not unconditional V26 candidates",
+        "live_hit_population": (
+            "verified_player_game_appearance; observed PA or historical box score; "
+            "not unconditional V26 candidates"
+            if model_config.include_boxscore_heads
+            else "observed_PA_at_least_one; not unconditional V26 candidates"
+        ),
         "history": history,
         **_runtime_memory(device),
     }
@@ -774,14 +924,20 @@ def _write_prediction_parquet(path: Path, rows: Sequence[Mapping[str, Any]]) -> 
     if not rows:
         return
     names = tuple(rows[0])
-    types = [
-        "VARCHAR"
-        if isinstance(rows[0][name], str)
-        else "BIGINT"
-        if isinstance(rows[0][name], int)
-        else "DOUBLE"
-        for name in names
-    ]
+    types = []
+    for name in names:
+        first_value = next((row[name] for row in rows if row[name] is not None), None)
+        if name.startswith("observed_") and name != "observed_pa_known":
+            kind = "BIGINT"
+        elif isinstance(first_value, str):
+            kind = "VARCHAR"
+        elif isinstance(first_value, bool):
+            kind = "BOOLEAN"
+        elif isinstance(first_value, int):
+            kind = "BIGINT"
+        else:
+            kind = "DOUBLE"
+        types.append(kind)
     expressions = ", ".join(
         f"unnest(?::{kind}[]) AS {name}" for name, kind in zip(names, types, strict=True)
     )
@@ -881,16 +1037,32 @@ def evaluate_kbo_relgnn(
         "prediction_artifacts": artifacts,
         "output_directory": str(output),
         "smoke_test_only": options.max_days_per_split is not None,
+        "sampling_limits": {
+            "evaluation_pa_per_day": None,
+            "edges_per_route_per_day": options.max_edges_per_route_per_day or None,
+            "boxscore_queries": None,
+            "zero_means_unlimited": True,
+        },
         "class_order": {
             "match": ["L", "D", "W"],
             "live_hit": ["no_hit", "hit"],
             "pa": list(NEURAL_PA_OUTCOMES),
+            **({"box_pa": list(NEURAL_PA_OUTCOMES), "box_pitch": list(BOX_PITCH_TARGET_NAMES)}
+               if model.config.include_boxscore_heads else {}),
         },
         "limitations": [
-            "Live Hit is conditional on at least one observed PA, not a full candidate pool.",
+            ("Live Hit is conditional on verified PA appearance (PBP or box score), "
+             "not a full candidate pool." if model.config.include_boxscore_heads else
+             "Live Hit is conditional on at least one observed PA, not a full candidate pool."),
             "Joint PA/hit overflow buckets yield lower-bound expectations, not exact tail means.",
             "PA auxiliary queries contain pre-PA state; match and Live Hit remain pre-day tasks.",
             "Source publication times are reconstructed; this is a retrospective benchmark.",
+            *([
+                "Box-score outcome histograms are not reconstructed PA event sequences.",
+                "Unknown PA labels marginalize joint mass above the verified PA minimum; "
+                "PA MAE excludes them. Overflow buckets cannot resolve within-bucket minima.",
+                "Pitching counts use masked auxiliary Poisson objectives, not a joint simulator.",
+            ] if model.config.include_boxscore_heads else []),
         ],
         **_runtime_memory(selected),
     }

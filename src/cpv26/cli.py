@@ -302,7 +302,7 @@ def kbo_history_fetch(
         ),
     ] = None,
 ) -> None:
-    """Download checksum-pinned 2001-2022 game archives; these are not PA records."""
+    """Download checksum-pinned 2001-2022 game and player box-score archives."""
 
     years = _history_years(start_year, end_year)
     settings = _settings()
@@ -336,7 +336,7 @@ def kbo_history_import(
         ),
     ] = None,
 ) -> None:
-    """Import historical final scores for match/run training, without inventing PA labels."""
+    """Import games, batting and pitching records with raw values and missing-field masks."""
 
     years = _history_years(start_year, end_year)
     settings = _settings()
@@ -369,17 +369,22 @@ def kbo_history_import(
     except (DuckDBError, OSError, RuntimeError, TypeError, ValueError) as exc:
         error_console.print(f"[red]KBO history import failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    table = Table(title="KBO historical game coverage (match/run only)")
+    table = Table(title="KBO historical game and player coverage")
     table.add_column("Season")
     table.add_column("Games", justify="right")
-    table.add_column("First date")
-    table.add_column("Last date")
+    table.add_column("Batters", justify="right")
+    table.add_column("Pitchers", justify="right")
+    table.add_column("Hit labels", justify="right")
+    table.add_column("Verified outcomes", justify="right")
     for season in report["season_coverage"]:
         table.add_row(
-            str(season["year"]), str(season["games"]), season["date_start"], season["date_end"]
+            str(season["year"]), str(season["games"]),
+            str(season["batter_rows"]), str(season["pitcher_rows"]),
+            str(season["hit_labels"]), str(season["verified_batting_outcomes"]),
         )
     console.print(table)
-    console.print(f"Historical games: {report['games']:,}; no PA or LiveHit labels created.")
+    console.print(f"Historical games: {report['games']:,}; partial player records retained.")
+    console.print("Unresolved names remain separate source observations, not career player IDs.")
     console.print(f"[green]Import report ready[/green]: {output}")
 
 
@@ -613,8 +618,17 @@ def relgnn_train(
     workers: Annotated[int, typer.Option(min=0, help="CPU graph-loading worker processes.")] = 2,
     accumulate_steps: Annotated[int, typer.Option(min=1)] = 1,
     max_pa_per_day: Annotated[
-        int, typer.Option(min=1, help="Training auxiliary PA queries only.")
-    ] = 128,
+        int, typer.Option(min=0, help="Training PA limit per day; 0 uses every query.")
+    ] = 0,
+    max_edges_per_route: Annotated[
+        int, typer.Option(min=0, help="Relation edge limit per route; 0 uses every edge.")
+    ] = 0,
+    box_pa_weight: Annotated[
+        float, typer.Option(min=0.0, help="Historical aggregate batting outcome loss weight.")
+    ] = 0.2,
+    box_pitch_weight: Annotated[
+        float, typer.Option(min=0.0, help="Historical masked pitching-count loss weight.")
+    ] = 0.1,
     patience: Annotated[
         int, typer.Option(min=0, help="Validation early stopping; 0 disables it.")
     ] = 6,
@@ -660,6 +674,9 @@ def relgnn_train(
             workers=workers,
             accumulate_steps=accumulate_steps,
             max_pa_per_day=max_pa_per_day,
+            max_edges_per_route_per_day=max_edges_per_route,
+            box_pa_weight=box_pa_weight,
+            box_pitch_weight=box_pitch_weight,
             patience=patience,
             seed=settings.random_seed,
             max_days_per_split=max_days_per_split,

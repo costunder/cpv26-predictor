@@ -10,8 +10,8 @@
 
 이 저장소는 다음 핵심 구성요소를 실제 코드와 테스트로 제공합니다.
 
-- append-only point-in-time DuckDB와 schema v1→v2→v3→v4 migration
-- 경기 상태·선발·타석 전이·교체·주루·수비·날씨·V26 slate를 포함한 36-table 계약
+- append-only point-in-time DuckDB와 schema v1→v2→v3→v4→v5 migration
+- 경기·타석·V26 계약에 과거 선수 박스스코어와 경기 원문을 추가한 38-table 계약
 - PA/박스스코어/전이/V26 capture/날씨/시즌 분할 데이터 감사
 - 재현 가능한 Parquet snapshot과 SHA-256 manifest
 - 타격 feature primitive와 확률 평가 도구
@@ -464,9 +464,19 @@ publication delay      available_at - event_at  # opt-in feature
 `available_at`을 recency로 쓰지 않는다. 오래된 경기가 최근 정정됐다고 최근 경기로
 취급하는 오류를 막는다.
 
-## 9. Schema v4 table 목록
+## 9. Schema v5 table 목록
 
-Metadata 포함 36개다.
+Metadata 포함 38개다. v5는 기존 v4 행을 유지하고 아래 두 표를 추가한다.
+
+| v5 추가 표 | 용도 |
+|---|---|
+| `historical_boxscore` | 원천 관측별 타자·투수 수치, 원문, 품질 사유; 이름 기반 선수 병합 없음 |
+| `historical_game_detail` | 스코어보드·ETC·기타 경기 원문 보존 |
+
+2001~2022 경기·안타·타격 결과 집계·투구 기록을 연결한 그래프는 v3이다.
+기존 v2 그래프/체크포인트는 읽을 수 있으며 새 데이터로 재개하지 않는다.
+현재 사용 범위·결측 마스크·학습 명령은 [GPU 학습 설명](GPU_TRAINING.md)과
+[README](../README.md)가 기준이다. 아래 v4 설계·실험 기록은 당시 상태의 기록이다.
 
 | table | 역할 |
 |---|---|
@@ -1035,7 +1045,8 @@ batch 이후의 계약이며, 실제 KBO data loader·파일 checkpoint·실행 
 
 기본 모델은 hidden dimension 64, 2 layers, 4 attention heads다. 기본 runner는
 단일 `cuda:0`, 2일/batch, DataLoader workers 2, pinned-memory/non-blocking 전송,
-날짜·route별 edge 상한 20,000, 훈련 PA query 128개/일을 사용한다. validation/test의
+기존 실험은 날짜·route별 edge 상한 20,000, 훈련 PA query 128개/일을 사용했다.
+현재 CLI는 두 상한을 0(전부 사용)으로 전달하고 `sampling_limits`에 남긴다. validation/test의
 PA query는 전부 평가한다. graph edge 상한은 평가에도 적용되므로 무제한 전체 관계
 graph라고 주장하지 않는다. AMP `auto`는 장치에 따라 BF16/FP16을 선택하며 `off`도
 가능하다. AdamW, gradient clipping, gradient accumulation을 지원한다.
