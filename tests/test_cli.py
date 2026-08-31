@@ -5,6 +5,8 @@ from typing import Any
 
 import pytest
 from pytest import MonkeyPatch
+from rich.text import Text
+from typer import rich_utils
 from typer.testing import CliRunner
 
 import cpv26.cli as cli_module
@@ -154,24 +156,31 @@ def test_relgnn_train_rejects_years_outside_date_range(option: str, year: str) -
     assert "1<=x<=9999" in result.output
 
 
+@pytest.mark.parametrize("force_color", [False, True])
 def test_relgnn_season_help_describes_checkpoint_splits_and_epoch_date_order(
     monkeypatch: MonkeyPatch,
+    force_color: bool,
 ) -> None:
     monkeypatch.setenv("COLUMNS", "200")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(rich_utils, "MAX_WIDTH", 200)
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", force_color)
     runner = CliRunner()
     train = runner.invoke(app, ["relgnn-train", "--help"], terminal_width=160)
     assert train.exit_code == 0, train.output
+    train_text = Text.from_ansi(train.output).plain
     for option in (
         "--train-start-year", "--train-end-year", "--validation-year",
         "--test-year", "--chronological",
     ):
-        assert option in train.output
-    assert "within each epoch" in train.output
-    assert "not streaming" in train.output
+        assert option in train_text
+    assert "within each epoch" in train_text
+    assert "not streaming" in train_text
     evaluate = runner.invoke(app, ["relgnn-evaluate", "--help"], terminal_width=160)
     assert evaluate.exit_code == 0, evaluate.output
-    assert "years come from the checkpoint" in evaluate.output
-    assert "test (2025)" not in evaluate.output
+    evaluate_text = Text.from_ansi(evaluate.output).plain
+    assert "years come from the checkpoint" in evaluate_text
+    assert "test (2025)" not in evaluate_text
 
 
 def test_kbo_fetch_uses_runtime_directory_and_requested_year(
