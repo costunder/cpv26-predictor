@@ -7,6 +7,7 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -48,6 +49,31 @@ def test_transfer_module_imports_without_optional_torch() -> None:
         check=False, timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(("names", "expected"), [
+    (None, True),
+    ((None, None), True),
+    (("batch", None), False),
+])
+def test_pack_guard_supports_optional_names_attribute(
+    names: tuple[str | None, ...] | None, expected: bool,
+) -> None:
+    # Cover both old named-tensor APIs and builds without Tensor.names.
+    backend = SimpleNamespace(Tensor=SimpleNamespace, strided="strided", **{
+        name: name for name in (
+            "bool", "uint8", "int8", "int16", "int32", "int64",
+            "float16", "bfloat16", "float32", "float64",
+        )
+    })
+    tensor = SimpleNamespace(
+        device=SimpleNamespace(type="cpu"), layout="strided", is_nested=False,
+        requires_grad=False, dtype="float32", is_contiguous=lambda: True,
+        numel=lambda: 4, is_conj=lambda: False, is_neg=lambda: False,
+    )
+    if names is not None:
+        tensor.names = names
+    assert batch_transfer._can_pack(tensor, backend) is expected
 
 
 @pytest.mark.parametrize("dtype_name", [
