@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from dataclasses import asdict, replace
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import duckdb
 import numpy as np
 import pytest
 
+import cpv26.training.kbo_runner as runner_module
 from cpv26.data.kbo_graph_dataset import build_kbo_graph_dataset
 from cpv26.data.kbo_playbyplay import sha256_file
 from cpv26.training.kbo_runner import (
     KBOTrainingConfig,
     _float64_probabilities,
+    _loader,
+    _resume_compatible,
+    _split_days,
+    _split_summary,
     check_gpu,
     evaluate_kbo_relgnn,
     train_kbo_relgnn,
@@ -64,7 +70,7 @@ def graph_directory(tmp_path: Path) -> Path:
             "INSERT INTO source_revision VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ["fixture", "pytest", "local", "a" * 64, "{}", start, start, start, start, None],
         )
-        for year in (2023, 2024, 2025):
+        for year in (2023, 2024, 2025, 2026):
             for day in (1, 2):
                 start = datetime(year, 4, day, tzinfo=timezone(timedelta(hours=9)))
                 event = start + timedelta(hours=23, minutes=59, seconds=59)
@@ -210,19 +216,29 @@ def test_real_graph_train_resume_and_test_artifacts(graph_directory: Path, tmp_p
     assert report["output_directory"] != repeated["output_directory"]
 
 
-def test_epoch_resume_matches_uninterrupted_training(graph_directory: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("chronological", [False, True])
+def test_epoch_resume_matches_uninterrupted_training(
+    graph_directory: Path, tmp_path: Path, chronological: bool
+) -> None:
     torch = pytest.importorskip("torch")
     first = tmp_path / "resumed"
     full = tmp_path / "uninterrupted"
-    train_kbo_relgnn(graph_directory, first, config=_config(), progress=lambda _: None)
+    train_kbo_relgnn(
+        graph_directory, first, config=_config(chronological=chronological), progress=lambda _: None
+    )
     train_kbo_relgnn(
         graph_directory,
         first,
-        config=_config(epochs=2),
+        config=_config(epochs=2, chronological=chronological),
         resume=first / "last.pt",
         progress=lambda _: None,
     )
-    train_kbo_relgnn(graph_directory, full, config=_config(epochs=2), progress=lambda _: None)
+    train_kbo_relgnn(
+        graph_directory,
+        full,
+        config=_config(epochs=2, chronological=chronological),
+        progress=lambda _: None,
+    )
     resumed = torch.load(first / "last.pt", map_location="cpu", weights_only=True)
     uninterrupted = torch.load(full / "last.pt", map_location="cpu", weights_only=True)
     for key, tensor in resumed["model"].items():
@@ -270,3 +286,124 @@ def test_training_config_disallows_invalid_splits_and_empty_tasks() -> None:
         KBOTrainingConfig(live_hit_weight=0)
     with pytest.raises(ValueError, match="divisible"):
         KBOTrainingConfig(hidden_dim=63, heads=4)
+
+
+@pytest.mark.parametrize("years", [(2023, 2023), (2024, 2023), (False,), (0,), (10000,)])
+def test_training_config_rejects_invalid_years(years: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="season"):
+        KBOTrainingConfig(train_seasons=years, validation_season=2025, test_season=2026)
+
+
+def test_training_config_accepts_historical_years_and_reads_legacy_checkpoints() -> None:
+    expanded = KBOTrainingConfig(
+        train_seasons=tuple(range(2000, 2024)), chronological=True
+    )
+    assert expanded.train_seasons[0] == 2000
+    assert KBOTrainingConfig.from_dict(asdict(expanded)) == expanded
+    legacy = asdict(KBOTrainingConfig())
+    del legacy["chronological"]
+    assert KBOTrainingConfig.from_dict(legacy).chronological is False
+    _resume_compatible({"training_config": legacy, "epoch": 1}, KBOTrainingConfig(epochs=2))
+    with pytest.raises(ValueError, match="chronological"):
+        _resume_compatible(
+            {"training_config": legacy, "epoch": 1},
+            KBOTrainingConfig(epochs=2, chronological=True),
+        )
+
+
+def test_multi_year_splits_are_complete_ordered_and_disjoint(graph_directory: Path) -> None:
+    dataset = runner_module.KBOGraphDataset(graph_directory)
+    config = KBOTrainingConfig(
+        train_seasons=(2023, 2024), validation_season=2025, test_season=2026, chronological=True
+    )
+    splits = _split_days(dataset, config)
+    assert splits["train"] == (
+        date(2023, 4, 1), date(2023, 4, 2), date(2024, 4, 1), date(2024, 4, 2)
+    )
+    assert {day.year for day in splits["validation"]} == {2025}
+    assert {day.year for day in splits["test"]} == {2026}
+    assert set(splits["train"]).isdisjoint(splits["validation"])
+    assert set(splits["train"]).isdisjoint(splits["test"])
+    summary = _split_summary(dataset, splits)
+    assert summary["train"]["games"] == 4
+    assert summary["train"]["live_hit_queries"] == 8
+    assert summary["train"]["pa_queries"] == 8
+    assert summary["train"]["date_start"] == "2023-04-01"
+    assert summary["train"]["date_end"] == "2024-04-02"
+    assert summary["test"]["days"] == 2
+
+
+def test_requested_training_or_validation_year_cannot_be_silently_skipped(
+    graph_directory: Path,
+) -> None:
+    dataset = runner_module.KBOGraphDataset(graph_directory)
+    with pytest.raises(ValueError, match="training seasons: 2022"):
+        _split_days(dataset, KBOTrainingConfig(train_seasons=(2022, 2023)))
+    with pytest.raises(ValueError, match="validation seasons: 2027"):
+        _split_days(dataset, KBOTrainingConfig(validation_season=2027, test_season=2028))
+    # A future test season need not be available to train; evaluation checks it separately.
+    splits = _split_days(dataset, KBOTrainingConfig(test_season=2027))
+    assert splits["test"] == ()
+
+
+@pytest.mark.parametrize(
+    ("chronological", "training", "expected_shuffle"),
+    [(True, True, False), (False, True, True), (False, False, False)],
+)
+def test_loader_orders_training_dates_only_when_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chronological: bool,
+    training: bool,
+    expected_shuffle: bool,
+) -> None:
+    class Generator:
+        def manual_seed(self, value: int) -> Generator:
+            self.seed = value
+            return self
+
+    def capture_loader(dataset: Any, **options: Any) -> Any:
+        return {"dataset": dataset, **options}
+
+    fake_torch = SimpleNamespace(
+        Generator=Generator,
+        utils=SimpleNamespace(data=SimpleNamespace(DataLoader=capture_loader)),
+    )
+    monkeypatch.setattr(runner_module, "require_torch", lambda: (fake_torch, None))
+    days = (date(2024, 4, 2), date(2023, 4, 1), date(2024, 4, 1))
+    config = _config(chronological=chronological)
+    loader = _loader(tmp_path, days, config, epoch=3, training=training)
+    assert loader["shuffle"] is expected_shuffle
+    assert loader["generator"].seed == config.seed + 3
+    expected_days = days if expected_shuffle else tuple(sorted(days))
+    assert loader["dataset"].selected_days == expected_days
+
+
+def test_multi_year_chronological_training_and_2026_evaluation(
+    graph_directory: Path, tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    run = tmp_path / "multi-year"
+    config = _config(
+        train_seasons=(2023, 2024), validation_season=2025, test_season=2026,
+        chronological=True,
+    )
+    progress: list[str] = []
+    report = train_kbo_relgnn(graph_directory, run, config=config, progress=progress.append)
+    assert report["training_order"] == "chronological"
+    assert report["training_seasons"] == [2023, 2024]
+    assert report["validation_season"] == 2025
+    assert report["held_out_test_season"] == 2026
+    assert report["split_summary"]["train"]["games"] == 4
+    assert report["history"][0]["training_samples"]["match"] == 4
+    assert report["history"][0]["validation"]["match"]["samples"] == 2
+    assert any("2026 test is not used" in line for line in progress)
+    state = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+    assert state["training_config"]["chronological"] is True
+    evaluation = evaluate_kbo_relgnn(
+        run / "best.pt", split="test", device="cpu", amp="off", workers=0
+    )
+    assert evaluation["date_start"] == "2026-04-01"
+    assert evaluation["date_end"] == "2026-04-02"
+    assert evaluation["held_out_test_season"] == 2026
+    assert evaluation["metrics"]["match"]["samples"] == 2

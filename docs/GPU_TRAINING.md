@@ -35,7 +35,9 @@ CPU smoke는 CUDA 패키지를 바꾸지 않도록 README의 별도 Conda `cpv26
 
 다운로더는 변하는 `main`이 아니라 revision
 `6afc8af044e3bba5f326b688e8cb41d7ff7065ec`의
-`v0/kbo_pbp_2023.parquet`, `kbo_pbp_2024.parquet`, `kbo_pbp_2025.parquet`를 사용합니다.
+`v0/kbo_pbp_2023.parquet`, `kbo_pbp_2024.parquet`, `kbo_pbp_2025.parquet`를 기본으로 사용합니다.
+`kbo-fetch --year 2026`으로 같은 revision의 `kbo_pbp_2026.parquet`도 받을 수 있으며,
+포함 범위는 2026년 7월 26일까지입니다. 2000~2022년 원천은 연결돼 있지 않습니다.
 파일별 예상 SHA-256은 `kbo_playbyplay.py`에 고정돼 있습니다.
 `.part` 다운로드 → 체크섬 검증 → 파일 교체 순서이며, 유효한 기존 파일은 재사용합니다.
 다운로드 출처는 `SOURCE.json`, canonical 변환 버전과 원본 체크섬은
@@ -106,12 +108,31 @@ NPZ는 object 배열 없이 저장하고 `allow_pickle=False`로 읽습니다.
 WDL·LiveHit 라벨과 과거 집계는 이 마스킹으로 바뀌지 않습니다.
 두 건수는 manifest `label_quality`에 따로 기록됩니다.
 
-모델 파라미터는 2023년으로 학습하고 2024년 검증 손실로 선택합니다.
+기본 설정은 2023년으로 학습하고 2024년 검증 손실로 모델을 선택합니다.
 2025년은 학습 루프에서 평가하지 않고, 선택한 checkpoint를 명시해 별도로 평가합니다.
 검증/테스트 시즌에서도 각 평가일 이전에 끝난 같은 시즌 경기는 역사 입력에 포함됩니다.
 이는 매일 관측 이력을 갱신하는 평가이며, 그 이력으로 모델 파라미터를 재학습한다는 뜻은 아닙니다.
 `max_days_per_split`은 각 시즌에 걸쳐 날짜를 균등 간격으로 줄이는 smoke 옵션입니다.
 그 결과는 전체 시즌 성능으로 해석하면 안 됩니다.
+
+### 다년 학습과 날짜 순서
+
+`relgnn-train`의 `--train-start-year`, `--train-end-year`는 양끝 연도를 포함한 학습
+범위입니다. `--validation-year`, `--test-year`로 이후 검증·테스트 시즌을 지정합니다.
+학습 종료연도 < 검증연도 < 테스트연도여야 하며, 요청한 학습연도마다 데이터가 있어야 합니다.
+기본값은 기존대로 2023년 학습·2024년 검증·2025년 테스트입니다.
+
+[README의 다년 실행 예시](../README.md#더-많은-시즌을-시간순으로-학습하기)는
+2023~2024년 330일·1,440경기로 학습하고, 2025년으로 모델을 선택한 뒤 2026년 부분
+시즌을 별도로 평가합니다. 이미 평가 결과를 본 2025년은 이 실험에서 개발용 검증으로
+전환되며, 최종 보류 테스트라고 표시하지 않습니다. 기존 그래프 대신
+`var/datasets/kbo_graph_2023_2026`을 만들고 새 run에서 시작합니다.
+
+`--chronological`이면 매 epoch 전체 학습 날짜를 오름차순으로 순회하며 시즌 경계에서
+모델·optimizer를 초기화하지 않습니다. 다음 epoch는 학습 시작 날짜로 돌아갑니다.
+기본값은 날짜 shuffle이며, 시간순 모드는 온라인 predict-before-learn 평가나 새 데이터
+추가 학습을 구현한 것이 아닙니다. 각 날짜의 입력은 여전히 그 날짜 이전 최대 90일입니다.
+검증·테스트 결과로 가중치를 갱신하지 않습니다.
 
 ## 실제 모델과 네 가지 학습 신호
 
@@ -158,6 +179,7 @@ overflow bin의 평균을 알 수 없으므로 출력의 기대 PA/안타는 마
 | optimizer / learning rate / weight decay | AdamW / `3e-4` / `1e-4` |
 | minibatch / gradient accumulation / clip | 날짜 2개 / 1 step / norm 1.0 |
 | 데이터 로더 worker / seed | 2 / 2026 |
+| 학습 날짜 순서 | shuffle (`--chronological`로 오름차순 선택) |
 | 학습 PA 질의 상한 | 날짜당 128개 |
 | 관계 상한 | 날짜·관계 종류당 20,000개 |
 
@@ -181,7 +203,9 @@ seed를 고정해도 CUDA atomic 연산까지 bitwise 재현된다고 보장하�
 모델·optimizer·scaler·난수 상태·epoch·step·학습 이력·데이터 fingerprint를 함께 저장합니다.
 
 재개는 **같은 run 디렉터리의 `last.pt`**로만 합니다. 데이터 fingerprint와 모델/특성/관계
-설정이 다르면 거부합니다. 재개 시 바꿀 수 있는 설정은 총 목표 epoch, 장치, worker,
+설정, 학습·검증·테스트 연도 또는 날짜 순서가 다르면 거부합니다. 새 시즌을 추가한
+데이터에 기존 checkpoint를 `--resume`하는 기능은 아닙니다.
+재개 시 바꿀 수 있는 설정은 총 목표 epoch, 장치, worker,
 batch days, AMP, accumulation, patience이며, epoch는 추가 횟수가 아니라 총 목표입니다.
 batch/precision 변경을 허용한다는 것이 이전과 동일한 수치 경로를 보장한다는 뜻은 아닙니다.
 저장되지 않은 진행 중 batch는 복구되지 않으며, epoch 도중 중단된 계산은 마지막으로

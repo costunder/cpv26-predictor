@@ -451,13 +451,36 @@ def relgnn_train(
     run_dir: Annotated[
         Path | None, typer.Option(help="New run directory; keep models out of Git.")
     ] = None,
-    resume: Annotated[Path | None, typer.Option(help="Resume from this run's last.pt.")] = None,
+    resume: Annotated[
+        Path | None,
+        typer.Option(
+            help="Resume from this run's last.pt; repeat original season and date-order options."
+        ),
+    ] = None,
     device: Annotated[
         str, typer.Option(help="CUDA device; CPU is only an explicit validation mode.")
     ] = "cuda:0",
     epochs: Annotated[
         int, typer.Option(min=1, help="Total target epochs, including resumed epochs.")
     ] = 30,
+    train_start_year: Annotated[
+        int, typer.Option(min=1, max=9999, help="First training season, inclusive.")
+    ] = 2023,
+    train_end_year: Annotated[
+        int, typer.Option(min=1, max=9999, help="Last training season, inclusive.")
+    ] = 2023,
+    validation_year: Annotated[
+        int, typer.Option(min=1, max=9999, help="Validation season, after all training seasons.")
+    ] = 2024,
+    test_year: Annotated[
+        int, typer.Option(min=1, max=9999, help="Held-out test season, after validation.")
+    ] = 2025,
+    chronological: Annotated[
+        bool,
+        typer.Option(
+            help="Use date order within each epoch; not streaming predict-then-learn."
+        ),
+    ] = False,
     batch_days: Annotated[int, typer.Option(min=1, help="Disjoint day graphs per minibatch.")] = 2,
     hidden_dim: Annotated[int, typer.Option(min=4)] = 64,
     layers: Annotated[int, typer.Option(min=1)] = 2,
@@ -478,7 +501,12 @@ def relgnn_train(
         int | None, typer.Option(min=1, help="Explicit smoke test limit; not a full-season result.")
     ] = None,
 ) -> None:
-    """Train real role-aware RelGNN on 2023 and select checkpoints with 2024 validation."""
+    """Train role-aware RelGNN on selected seasons with later validation and held-out test."""
+    if train_start_year > train_end_year:
+        raise typer.BadParameter(
+            "--train-start-year must not exceed --train-end-year.",
+            param_hint="--train-start-year",
+        )
     settings = _settings()
     directory = (dataset or settings.home / "datasets" / "kbo_graph").expanduser().resolve()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -514,6 +542,10 @@ def relgnn_train(
             patience=patience,
             seed=settings.random_seed,
             max_days_per_split=max_days_per_split,
+            train_seasons=tuple(range(train_start_year, train_end_year + 1)),
+            validation_season=validation_year,
+            test_season=test_year,
+            chronological=chronological,
         )
         report = train_kbo_relgnn(
             directory, output, config=config, resume=resume, progress=console.print
@@ -525,7 +557,10 @@ def relgnn_train(
     console.print(f"Epochs: {report['completed_epochs']}; best: {report['best_epoch']}")
     if report["smoke_test_only"]:
         console.print("[yellow]Limited-date verification only, not a full-season result.[/yellow]")
-    console.print("2025 test was not used; evaluate best.pt explicitly with relgnn-evaluate.")
+    console.print(
+        f"{config.test_season} test was not used; "
+        "evaluate best.pt explicitly with relgnn-evaluate."
+    )
 
 
 @app.command("relgnn-evaluate")
@@ -535,7 +570,7 @@ def relgnn_evaluate(
         Path | None, typer.Option(help="Defaults to the checkpoint's dataset.")
     ] = None,
     split: Annotated[
-        str, typer.Option(help="test (2025), validation (2024), or train (2023).")
+        str, typer.Option(help="test, validation, or train; years come from the checkpoint.")
     ] = "test",
     device: Annotated[str, typer.Option()] = "cuda:0",
     amp: Annotated[str, typer.Option()] = "auto",

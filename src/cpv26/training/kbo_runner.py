@@ -59,6 +59,7 @@ class KBOTrainingConfig:
     train_seasons: tuple[int, ...] = (2023,)
     validation_season: int = 2024
     test_season: int = 2025
+    chronological: bool = False
 
     def __post_init__(self) -> None:
         positive = (
@@ -94,6 +95,16 @@ class KBOTrainingConfig:
             raise ValueError("max_days_per_split must be positive when supplied")
         if self.amp not in {"auto", "off", "fp16", "bf16"}:
             raise ValueError("amp must be auto, off, fp16, or bf16")
+        if not isinstance(self.chronological, bool):
+            raise ValueError("chronological must be a boolean")
+        seasons = (*self.train_seasons, self.validation_season, self.test_season)
+        if any(
+            isinstance(year, bool) or not isinstance(year, int) or not 1 <= year <= 9999
+            for year in seasons
+        ):
+            raise ValueError("season years must be integers between 1 and 9999")
+        if tuple(sorted(set(self.train_seasons))) != self.train_seasons:
+            raise ValueError("training seasons must be unique and increasing")
         if not self.train_seasons or not (
             max(self.train_seasons) < self.validation_season < self.test_season
         ):
@@ -244,10 +255,11 @@ def _loader(
 ) -> Any:
     torch, _ = require_torch()
     generator = torch.Generator().manual_seed(config.seed + epoch)
+    ordered_days = sorted(days) if config.chronological or not training else days
     return torch.utils.data.DataLoader(
-        _DayDataset(directory, days),
+        _DayDataset(directory, ordered_days),
         batch_size=config.batch_days,
-        shuffle=training,
+        shuffle=training and not config.chronological,
         num_workers=config.workers,
         pin_memory=config.device.startswith("cuda"),
         generator=generator,
@@ -265,20 +277,50 @@ def _split_days(
     dataset: KBOGraphDataset,
     config: KBOTrainingConfig,
 ) -> dict[str, tuple[date, ...]]:
+    available_days = tuple(sorted(dataset.days()))
+    available_years = {day.year for day in available_days}
+    for name, years in (
+        ("training", config.train_seasons),
+        ("validation", (config.validation_season,)),
+    ):
+        missing = sorted(set(years) - available_years)
+        if missing:
+            raise ValueError(
+                f"graph dataset has no dates for requested {name} seasons: "
+                f"{', '.join(map(str, missing))}; "
+                "import those seasons and build a new graph dataset"
+            )
     selected: dict[str, tuple[date, ...]] = {}
     for name, years in (
         ("train", config.train_seasons),
         ("validation", (config.validation_season,)),
         ("test", (config.test_season,)),
     ):
-        days = tuple(day for day in dataset.days() if day.year in years)
+        days = tuple(day for day in available_days if day.year in years)
         if config.max_days_per_split is not None and len(days) > config.max_days_per_split:
             indices = np.linspace(0, len(days) - 1, config.max_days_per_split, dtype=int)
             days = tuple(days[int(index)] for index in indices)
         selected[name] = days
-    if not selected["train"] or not selected["validation"]:
-        raise ValueError("graph dataset needs non-empty 2023 training and 2024 validation dates")
     return selected
+
+
+def _split_summary(
+    dataset: KBOGraphDataset, splits: Mapping[str, Sequence[date]]
+) -> dict[str, Any]:
+    entries = {entry["day"]: entry for entry in dataset.manifest["days"]}
+    summary: dict[str, Any] = {}
+    for name, days in splits.items():
+        rows = [entries[day.isoformat()] for day in days]
+        summary[name] = {
+            "seasons": sorted({day.year for day in days}),
+            "days": len(days),
+            "date_start": min(days).isoformat() if days else None,
+            "date_end": max(days).isoformat() if days else None,
+            "games": sum(row["games"] for row in rows),
+            "live_hit_queries": sum(row["live_hit_queries"] for row in rows),
+            "pa_queries": sum(row["pa_queries"] for row in rows),
+        }
+    return summary
 
 
 def _losses(outputs: Mapping[str, Any], batch: Mapping[str, Any], config: KBOTrainingConfig) -> Any:
@@ -501,7 +543,7 @@ def train_kbo_relgnn(
     resume: str | Path | None = None,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Any]:
-    """Train on 2023, select on 2024, and never inspect the 2025 holdout here."""
+    """Train on configured past seasons and select with a later validation season."""
     torch, _ = require_torch()
     options = config or KBOTrainingConfig()
     device, dtype, runtime = _device_and_precision(options.device, options.amp)
@@ -509,6 +551,8 @@ def train_kbo_relgnn(
     output = Path(run_directory).expanduser().resolve()
     dataset = KBOGraphDataset(directory)
     splits = _split_days(dataset, options)
+    split_summary = _split_summary(dataset, splits)
+    training_order = "chronological" if options.chronological else "shuffled"
     model_config = _model_config(dataset, options)
     torch.manual_seed(options.seed)
     random.seed(options.seed)
@@ -572,6 +616,8 @@ def train_kbo_relgnn(
                 "dataset_directory": str(directory),
                 "dataset_fingerprint": dataset.manifest["fingerprint"],
                 "training": asdict(options),
+                "training_order": training_order,
+                "split_summary": split_summary,
                 "model": model_config.to_dict(),
                 "runtime": runtime,
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -581,8 +627,18 @@ def train_kbo_relgnn(
         f"RelGNN device={device} precision={runtime['precision']} "
         f"parameters={sum(p.numel() for p in model.parameters()):,}; "
         f"train_days={len(splits['train'])}, validation_days={len(splits['validation'])}; "
-        "2025 test is not used during training"
+        f"{options.test_season} test is not used during training"
     )
+    progress(
+        f"Training seasons={','.join(map(str, options.train_seasons))}; "
+        f"validation={options.validation_season}; test={options.test_season}; "
+        f"order={training_order}; train_games={split_summary['train']['games']:,}"
+    )
+    if options.chronological:
+        progress(
+            "Each epoch visits training dates oldest first; weights continue across seasons. "
+            "Validation is held out, not an online predict-then-learn score."
+        )
     if runtime.get("gpu_name"):
         progress(
             f"GPU: {runtime['gpu_name']}; VRAM={runtime['total_memory_bytes'] / 2**30:.1f} GiB"
@@ -690,6 +746,9 @@ def train_kbo_relgnn(
         "training_seasons": list(options.train_seasons),
         "validation_season": options.validation_season,
         "held_out_test_season": options.test_season,
+        "training_order": training_order,
+        "evaluation_protocol": "fixed_chronological_holdout",
+        "split_summary": split_summary,
         "test_used_during_training": False,
         "smoke_test_only": options.max_days_per_split is not None,
         "completed_epochs": len(history),
@@ -810,6 +869,9 @@ def evaluate_kbo_relgnn(
         "checkpoint": str(path),
         "checkpoint_sha256": sha256_file(path),
         "checkpoint_epoch": state["epoch"],
+        "training_seasons": list(options.train_seasons),
+        "validation_season": options.validation_season,
+        "held_out_test_season": options.test_season,
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "date_start": min(days).isoformat(),
         "date_end": max(days).isoformat(),

@@ -52,6 +52,126 @@ def test_kbo_commands_are_available_without_loading_catboost() -> None:
         assert result.exit_code == 0, result.output
 
 
+@pytest.mark.parametrize(
+    ("options", "train_seasons", "validation_season", "test_season", "chronological"),
+    [
+        ([], (2023,), 2024, 2025, False),
+        (
+            [
+                "--train-start-year", "2000", "--train-end-year", "2024",
+                "--validation-year", "2025", "--test-year", "2026", "--chronological",
+            ],
+            tuple(range(2000, 2025)),
+            2025,
+            2026,
+            True,
+        ),
+    ],
+)
+def test_relgnn_train_forwards_seasons_and_date_order_without_gpu(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    options: list[str],
+    train_seasons: tuple[int, ...],
+    validation_season: int,
+    test_season: int,
+    chronological: bool,
+) -> None:
+    from cpv26.training import kbo_runner
+
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    calls: list[tuple[Path, Path, kbo_runner.KBOTrainingConfig]] = []
+
+    def fake_train(
+        directory: Path, output: Path, *, config: kbo_runner.KBOTrainingConfig, **kwargs: Any
+    ) -> dict[str, Any]:
+        calls.append((directory, output, config))
+        assert kwargs["resume"] is None
+        return {"completed_epochs": 17, "best_epoch": 11, "smoke_test_only": False}
+
+    monkeypatch.setattr(kbo_runner, "train_kbo_relgnn", fake_train)
+    result = CliRunner().invoke(app, ["relgnn-train", *options])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    directory, output, config = calls[0]
+    assert directory == (runtime / "datasets" / "kbo_graph").resolve()
+    assert output.parent == (runtime / "runs" / "relgnn").resolve()
+    assert config.train_seasons == train_seasons
+    assert config.validation_season == validation_season
+    assert config.test_season == test_season
+    assert config.chronological is chronological
+    assert config.device == "cuda:0"
+    assert config.epochs == 30
+    assert config.batch_days == 2
+    assert f"{test_season} test was not used" in result.output
+    assert "Epochs: 17; best: 11" in result.output
+    assert not runtime.exists()
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (
+            ["--train-start-year", "2024", "--train-end-year", "2023"],
+            "must not exceed",
+        ),
+        (["--train-end-year", "2024"], "precede validation"),
+        (["--validation-year", "2023"], "precede validation"),
+        (["--test-year", "2024"], "precede validation"),
+    ],
+)
+def test_relgnn_train_rejects_invalid_splits_before_training(
+    tmp_path: Path, monkeypatch: MonkeyPatch, options: list[str], message: str
+) -> None:
+    from cpv26.training import kbo_runner
+
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    calls: list[bool] = []
+
+    def unexpected_train(*args: Any, **kwargs: Any) -> None:
+        calls.append(True)
+        pytest.fail("Invalid season splits must not reach model training")
+
+    monkeypatch.setattr(kbo_runner, "train_kbo_relgnn", unexpected_train)
+    result = CliRunner().invoke(app, ["relgnn-train", *options])
+    assert result.exit_code != 0
+    assert message in result.output
+    assert not calls
+    assert not runtime.exists()
+
+
+@pytest.mark.parametrize(
+    "option", ["--train-start-year", "--train-end-year", "--validation-year", "--test-year"]
+)
+@pytest.mark.parametrize("year", ["0", "10000"])
+def test_relgnn_train_rejects_years_outside_date_range(option: str, year: str) -> None:
+    result = CliRunner().invoke(app, ["relgnn-train", option, year])
+    assert result.exit_code == 2
+    assert "1<=x<=9999" in result.output
+
+
+def test_relgnn_season_help_describes_checkpoint_splits_and_epoch_date_order(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COLUMNS", "200")
+    runner = CliRunner()
+    train = runner.invoke(app, ["relgnn-train", "--help"], terminal_width=160)
+    assert train.exit_code == 0, train.output
+    for option in (
+        "--train-start-year", "--train-end-year", "--validation-year",
+        "--test-year", "--chronological",
+    ):
+        assert option in train.output
+    assert "within each epoch" in train.output
+    assert "not streaming" in train.output
+    evaluate = runner.invoke(app, ["relgnn-evaluate", "--help"], terminal_width=160)
+    assert evaluate.exit_code == 0, evaluate.output
+    assert "years come from the checkpoint" in evaluate.output
+    assert "test (2025)" not in evaluate.output
+
+
 def test_kbo_fetch_uses_runtime_directory_and_requested_year(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:

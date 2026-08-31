@@ -159,7 +159,7 @@ cpv26 relgnn-train \
   --amp auto
 ~~~
 
-학습·평가 시즌은 고정해서 구분합니다.
+위 명령의 기본 학습·평가 시즌은 다음과 같습니다.
 
 | 시즌 | 역할 |
 |---|---|
@@ -205,9 +205,57 @@ history.jsonl에서 진행 기록을, training_report.json에서 학습 요약�
 best.pt는 validation으로 선택한 평가용 모델이고, last.pt는 학습 재개용입니다.
 GPU를 사용할 수 없으면 오류로 끝나며 CPU 학습으로 자동 전환하지 않습니다.
 
+### 더 많은 시즌을 시간순으로 학습하기
+
+4절의 2023~2025년 적재를 마쳤다면 2026년 자료를 추가합니다. 현재 고정 원천은
+2023~2025년 정규시즌과 **2026년 7월 26일까지**이며, 2000~2022년 자료는 없습니다.
+아래 명령은 기존 그래프와 checkpoint를 보존하고 별도 그래프를 만듭니다.
+
+~~~bash
+cpv26 kbo-fetch --year 2026 &&
+cpv26 kbo-import --year 2026 --report var/reports/kbo_import_2026.json &&
+cpv26 db-check &&
+cpv26 kbo-graph-build \
+  --output var/datasets/kbo_graph_2023_2026 \
+  --start-date 2023-01-01 \
+  --end-date 2026-07-26
+~~~
+
+그래프 생성이 끝나면 실행합니다.
+
+~~~bash
+cpv26 relgnn-train \
+  --dataset var/datasets/kbo_graph_2023_2026 \
+  --train-start-year 2023 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
+  --device cuda:0 \
+  --epochs 30 \
+  --batch-days 1 \
+  --amp auto
+~~~
+
+학습 경기는 기존 2023년 720경기에서 **2023~2024년 1,440경기**로 늘어납니다.
+2025년은 검증·모델 선택, 2026년 부분 시즌은 별도 테스트입니다. 이미 결과를 확인한
+2025년을 다시 독립적인 최종 테스트로 취급하지 않습니다.
+
+`--chronological`은 날짜를 섞지 않고 2023년부터 2024년까지 순서대로 학습합니다.
+연도가 바뀌어도 가중치·optimizer를 유지하며, 다음 epoch에는 처음 날짜부터 다시
+학습합니다. 예측한 뒤 새 결과를 받아 갱신하는 온라인 학습은 아니며, 입력의 90일
+이력 범위는 그대로입니다. 옵션을 생략하면 기존처럼 학습 날짜를 섞습니다.
+
+run 폴더는 자동으로 새로 생성됩니다. 완료 로그에 나온 실제 폴더의 `best.pt`를
+다음 절의 `relgnn-evaluate --split test`로 평가하면 이 실행에서는 **2026년 부분 시즌**을
+평가합니다. `--resume`는 새 시즌 추가용이 아니라 같은 데이터·분할·순서 설정의 학습
+재개용입니다. 요청한 학습연도의 자료가 빠졌으면 오류로 중단합니다.
+2000~2022년까지 넓히려면 검증된 타석 원천과 그에 맞는 변환 코드가 먼저 필요합니다.
+
 ## 6. 2025 test 평가
 
-학습이 끝난 뒤 best.pt를 명시해 실행합니다.
+기본 2023/2024/2025 분할의 평가 예시입니다. 학습이 끝난 뒤 best.pt를 명시해 실행합니다.
+다년 학습 실행을 평가할 때는 checkpoint 경로를 해당 실행의 실제 `best.pt`로 바꿉니다.
 
 ~~~bash
 cpv26 relgnn-evaluate \
