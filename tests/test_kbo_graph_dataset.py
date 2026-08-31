@@ -224,6 +224,8 @@ def test_2001_game_only_graph_preserves_scores_without_fabricating_player_labels
             "box_pitch_queries": 0,
             "box_live_hit_queries": 0,
             "box_live_hit_unknown_pa_queries": 0,
+            "box_pa_outcomes": 0,
+            "box_pitch_observed_counts": 0,
             "box_target_missing_reasons": {},
         }
     ]

@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import numpy as np
 
+import cpv26.data.kbo_graph_dataset as graph_module
 from cpv26.data.kbo_graph_dataset import KBOGraphDataset, build_kbo_graph_dataset
 from cpv26.data.schema_v5 import V5_DDL
 from test_kbo_graph_dataset import _database
@@ -130,6 +131,8 @@ def test_boxscore_targets_use_actual_counts_and_missing_pa_lower_bounds(tmp_path
     assert coverage["box_pitching_rows"] == 2
     assert coverage["box_live_hit_queries"] == 3
     assert coverage["box_live_hit_unknown_pa_queries"] == 1
+    assert coverage["box_pa_outcomes"] == 8
+    assert coverage["box_pitch_observed_counts"] == 18
     assert coverage["box_target_missing_reasons"]["live_hit_no_observed_appearance"] == 1
 
 
@@ -294,3 +297,78 @@ def test_version_two_graph_cache_loads_with_empty_boxscore_defaults(tmp_path: Pa
     assert graph.player_box_batting_features.shape == (len(graph.player_ids), 19)
     assert not graph.player_box_batting_features.any()
     np.testing.assert_array_equal(graph.live_hit_pa, graph.live_hit_pa_min)
+
+
+def test_streamed_records_drop_unused_payload_only_after_full_provenance_hash(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _historical_database(database)
+    records, _, digest_before = graph_module._read_records(database, None)
+    boxes = [record for record in records if record.kind.startswith("box_")]
+    assert len(boxes) == 6
+    assert all("raw_json" not in record.data for record in boxes)
+    assert all("display_name" not in record.data for record in boxes)
+    before = build_kbo_graph_dataset(database, tmp_path / "before")
+    with duckdb.connect(str(database)) as connection:
+        # This unused source payload must remain part of provenance, even though
+        # it need not consume memory in every retained graph record.
+        connection.execute(
+            "UPDATE historical_boxscore SET raw_json=? WHERE observation_id='bat1'",
+            [json.dumps({"unused_original_source_field": "changed"})],
+        )
+        streamed = list(
+            graph_module._iter_dicts(
+                connection,
+                "SELECT observation_id FROM historical_boxscore ORDER BY observation_id",
+                chunk_size=2,
+            )
+        )
+        assert len(streamed) == 6
+    _, _, digest_after = graph_module._read_records(database, None)
+    after = build_kbo_graph_dataset(database, tmp_path / "after")
+    assert digest_after != digest_before
+    assert after.manifest["fingerprint"] != before.manifest["fingerprint"]
+    for day in before.days():
+        old, new = before.load_day(day), after.load_day(day)
+        for name in old.arrays:
+            np.testing.assert_array_equal(old.arrays[name], new.arrays[name])
+
+
+def test_all_missing_placeholder_is_audited_without_false_participation_history(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database, season=2001, include_pas=False)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(V5_DDL[0])
+        _box(connection, "missing-placeholder", 1, "batting", {})
+    dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
+    assert dataset.manifest["boxscore_history_policy"] == "observed_fields_only_v1"
+    first, second = dataset.load_day("2001-04-01"), dataset.load_day("2001-04-02")
+    assert first.live_hit_pa.size == first.box_pa_counts.size == 0
+    assert second.player_ids == ()
+    assert not second.team_box_batting_features.any()
+    assert not second.routes["batter_participation_team"]["source_index"].size
+    assert dataset.manifest["season_coverage"][0]["box_batting_rows"] == 1
+    assert (
+        dataset.manifest["season_coverage"][0]["box_target_missing_reasons"][
+            "live_hit_missing_or_unverified_hits"
+        ]
+        == 1
+    )
+
+
+def test_reported_zero_is_not_treated_as_an_all_missing_placeholder(tmp_path: Path) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database, season=2001, include_pas=False)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(V5_DDL[0])
+        _box(connection, "zero-ab", 1, "batting", {"at_bats": 0})
+    dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
+    second = dataset.load_day("2001-04-02")
+    prior = second.team_box_batting_features[second.team_ids.index("away")]
+    assert prior[0] == 0
+    assert prior[9] > 0  # The AB field was actually reported, although its value is zero.
+    assert prior[-1] > 0
+    assert len(second.routes["batter_participation_team"]["source_index"]) == 1

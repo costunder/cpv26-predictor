@@ -108,6 +108,10 @@ def test_relgnn_train_forwards_seasons_and_date_order_without_gpu(
     assert config.device == "cuda:0"
     assert config.epochs == 30
     assert config.batch_days == 2
+    assert config.max_pa_per_day == 0
+    assert config.max_edges_per_route_per_day == 0
+    assert config.box_pa_weight == 0.2
+    assert config.box_pitch_weight == 0.1
     assert f"{test_season} test was not used" in result.output
     assert "Epochs: 17; best: 11" in result.output
     assert not runtime.exists()
@@ -303,7 +307,8 @@ def test_kbo_history_import_forwards_years_checks_references_and_writes_coverage
         "total_rows": {"game": 532},
     }
 
-    def fake_import(store: Any, source: Path, *, years: Any) -> dict[str, Any]:
+    def fake_import(store: Any, source: Path, *, years: Any, progress: Any) -> dict[str, Any]:
+        assert callable(progress)
         assert store.connection.execute("SELECT count(*) FROM game").fetchone() == (0,)
         calls.append((source, tuple(years)))
         return report

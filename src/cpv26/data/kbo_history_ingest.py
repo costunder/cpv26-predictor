@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -191,6 +191,7 @@ def _import_boxscores(
     selected: tuple[KBOHistoryArtifact, ...],
     games: dict[str, HistoricalGame],
     now: datetime,
+    progress: Callable[[str], None] | None,
 ) -> dict[int, dict[str, Any]]:
     """Append one archive at a time, preserving raw rows and field-level masks.
 
@@ -201,6 +202,8 @@ def _import_boxscores(
     seen: dict[str, str] = {}
     coverage: dict[int, dict[str, Any]] = {}
     for artifact in selected:
+        if progress is not None:
+            progress(f"Reading player box scores: {artifact.filename}")
         source_id = f"kbo-history-box:v1:{artifact.filename}:{artifact.sha256}"
         box_rows: list[dict[str, Any]] = []
         details = []
@@ -293,8 +296,14 @@ def _import_boxscores(
                 "label_tier": "partial_player_boxscore",
             }, **_timestamps(first, now),
         }], ignore_existing=True)
-        store.append("historical_game_detail", details, ignore_existing=True, batch_size=256)
-        store.append("historical_boxscore", box_rows, ignore_existing=True, batch_size=256)
+        store.append(
+            "historical_game_detail", details, ignore_existing=True, batch_size=4096, columnar=True
+        )
+        store.append(
+            "historical_boxscore", box_rows, ignore_existing=True, batch_size=4096, columnar=True
+        )
+        if progress is not None:
+            progress(f"  staged {len(box_rows):,} player rows; commit follows full validation")
     for season in coverage.values():
         for field in ("quality_reasons", "source_fields"):
             season[field] = dict(sorted(season[field].items()))
@@ -308,6 +317,7 @@ def import_kbo_history(
     years: Iterable[int] | None = None,
     artifacts: tuple[KBOHistoryArtifact, ...] = KBO_HISTORY_FILES,
     ingested_at: datetime | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Atomically append archived games and every available player box-score row.
 
@@ -484,7 +494,7 @@ def import_kbo_history(
         before = _table_counts(store)
         for table in _CORE_TABLES:
             store.append(table, rows[table], ignore_existing=True, batch_size=256)
-        box_coverage = _import_boxscores(store, root, selected, unique, now)
+        box_coverage = _import_boxscores(store, root, selected, unique, now, progress)
         store.assert_referential_integrity()
         store.assert_composite_referential_integrity()
         totals = _table_counts(store)

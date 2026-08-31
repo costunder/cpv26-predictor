@@ -362,7 +362,7 @@ def kbo_history_import(
     try:
         settings.ensure_runtime_directories()
         with DuckDBStore(settings.database_path) as store:
-            report = import_kbo_history(store, directory, years=years)
+            report = import_kbo_history(store, directory, years=years, progress=console.print)
             store.assert_referential_integrity()
             store.assert_composite_referential_integrity()
         _write_json_report(output, report)

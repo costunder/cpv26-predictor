@@ -132,6 +132,7 @@ class DuckDBStore:
         self._transaction_active = False
         self._transaction_failed = False
         self._columns_cache: dict[str, tuple[str, ...]] = {}
+        self._column_types_cache: dict[str, dict[str, str]] = {}
         self._required_cache: dict[str, frozenset[str]] = {}
         if read_only:
             assert_schema_current(self._connection)
@@ -188,6 +189,7 @@ class DuckDBStore:
             columns = tuple(row[1] for row in rows)
             required = frozenset(row[1] for row in rows if bool(row[3]) and row[4] is None)
             self._columns_cache[table] = columns
+            self._column_types_cache[table] = {row[1]: row[2] for row in rows}
             self._required_cache[table] = required
             return columns
 
@@ -198,6 +200,7 @@ class DuckDBStore:
         *,
         ignore_existing: bool = False,
         batch_size: int = 1,
+        columnar: bool = False,
     ) -> int:
         """Append homogeneous rows and return the submitted row count.
 
@@ -205,12 +208,16 @@ class DuckDBStore:
         source ingestion retry-safe without modifying the existing row.
         ``batch_size`` optionally groups bound-parameter inserts after the same
         validation/normalization, within the same all-or-nothing transaction.
+        ``columnar`` opts into typed list parameters with fixed-size SQL, useful
+        for large batches of wide rows. Omitted columns still use DB defaults.
         """
 
         if self.read_only:
             raise PermissionError("cannot append through a read-only store")
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer")
+        if not isinstance(columnar, bool):
+            raise ValueError("columnar must be a boolean")
         self._validate_table(table)
         materialised = self._materialise_rows(rows)
         if not materialised:
@@ -237,6 +244,14 @@ class DuckDBStore:
         column_sql = ", ".join(f'"{column}"' for column in first_columns)
         conflict_sql = " ON CONFLICT DO NOTHING" if ignore_existing else ""
         sql = f'INSERT INTO "{table}" ({column_sql}) VALUES ({placeholders}){conflict_sql}'
+        if columnar:
+            # Types originate from the installed schema, never from row values.
+            # Explicit array casts also make all-null batches unambiguous.
+            types = self._column_types_cache[table]
+            projections = ", ".join(
+                f"unnest(CAST(? AS {types[column]}[]))" for column in first_columns
+            )
+            sql = f'INSERT INTO "{table}" ({column_sql}) SELECT {projections}{conflict_sql}'
         values = [
             [_normalise_value(column, row[column]) for column in first_columns]
             for row in materialised
@@ -248,7 +263,13 @@ class DuckDBStore:
             try:
                 if table == "prediction_run":
                     self._validate_new_prediction_runs(materialised)
-                if batch_size == 1:
+                if columnar:
+                    for offset in range(0, len(values), batch_size):
+                        batch = values[offset : offset + batch_size]
+                        self._connection.execute(
+                            sql, [list(column) for column in zip(*batch, strict=True)]
+                        )
+                elif batch_size == 1:
                     self._connection.executemany(sql, values)
                 else:
                     for offset in range(0, len(values), batch_size):

@@ -14,7 +14,7 @@ import json
 import math
 import os
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -393,6 +393,11 @@ class _History:
             ):
                 update(self.routes[route], key, record, record.values, add)
         elif record.kind.startswith("box_"):
+            if not record.box_values[len(record.box_values) // 2 :].any():
+                # An entirely missing placeholder remains in raw data and audit
+                # counts, but does not prove a historical participation or reset
+                # recency. Any actually reported field, including zero, is kept.
+                return
             role = data["role"]
             team = data["team_id"]
             # The archive has no verified stable player IDs. Keep observations
@@ -476,6 +481,7 @@ def build_kbo_graph_dataset(
         "dataset_version": GRAPH_DATASET_VERSION,
         "rolling_days": rolling_days,
         "pa_incomplete_transition_context": "mask_pre_scores_unknown",
+        "boxscore_history_policy": "observed_fields_only_v1",
         "cutoff_timezone": "Asia/Seoul",
         "cutoff_time": "00:00:00",
         "knowledge_at": knowledge_at.isoformat()
@@ -614,6 +620,8 @@ def build_kbo_graph_dataset(
                     "box_pitch_queries",
                     "box_live_hit_queries",
                     "box_live_hit_unknown_pa_queries",
+                    "box_pa_outcomes",
+                    "box_pitch_observed_counts",
                 )
             },
         },
@@ -672,6 +680,8 @@ def _season_coverage(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "box_pitch_queries",
         "box_live_hit_queries",
         "box_live_hit_unknown_pa_queries",
+        "box_pa_outcomes",
+        "box_pitch_observed_counts",
     )
     return [
         {
@@ -717,7 +727,7 @@ def _read_records(
                 ("box", "SELECT * FROM historical_boxscore ORDER BY observation_id, valid_from")
             )
         for kind, query in queries:
-            for row in _fetch_dicts(connection, query):
+            for row in _iter_dicts(connection, query):
                 if knowledge_at is not None and row["ingested_at"] > knowledge_at:
                     continue
                 if kind == "game" and (row["home_score"] is None or row["away_score"] is None):
@@ -778,6 +788,10 @@ def _read_records(
                     )
                 elif kind == "box":
                     record.box_values = _box_record_values(row)
+                    # The full source row has already contributed to the digest.
+                    # Keep only model/audit fields in hundreds of thousands of
+                    # in-memory records, not raw JSON or inning-token objects.
+                    record.data = _box_graph_data(row)
                 else:
                     home, away = row["home_score"], row["away_score"]
                     record.values = np.array(
@@ -808,6 +822,40 @@ def _fetch_dicts(connection: Any, query: str) -> list[dict[str, Any]]:
     cursor = connection.execute(query)
     names = [column[0] for column in cursor.description]
     return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+
+def _iter_dicts(connection: Any, query: str, chunk_size: int = 4096) -> Iterator[dict[str, Any]]:
+    """Stream records in bounded chunks without changing SQL ordering or hashes."""
+    cursor = connection.execute(query)
+    names = [column[0] for column in cursor.description]
+    while rows := cursor.fetchmany(chunk_size):
+        for row in rows:
+            yield dict(zip(names, row, strict=True))
+
+
+def _box_graph_data(row: Mapping[str, Any]) -> dict[str, Any]:
+    stats = row["stats_json"]
+    names = (
+        set(BOX_BATTING_FIELDS) | set(BOX_PITCHING_FIELDS) | {"counts_verified", "hits_verified"}
+    )
+    if stats.get("counts_verified"):
+        names.add("outcome_counts")
+    return {
+        **{
+            name: row[name]
+            for name in (
+                "game_id",
+                "observation_id",
+                "role",
+                "player_id",
+                "identity_status",
+                "team_id",
+                "opponent_team_id",
+            )
+        },
+        "stats_json": {name: stats[name] for name in names if name in stats},
+        "quality_json": row.get("quality_json", ()),
+    }
 
 
 def _label_records(records: list[_Record]) -> dict[date, list[_Record]]:
@@ -1265,12 +1313,13 @@ def _box_label_audit(labels: list[_Record]) -> dict[str, Any]:
     batting = [record for record in labels if record.kind == "box_batting"]
     pitching = [record for record in labels if record.kind == "box_pitching"]
     reasons: dict[str, int] = defaultdict(int)
-    live_known = live_unknown = pa_queries = pitch_queries = 0
+    live_known = live_unknown = pa_queries = pitch_queries = pa_outcomes = pitch_observed = 0
     for record in batting:
         stats = _box_stat_fields(record.data)
         pa, ab, hits = (stats.get(name) for name in ("plate_appearances", "at_bats", "hits"))
         if stats.get("counts_verified") and sum(stats.get("outcome_counts", ())) > 0:
             pa_queries += 1
+            pa_outcomes += sum(stats["outcome_counts"])
         else:
             reasons["box_pa_unverified_or_zero_counts"] += 1
         if not stats.get("hits_verified", True) or not _observed_nonnegative(hits):
@@ -1286,6 +1335,7 @@ def _box_label_audit(labels: list[_Record]) -> dict[str, Any]:
         observed = [_observed_nonnegative(stats.get(name)) for name in BOX_PITCHING_FIELDS]
         if any(observed):
             pitch_queries += 1
+            pitch_observed += sum(observed)
         else:
             reasons["box_pitch_no_observed_count_fields"] += 1
         for name, known in zip(BOX_PITCHING_FIELDS, observed, strict=True):
@@ -1316,6 +1366,8 @@ def _box_label_audit(labels: list[_Record]) -> dict[str, Any]:
         "box_pitch_queries": pitch_queries,
         "box_live_hit_queries": live_known + live_unknown,
         "box_live_hit_unknown_pa_queries": live_unknown,
+        "box_pa_outcomes": pa_outcomes,
+        "box_pitch_observed_counts": pitch_observed,
         "box_target_missing_reasons": dict(sorted(reasons.items())),
     }
 
