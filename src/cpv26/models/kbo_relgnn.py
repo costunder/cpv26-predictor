@@ -22,7 +22,7 @@ from ._torch import ModuleBase, nn, require_torch
 from .heads import DirectRunDistributionHead, WDLHead
 from .interaction import PlateAppearanceInteractionDecoder
 from .player_encoder import RoleAwarePlayerEncoder
-from .relgnn import CompositeRelGNNBackbone
+from .relgnn import CompositeRelGNNBackbone, RelGNNDiagnosticsObserver
 
 KBO_ROUTE_NAMES = (
     "batter_pa_pitcher",
@@ -239,7 +239,12 @@ class KBORelGNNModel(ModuleBase):
         cast(Any, self).register_buffer("pa_support", pa_support)
         cast(Any, self).register_buffer("hit_support", hit_support)
 
-    def forward(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+    def forward(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        diagnostics_observer: RelGNNDiagnosticsObserver | None = None,
+    ) -> dict[str, Any]:
         torch, _ = require_torch()
         if batch.get("_validated_on_cpu") is not True:
             raise ValueError("use collate_kbo_day_graphs to validate graph indices before forward")
@@ -268,6 +273,7 @@ class KBORelGNNModel(ModuleBase):
             batch["routes"],
             player_role_features=roles,
             validate_routes=False,
+            diagnostics_observer=diagnostics_observer,
         )
         teams = state.node_states["team"]
         batting = state.player_role_states["batting"]

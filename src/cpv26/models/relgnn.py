@@ -7,7 +7,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal, Protocol
 
 from cpv26.graph import (
     PLAYER_ROLE_NAMES,
@@ -35,6 +35,56 @@ def _state_channel(node_type: str, role: str) -> str:
 def _gate_key(route_name: str, reverse: bool) -> str:
     direction = "reverse" if reverse else "forward"
     return f"{route_name}__{direction}"
+
+
+class RelGNNDiagnosticsObserver(Protocol):
+    """Read-only observer for relational attention and route-gate diagnostics.
+
+    Tensor arguments are detached views of the values used by the forward
+    pass. Observers must treat them as read-only. The default model path has no
+    observer and therefore performs no diagnostic tensor work or host reads.
+    """
+
+    def observe_attention(
+        self,
+        *,
+        layer_index: int,
+        route_name: str,
+        direction: Literal["forward", "reverse"],
+        source_channel: str,
+        destination_channel: str,
+        source_index: Any,
+        destination_index: Any,
+        positive_weight: Any,
+        attention: Any,
+        message: Any,
+        route_mask: Any,
+        destination_state: Any,
+    ) -> None:
+        """Observe one directional route aggregation."""
+
+        ...
+
+    def observe_gates(
+        self,
+        *,
+        layer_index: int,
+        destination_channel: str,
+        route_names: tuple[str, ...],
+        directions: tuple[Literal["forward", "reverse"], ...],
+        source_channels: tuple[str, ...],
+        gate_keys: tuple[str, ...],
+        messages: Any,
+        masks: Any,
+        route_attention: Any,
+        previous_state: Any,
+        combined_message: Any,
+        candidate_state: Any,
+        updated_state: Any,
+    ) -> None:
+        """Observe learned route mixing and the resulting channel update."""
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +119,16 @@ class RelGNNState:
             }
         )
         return channels
+
+
+@dataclass(frozen=True, slots=True)
+class _IncomingRouteMessage:
+    message: Any
+    mask: Any
+    gate_key: str
+    route_name: str
+    direction: Literal["forward", "reverse"]
+    source_channel: str
 
 
 class _CompositeRouteAttention(ModuleBase):
@@ -151,6 +211,10 @@ class _CompositeRouteAttention(ModuleBase):
         *,
         reverse: bool,
         encoded_context: tuple[Any, Any] | None = None,
+        layer_index: int = 0,
+        source_channel: str = "",
+        destination_channel: str = "",
+        diagnostics_observer: RelGNNDiagnosticsObserver | None = None,
     ) -> tuple[Any, Any]:
         """Aggregate one direction with a softmax per destination and head."""
 
@@ -173,6 +237,7 @@ class _CompositeRouteAttention(ModuleBase):
             value_projection = self.forward_value
             output_projection = self.forward_output
 
+        direction: Literal["forward", "reverse"] = "reverse" if reverse else "forward"
         if batch.num_edges == 0:
             empty_messages = destination_state.new_zeros((destination_count, self.hidden_dim))
             empty_mask = torch.zeros(
@@ -180,6 +245,21 @@ class _CompositeRouteAttention(ModuleBase):
                 dtype=torch.bool,
                 device=destination_state.device,
             )
+            if diagnostics_observer is not None:
+                diagnostics_observer.observe_attention(
+                    layer_index=layer_index,
+                    route_name=batch.route_name,
+                    direction=direction,
+                    source_channel=source_channel,
+                    destination_channel=destination_channel,
+                    source_index=source_index.detach(),
+                    destination_index=destination_index.detach(),
+                    positive_weight=(batch.weights > 0).detach(),
+                    attention=destination_state.new_zeros((0, self.num_heads)).detach(),
+                    message=empty_messages.detach(),
+                    route_mask=empty_mask.detach(),
+                    destination_state=destination_state.detach(),
+                )
             return empty_messages, empty_mask
 
         context = source_projection(source_state[source_index])
@@ -256,6 +336,21 @@ class _CompositeRouteAttention(ModuleBase):
             aggregated_heads.reshape(destination_count, self.hidden_dim).to(value.dtype)
         )
         route_mask = denominator.sum(dim=-1) > 0
+        if diagnostics_observer is not None:
+            diagnostics_observer.observe_attention(
+                layer_index=layer_index,
+                route_name=batch.route_name,
+                direction=direction,
+                source_channel=source_channel,
+                destination_channel=destination_channel,
+                source_index=source_index.detach(),
+                destination_index=destination_index.detach(),
+                positive_weight=positive_weight.detach(),
+                attention=attention.detach(),
+                message=aggregate.detach(),
+                route_mask=route_mask.detach(),
+                destination_state=destination_state.detach(),
+            )
         return aggregate, route_mask
 
 
@@ -392,11 +487,15 @@ class _CompositeRouteLayer(ModuleBase):
         *,
         validate_routes: bool = True,
         reuse_route_context: bool = True,
+        layer_index: int = 0,
+        diagnostics_observer: RelGNNDiagnosticsObserver | None = None,
     ) -> RelGNNState:
         torch, _ = require_torch()
         channels = state.channels()
         strict_player_roles = bool(state.player_role_states)
-        incoming: dict[str, list[tuple[Any, Any, str]]] = {channel: [] for channel in channels}
+        incoming: dict[str, list[_IncomingRouteMessage]] = {
+            channel: [] for channel in channels
+        }
 
         for batch in route_batches:
             route = self.registry.require(batch.route_name)
@@ -430,9 +529,20 @@ class _CompositeRouteLayer(ModuleBase):
                 batch,
                 reverse=False,
                 encoded_context=encoded_context,
+                layer_index=layer_index,
+                source_channel=source_channel,
+                destination_channel=destination_channel,
+                diagnostics_observer=diagnostics_observer,
             )
             incoming[destination_channel].append(
-                (message, mask, _gate_key(batch.route_name, False))
+                _IncomingRouteMessage(
+                    message,
+                    mask,
+                    _gate_key(batch.route_name, False),
+                    batch.route_name,
+                    "forward",
+                    source_channel,
+                )
             )
             if route.bidirectional:
                 reverse_message, reverse_mask = attention.aggregate(
@@ -441,9 +551,20 @@ class _CompositeRouteLayer(ModuleBase):
                     batch,
                     reverse=True,
                     encoded_context=encoded_context,
+                    layer_index=layer_index,
+                    source_channel=destination_channel,
+                    destination_channel=source_channel,
+                    diagnostics_observer=diagnostics_observer,
                 )
                 incoming[source_channel].append(
-                    (reverse_message, reverse_mask, _gate_key(batch.route_name, True))
+                    _IncomingRouteMessage(
+                        reverse_message,
+                        reverse_mask,
+                        _gate_key(batch.route_name, True),
+                        batch.route_name,
+                        "reverse",
+                        destination_channel,
+                    )
                 )
 
         updated_channels = dict(channels)
@@ -451,12 +572,14 @@ class _CompositeRouteLayer(ModuleBase):
             previous = channels[channel]
             if not route_messages or int(previous.shape[0]) == 0:
                 continue
-            messages = torch.stack([item[0] for item in route_messages], dim=1)
-            masks = torch.stack([item[1] for item in route_messages], dim=1)
+            messages = torch.stack([item.message for item in route_messages], dim=1)
+            masks = torch.stack([item.mask for item in route_messages], dim=1)
             gate_scores = torch.cat(
                 [
-                    self.route_gates[gate_key](torch.cat((previous, message), dim=-1))
-                    for message, _, gate_key in route_messages
+                    self.route_gates[item.gate_key](
+                        torch.cat((previous, item.message), dim=-1)
+                    )
+                    for item in route_messages
                 ],
                 dim=1,
             )
@@ -474,11 +597,28 @@ class _CompositeRouteLayer(ModuleBase):
             ).clamp_min(torch.finfo(route_attention.dtype).tiny)
             combined = (route_attention.unsqueeze(-1) * messages).sum(dim=1)
             candidate = self.norms[channel](self.updaters[channel](combined, previous))
-            updated_channels[channel] = torch.where(
+            updated = torch.where(
                 any_message.unsqueeze(-1),
                 candidate,
                 previous,
             )
+            updated_channels[channel] = updated
+            if diagnostics_observer is not None:
+                diagnostics_observer.observe_gates(
+                    layer_index=layer_index,
+                    destination_channel=channel,
+                    route_names=tuple(item.route_name for item in route_messages),
+                    directions=tuple(item.direction for item in route_messages),
+                    source_channels=tuple(item.source_channel for item in route_messages),
+                    gate_keys=tuple(item.gate_key for item in route_messages),
+                    messages=messages.detach(),
+                    masks=masks.detach(),
+                    route_attention=route_attention.detach(),
+                    previous_state=previous.detach(),
+                    combined_message=combined.detach(),
+                    candidate_state=candidate.detach(),
+                    updated_state=updated.detach(),
+                )
 
         node_states = {node_type: updated_channels[node_type] for node_type in state.node_states}
         player_role_states = {
@@ -734,6 +874,7 @@ class CompositeRelGNNBackbone(ModuleBase):
         player_role_features: Mapping[str | PlayerRole, Any | None] | None = None,
         player_role_states: Mapping[str | PlayerRole, Any] | None = None,
         validate_routes: bool = True,
+        diagnostics_observer: RelGNNDiagnosticsObserver | None = None,
     ) -> RelGNNState:
         """Return entity and player-role states after relational propagation.
 
@@ -756,12 +897,14 @@ class CompositeRelGNNBackbone(ModuleBase):
             device=first_features.device,
             dtype=first_features.dtype,
         )
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
             state = layer(
                 state,
                 tensor_batches,
                 validate_routes=validate_routes,
                 reuse_route_context=self._execution_optimization_enabled,
+                layer_index=layer_index,
+                diagnostics_observer=diagnostics_observer,
             )
         return state
 
@@ -773,6 +916,7 @@ class CompositeRelGNNBackbone(ModuleBase):
         cutoff_at: datetime | None = None,
         player_role_features: Mapping[str | PlayerRole, Any | None] | None = None,
         player_role_states: Mapping[str | PlayerRole, Any] | None = None,
+        diagnostics_observer: RelGNNDiagnosticsObserver | None = None,
     ) -> dict[str, Any]:
         """Return entity states, preserving the original backbone return type."""
 
@@ -782,6 +926,7 @@ class CompositeRelGNNBackbone(ModuleBase):
             cutoff_at=cutoff_at,
             player_role_features=player_role_features,
             player_role_states=player_role_states,
+            diagnostics_observer=diagnostics_observer,
         )
         return dict(state.node_states)
 
@@ -793,6 +938,7 @@ class CompositeRelGNNBackbone(ModuleBase):
         dtype: Any = None,
         player_role_features: Mapping[str | PlayerRole, Any | None] | None = None,
         player_role_states: Mapping[str | PlayerRole, Any] | None = None,
+        diagnostics_observer: RelGNNDiagnosticsObserver | None = None,
     ) -> dict[str, Any]:
         """Tensorize and encode a validated point-in-time graph snapshot."""
 
@@ -811,6 +957,7 @@ class CompositeRelGNNBackbone(ModuleBase):
                 cutoff_at=snapshot.cutoff_at,
                 player_role_features=player_role_features,
                 player_role_states=player_role_states,
+                diagnostics_observer=diagnostics_observer,
             )
 
 

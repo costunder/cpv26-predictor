@@ -753,5 +753,87 @@ def relgnn_evaluate(
         console.print("[yellow]Checkpoint came from a limited-date smoke test.[/yellow]")
 
 
+@app.command("relgnn-graph-diagnose")
+def relgnn_graph_diagnose(
+    checkpoint: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
+    dataset: Annotated[
+        Path | None, typer.Option(help="Defaults to the checkpoint's graph dataset.")
+    ] = None,
+    split: Annotated[
+        str,
+        typer.Option(
+            help="validation (default), train, or test; use validation for redesign decisions."
+        ),
+    ] = "validation",
+    device: Annotated[str, typer.Option()] = "cuda:0",
+    amp: Annotated[str, typer.Option()] = "auto",
+    batch_days: Annotated[int, typer.Option(min=1)] = 2,
+    workers: Annotated[int, typer.Option(min=0)] = 2,
+    seed: Annotated[
+        int, typer.Option(min=0, help="Deterministic graph intervention seed.")
+    ] = 2026,
+    max_days: Annotated[
+        int | None,
+        typer.Option(min=1, help="Evenly sampled smoke limit; omit for the complete split."),
+    ] = None,
+    output: Annotated[Path | None, typer.Option(help="New diagnostic output directory.")] = None,
+) -> None:
+    """Measure whether one fixed checkpoint depends on graph routes and topology."""
+
+    try:
+        from cpv26.training.kbo_graph_diagnostic import diagnose_kbo_graph_dependence
+
+        report = diagnose_kbo_graph_dependence(
+            checkpoint,
+            dataset_directory=dataset,
+            split=split,
+            device=device,
+            amp=amp,
+            batch_days=batch_days,
+            workers=workers,
+            seed=seed,
+            max_days=max_days,
+            output_directory=output,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]RelGNN graph diagnostic failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title="Fixed-checkpoint graph dependence")
+    table.add_column("Condition")
+    table.add_column("Selection loss", justify="right")
+    table.add_column("Delta", justify="right")
+    table.add_column("Mean TV: match / hit marginal / pa", justify="right")
+    for name, condition in report["conditions"].items():
+        metrics = condition["metrics"]
+        delta = (condition.get("metric_delta_vs_intact") or {}).get("selection_loss")
+        sensitivity = condition.get("prediction_sensitivity_vs_intact") or {}
+        shifts = []
+        for task in ("match", "live_hit", "pa"):
+            value = (sensitivity.get(task) or {}).get("mean_total_variation")
+            shifts.append("-" if value is None else f"{float(value):.6f}")
+        table.add_row(
+            name,
+            f"{float(metrics['selection_loss']):.6f}",
+            "-" if delta is None else f"{float(delta):+.6f}",
+            " / ".join(shifts),
+        )
+    console.print(table)
+    report_path = Path(report["output_directory"]) / "report.json"
+    console.print(f"[green]Graph dependence report ready[/green]: {report_path}")
+    console.print(
+        "This is a fixed-checkpoint dependence test. Proving graph benefit requires "
+        "matched retraining against node-only and rewired controls."
+    )
+    if split == "test":
+        console.print(
+            "[yellow]Test was inspected; do not use this result to choose the redesign.[/yellow]"
+        )
+    if max_days is not None or report.get("smoke_test_only", False):
+        console.print(
+            "[yellow]Limited-date smoke diagnostic, not a complete-split result.[/yellow]"
+        )
+
+
 if __name__ == "__main__":
     app()

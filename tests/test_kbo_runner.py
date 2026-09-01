@@ -14,6 +14,7 @@ import pytest
 import cpv26.training.kbo_runner as runner_module
 from cpv26.data.kbo_graph_dataset import build_kbo_graph_dataset
 from cpv26.data.kbo_playbyplay import sha256_file
+from cpv26.training.kbo_graph_diagnostic import diagnose_kbo_graph_dependence
 from cpv26.training.kbo_runner import (
     KBOTrainingConfig,
     _float64_probabilities,
@@ -294,6 +295,76 @@ def test_real_graph_train_resume_and_test_artifacts(graph_directory: Path, tmp_p
     )
     assert report["metrics"] == repeated["metrics"]
     assert report["output_directory"] != repeated["output_directory"]
+
+
+def test_graph_dependence_diagnostic_runs_all_conditions_on_a_real_checkpoint(
+    graph_directory: Path, tmp_path: Path,
+) -> None:
+    pytest.importorskip("torch")
+    run = tmp_path / "diagnostic-training"
+    train_kbo_relgnn(graph_directory, run, config=_config(), progress=lambda _: None)
+    checkpoint = run / "best.pt"
+    checkpoint_hash = sha256_file(checkpoint)
+    standard = evaluate_kbo_relgnn(
+        checkpoint,
+        split="validation",
+        device="cpu",
+        amp="off",
+        batch_days=2,
+        workers=0,
+        output_directory=tmp_path / "standard-evaluation",
+    )
+
+    output = tmp_path / "graph-diagnostic"
+    report = diagnose_kbo_graph_dependence(
+        checkpoint,
+        dataset_directory=graph_directory,
+        split="validation",
+        device="cpu",
+        amp="off",
+        batch_days=2,
+        workers=0,
+        seed=17,
+        output_directory=output,
+    )
+
+    assert tuple(report["conditions"]) == (
+        "intact",
+        "no_routes",
+        "permuted_endpoints",
+        "permuted_edge_attributes",
+        "without_batter_pa_pitcher",
+        "without_batter_participation_team",
+        "without_pitcher_participation_team",
+        "without_home_team_game_away_team",
+    )
+    intact = report["conditions"]["intact"]
+    assert intact["metrics"] == standard["metrics"]
+    assert intact["metric_delta_vs_intact"]["selection_loss"] == pytest.approx(0.0)
+    assert intact["prediction_sensitivity_vs_intact"]["match"][
+        "mean_total_variation"
+    ] == pytest.approx(0.0)
+    assert intact["internal_diagnostics"]["attention"]["by_layer_route_direction"]
+    assert all(
+        condition["internal_diagnostics"] is None
+        for name, condition in report["conditions"].items()
+        if name != "intact"
+    )
+    assert report["conditions"]["no_routes"]["transform"]["edges_after"] == 0
+    assert report["conditions"]["permuted_endpoints"]["transform"][
+        "effective_changes"
+    ] > 0
+    assert report["checkpoint_sha256"] == checkpoint_hash == sha256_file(checkpoint)
+    assert report["split"] == "validation"
+    assert not report["smoke_test_only"]
+    assert report["internal_diagnostics_scope"] == "intact condition only"
+    assert "binary hit/no-hit marginal" in report["prediction_sensitivity_definitions"][
+        "live_hit"
+    ]
+    assert any("multiple intervention seeds" in item for item in report["limitations"])
+    saved = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert saved["checkpoint_sha256"] == checkpoint_hash
+    assert saved["dataset_fingerprint"] == report["dataset_fingerprint"]
 
 
 @pytest.mark.parametrize("chronological", [False, True])

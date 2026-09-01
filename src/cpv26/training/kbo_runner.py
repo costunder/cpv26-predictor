@@ -508,6 +508,8 @@ def _evaluate_model(
     dtype: Any,
     *,
     collect_predictions: bool = False,
+    batch_transform: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    diagnostics: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     torch, _ = require_torch()
     model.eval()
@@ -534,9 +536,20 @@ def _evaluate_model(
     box_pitch_counts = np.zeros(10, dtype=np.int64)
     with torch.inference_mode():
         for raw_batch in loader:
-            batch = _move(raw_batch, device)
+            prepared_batch = (
+                batch_transform(raw_batch) if batch_transform is not None else raw_batch
+            )
+            if diagnostics is not None:
+                begin_batch = getattr(diagnostics, "begin_batch", None)
+                if callable(begin_batch):
+                    begin_batch(prepared_batch)
+            batch = _move(prepared_batch, device)
             with torch.autocast(device.type, enabled=dtype is not None, dtype=dtype):
-                outputs = model(batch)
+                outputs = (
+                    model(batch, diagnostics_observer=diagnostics)
+                    if diagnostics is not None
+                    else model(batch)
+                )
                 losses = _losses(outputs, batch, config)
             batch_counts = _counts(batch, include_boxscore=include_boxscore)
             for name, count in batch_counts.items():

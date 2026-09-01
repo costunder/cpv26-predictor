@@ -364,6 +364,53 @@ batch/precision 변경을 허용한다는 것이 이전과 동일한 수치 경�
 분포 Parquet는 내보내지 않습니다. ECE를 계산하는 것과 calibration 모델을 학습·적용하는
 것은 다릅니다. 이 runner에는 OOF stacking이나 후처리 calibration이 자동 연결돼 있지 않습니다.
 
+## 고정 checkpoint 그래프 의존도 진단
+
+모델 크기나 그래프 schema를 바꾸기 전에는 같은 `best.pt`에서 관계 메시지를 실제로
+사용하는지 먼저 확인합니다. 진단 기본값은 test가 아니라 checkpoint의 validation split입니다.
+
+~~~bash
+cpv26 relgnn-graph-diagnose \
+  --checkpoint var/runs/relgnn/kbo_2001_2024_v5/best.pt \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --split validation \
+  --device cuda:0 \
+  --batch-days 1 \
+  --workers 0 \
+  --seed 2026
+~~~
+
+진단은 node feature, 질의, 정답과 checkpoint를 고정하고 route 입력만 바꿉니다.
+`intact`, 전체 route 제거, 날짜·관계 안에서의 endpoint 재배선, endpoint를 유지한
+edge attribute 순열, 관계별 단독 제거를 각각 평가합니다. 서로 다른 날짜의 노드를
+연결하지 않으며 조작 전후 edge 수와 실제로 변경된 항목을 `transform`에 기록합니다.
+같은 질의 ID와 라벨이 유지되지 않으면 비교 결과를 만들지 않습니다.
+
+조건별 보고 내용은 다음과 같습니다.
+
+- 원래 task별 metric과 selection loss
+- `intact` 대비 metric 변화. selection loss delta가 양수면 조작 후 손실이 증가한 것입니다.
+- 같은 질의별 확률분포의 total variation과 예측 class 변경률. Live Hit TV는 전체 PA×H
+  결합분포가 아니라 `안타 없음/한 개 이상` 이진 주변분포입니다.
+- 정상(`intact`) 조건의 layer·route·방향별 메시지 전달 내부 진단. intervention 조건은
+  동기화 비용을 피하기 위해 이 내부 통계를 수집하지 않습니다.
+- checkpoint SHA-256, 데이터 fingerprint, split 날짜, seed와 실행 환경
+
+`no_routes`와 endpoint 재배선에서 loss와 예측 확률이 거의 변하지 않으면 현재 checkpoint가
+관계 topology에 거의 의존하지 않는다는 근거입니다. 특정 `without_<route>`만 변화가 작으면
+그 관계의 현재 기여가 작을 가능성을 먼저 확인합니다. 내부 메시지가 작거나 gate가 한 관계로
+몰리는 현상도 함께 볼 수 있지만, 하나의 수치만으로 원인을 확정하지 않습니다.
+
+Endpoint·edge attribute 순열은 지정한 seed의 한 번의 조작입니다. 아주 작은 loss/TV 차이는
+반복한 정상 평가의 변동폭과 여러 intervention seed에서 같은 방향으로 재현되는지 확인합니다.
+
+반대로 조작 후 손실이 커지는 것은 고정 checkpoint가 그 입력에 의존한다는 뜻이지,
+GNN 구조가 node-only 모델보다 일반화 성능이 좋다는 뜻은 아닙니다. 구조 선택에는 동일한
+특징·분할·loss·학습 예산으로 원래 그래프, node-only, 재배선 control을 각각 처음부터
+여러 seed로 학습하는 비교가 추가로 필요합니다. 이 선택은 validation에서 마치고 test는
+마지막 한 번의 평가에 사용합니다. `--max-days` 결과는 실행 경로를 확인하는 smoke 진단으로만
+취급합니다.
+
 ## 아직 연결되지 않은 범위와 해석 한계
 
 출처의 `events`가 없는 구간은 완료 PA 라벨에 포함되지 않습니다. canonical PA만 보고

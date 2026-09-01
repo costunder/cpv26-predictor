@@ -291,6 +291,46 @@ GPU를 사용할 수 없으면 오류로 끝나며 CPU 학습으로 자동 전�
 `--box-gradient-mode head_only`로 집계 출력층만 학습할 수 있습니다. 이 옵션은 집계 손실이
 공유 표현을 학습하지 못하게 하므로 기본값이 아닙니다. 비교 시 다른 조건은 고정합니다.
 
+### 5-1. 다시 설계하기 전 그래프 의존도 확인
+
+`best.pt` 하나를 고정한 채 정상 입력과 관계 제거·재배선 입력을 같은 2025 validation에서
+비교합니다. 2026 test를 구조 선택에 사용하지 않도록 이 명령의 기본 split은 validation입니다.
+
+~~~bash
+cpv26 relgnn-graph-diagnose \
+  --checkpoint var/runs/relgnn/kbo_2001_2024_v5/best.pt \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --split validation \
+  --device cuda:0 \
+  --batch-days 1 \
+  --workers 0 \
+  --seed 2026
+~~~
+
+한 번의 실행에서 아래 조건을 비교합니다.
+
+- `intact`: 원래 그래프
+- `no_routes`: 모든 관계 메시지를 제거한 같은 checkpoint
+- `permuted_endpoints`: 날짜와 관계별로 endpoint만 재배선한 그래프
+- `permuted_edge_attributes`: endpoint는 유지하고 edge attribute 대응을 섞은 그래프
+- `without_<route>`: 관계 한 종류씩 제거한 그래프
+
+표의 `Delta`는 정상 그래프 대비 selection loss 변화입니다. 양수면 해당 조작에서 손실이
+커졌다는 뜻입니다. `Mean TV`는 같은 질의의 예측 확률이 얼마나 달라졌는지 나타내며,
+0에 가까우면 조작 전후 예측이 거의 같습니다. Live Hit TV는 전체 PA×H 결합분포가 아니라
+`안타 없음/한 개 이상` 이진 주변분포의 변화입니다. 재배선이 실제로 바꾼 endpoint 수와
+정상(`intact`) 입력의 관계별 메시지 크기·gate·attention 진단을 포함한 전체 결과는 터미널에
+표시된 `report.json`에서 확인합니다. intervention 내부 통계는 동기화 비용을 피하기 위해
+수집하지 않습니다. `--max-days N`은 날짜를 줄인 실행 확인용이며 전체 validation 결과가
+아닙니다. 아주 작은 Delta/TV는 반복한 정상 평가의 변동폭과 여러 intervention seed에서 다시
+확인합니다.
+
+이 검사는 **이미 학습된 checkpoint가 현재 그래프에 의존하는지** 확인합니다. 관계를 없앴을 때
+성능이 떨어져도 GNN이 더 좋은 모델이라는 증명은 아닙니다. 구조를 확정하기 전에는 같은 분할,
+특징, loss, seed와 학습 예산으로 원래 그래프·node-only·재배선 모델을 각각 새로 학습하고
+여러 seed로 비교해야 합니다. 그 결정까지 validation에서 하고 2026 test는 마지막 평가에만
+사용합니다.
+
 ## 6. 2026 부분 시즌 test 평가
 
 5절 학습이 끝난 뒤 best.pt를 명시해 실행합니다. 다른 run 이름을 썼다면 경로도 바꿉니다.

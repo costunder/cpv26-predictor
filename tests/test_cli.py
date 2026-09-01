@@ -51,6 +51,7 @@ def test_kbo_commands_are_available_without_loading_catboost() -> None:
         "kbo-graph-build",
         "relgnn-train",
         "relgnn-evaluate",
+        "relgnn-graph-diagnose",
     ):
         result = runner.invoke(app, [command, "--help"])
         assert result.exit_code == 0, result.output
@@ -215,6 +216,92 @@ def test_relgnn_season_help_describes_checkpoint_splits_and_epoch_date_order(
     evaluate_text = Text.from_ansi(evaluate.output).plain
     assert "years come from the checkpoint" in evaluate_text
     assert "test (2025)" not in evaluate_text
+
+    diagnose = runner.invoke(app, ["relgnn-graph-diagnose", "--help"], terminal_width=160)
+    assert diagnose.exit_code == 0, diagnose.output
+    diagnose_text = Text.from_ansi(diagnose.output).plain
+    for option in (
+        "--checkpoint", "--dataset", "--split", "--device", "--amp", "--batch-days",
+        "--workers", "--seed", "--max-days", "--output",
+    ):
+        assert option in diagnose_text
+    assert "validation (default)" in diagnose_text
+    assert "fixed checkpoint" in diagnose_text
+
+
+def test_relgnn_graph_diagnose_forwards_options_and_prints_compact_deltas(
+    tmp_path: Path, monkeypatch: MonkeyPatch,
+) -> None:
+    from cpv26.training import kbo_graph_diagnostic
+
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint fixture")
+    dataset = tmp_path / "graphs"
+    output = tmp_path / "diagnostic"
+    calls: list[tuple[Path, dict[str, Any]]] = []
+
+    def fake_diagnose(path: Path, **options: Any) -> dict[str, Any]:
+        calls.append((path, options))
+        return {
+            "output_directory": str(output),
+            "conditions": {
+                "intact": {
+                    "metrics": {"selection_loss": 4.0},
+                    "metric_delta_vs_intact": {"selection_loss": 0.0},
+                    "prediction_sensitivity_vs_intact": {},
+                },
+                "no_routes": {
+                    "metrics": {"selection_loss": 4.25},
+                    "metric_delta_vs_intact": {"selection_loss": 0.25},
+                    "prediction_sensitivity_vs_intact": {
+                        "match": {"mean_total_variation": 0.01},
+                        "live_hit": {"mean_total_variation": 0.02},
+                        "pa": {"mean_total_variation": 0.03},
+                    },
+                },
+            },
+        }
+
+    monkeypatch.setattr(kbo_graph_diagnostic, "diagnose_kbo_graph_dependence", fake_diagnose)
+    result = CliRunner().invoke(
+        app,
+        [
+            "relgnn-graph-diagnose",
+            "--checkpoint", str(checkpoint),
+            "--dataset", str(dataset),
+            "--device", "cpu",
+            "--amp", "off",
+            "--batch-days", "3",
+            "--workers", "0",
+            "--seed", "7",
+            "--max-days", "5",
+            "--output", str(output),
+        ],
+        terminal_width=200,
+    )
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    path, options = calls[0]
+    assert path == checkpoint
+    assert options == {
+        "dataset_directory": dataset,
+        "split": "validation",
+        "device": "cpu",
+        "amp": "off",
+        "batch_days": 3,
+        "workers": 0,
+        "seed": 7,
+        "max_days": 5,
+        "output_directory": output,
+    }
+    plain = Text.from_ansi(result.output).plain
+    assert "no_routes" in plain
+    assert "+0.250000" in plain
+    assert "0.010000 / 0.020000 / 0.030000" in plain
+    assert output.name in plain
+    assert "report.json" in plain
+    assert "matched retraining" in plain
+    assert "Limited-date smoke diagnostic" in plain
 
 
 def test_kbo_fetch_uses_runtime_directory_and_requested_year(
