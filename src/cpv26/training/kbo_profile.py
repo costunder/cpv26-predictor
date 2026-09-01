@@ -37,6 +37,7 @@ from cpv26.training.kbo_runner import (
     _move,
     _read_checkpoint,
     _runtime_memory,
+    _validate_checkpoint_graph_control,
 )
 from cpv26.training.optimizer_state import make_adamw
 
@@ -380,6 +381,7 @@ def profile_run(
         raise ValueError("checkpoint/dataset fingerprint mismatch")
     # config.json is not rewritten on resume; the checkpoint has the actual last settings.
     config = KBOTrainingConfig.from_dict(state["training_config"])
+    _validate_checkpoint_graph_control(state, config)
     config = replace(
         config, device=device, amp="off" if device == "cpu" else config.amp,
         batch_days=config.batch_days if batch_days is None else batch_days,

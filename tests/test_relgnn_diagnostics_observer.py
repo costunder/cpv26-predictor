@@ -69,6 +69,8 @@ class _RecordingObserver:
         directions: tuple[str, ...],
         source_channels: tuple[str, ...],
         gate_keys: tuple[str, ...],
+        message_normalization: str,
+        pre_normalization_messages: Any,
         messages: Any,
         masks: Any,
         route_attention: Any,
@@ -84,6 +86,8 @@ class _RecordingObserver:
             directions=directions,
             source_channels=source_channels,
             gate_keys=gate_keys,
+            message_normalization=message_normalization,
+            pre_normalization_messages=pre_normalization_messages,
             messages=messages,
             masks=masks,
             route_attention=route_attention,
@@ -96,7 +100,11 @@ class _RecordingObserver:
         self.gate_events.append(event)
 
 
-def _model_and_batch() -> tuple[Any, dict[str, Any]]:
+def _model_and_batch(
+    *,
+    route_message_normalization: str = "none",
+    route_schedule: Any = None,
+) -> tuple[Any, dict[str, Any]]:
     torch.manual_seed(83)
     model = KBORelGNNModel(
         KBORelGNNConfig(
@@ -108,6 +116,8 @@ def _model_and_batch() -> tuple[Any, dict[str, Any]]:
             num_attention_heads=2,
             dropout=0.0,
             pa_context_dim=0,
+            route_message_normalization=route_message_normalization,
+            route_schedule=route_schedule,
         )
     )
     route = TorchAtomicRouteBatch(
@@ -202,7 +212,9 @@ def test_observer_exposes_detached_directional_tensors_without_changing_forward(
     for event in observer.gate_events:
         assert event["route_names"] == ("batter_pa_pitcher",)
         assert len(event["directions"]) == len(event["source_channels"]) == 1
+        assert event["message_normalization"] == "none"
         assert event["messages"].shape == (3, 1, 4)
+        assert torch.equal(event["pre_normalization_messages"], event["messages"])
         assert event["masks"].shape == (3, 1)
         assert event["route_attention"].shape == (3, 1)
 
@@ -211,3 +223,133 @@ def test_default_observer_does_not_add_checkpoint_state() -> None:
     model, _ = _model_and_batch()
 
     assert all("diagnostic" not in name for name in model.state_dict())
+
+
+def test_default_message_combine_stacks_once_per_updated_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, batch = _model_and_batch()
+    expected = model(batch)
+    original_stack = torch.stack
+    message_stack_calls = 0
+
+    def counted_stack(values: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal message_stack_calls
+        tensors = tuple(values)
+        if tensors and all(value.ndim == 2 and value.shape[-1] == 4 for value in tensors):
+            message_stack_calls += 1
+        return original_stack(tensors, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "stack", counted_stack)
+
+    without_observer = model(batch)
+    assert message_stack_calls == 4
+    _assert_tree_equal(expected, without_observer)
+
+    message_stack_calls = 0
+    observer = _RecordingObserver()
+    with_observer = model(batch, diagnostics_observer=observer)
+    assert message_stack_calls == 4
+    _assert_tree_equal(expected, with_observer)
+    for event in observer.gate_events:
+        assert (
+            event["pre_normalization_messages"].untyped_storage().data_ptr()
+            == event["messages"].untyped_storage().data_ptr()
+        )
+
+
+def test_parameter_free_message_layer_norm_preserves_checkpoint_keys_and_is_observable() -> None:
+    default_model, batch = _model_and_batch()
+    normalized_model, _ = _model_and_batch(route_message_normalization="layer_norm")
+    result = normalized_model.load_state_dict(default_model.state_dict(), strict=True)
+    assert not result.missing_keys
+    assert not result.unexpected_keys
+    assert default_model.state_dict().keys() == normalized_model.state_dict().keys()
+    observer = _RecordingObserver()
+
+    normalized_model(batch, diagnostics_observer=observer)
+
+    attention_messages = {
+        (event["layer_index"], event["destination_channel"]): event["message"]
+        for event in observer.attention_events
+    }
+    assert observer.gate_events
+    changed = False
+    for event in observer.gate_events:
+        assert event["message_normalization"] == "layer_norm"
+        before = event["pre_normalization_messages"]
+        gate_input = event["messages"]
+        mask = event["masks"]
+        assert torch.equal(
+            before[:, 0],
+            attention_messages[(event["layer_index"], event["destination_channel"])],
+        )
+        active = gate_input[mask]
+        torch.testing.assert_close(
+            active.mean(dim=-1),
+            torch.zeros(active.shape[0]),
+            rtol=0,
+            atol=1e-6,
+        )
+        assert bool((active.var(dim=-1, unbiased=False) > 0.99).all())
+        changed = changed or not torch.equal(before[mask], active)
+    assert changed
+
+
+def test_route_schedule_selects_direction_per_layer_and_round_trips_json_lists() -> None:
+    schedule = [
+        ["batter_pa_pitcher__forward"],
+        ["batter_pa_pitcher__reverse"],
+    ]
+    model, batch = _model_and_batch(route_schedule=schedule)
+    observer = _RecordingObserver()
+
+    model(batch, diagnostics_observer=observer)
+
+    assert model.config.route_schedule == tuple(tuple(layer) for layer in schedule)
+    serialized = model.config.to_dict()
+    assert serialized["route_schedule"] == schedule
+    assert KBORelGNNConfig(**serialized).route_schedule == model.config.route_schedule
+    assert [
+        (event["layer_index"], event["direction"])
+        for event in observer.attention_events
+    ] == [(0, "forward"), (1, "reverse")]
+    assert [
+        (event["layer_index"], event["destination_channel"])
+        for event in observer.gate_events
+    ] == [(0, "player__pitching"), (1, "player__batting")]
+
+
+def test_explicit_full_schedule_is_bit_exact_with_default_schedule() -> None:
+    default_model, batch = _model_and_batch()
+    full_schedule = [
+        ["batter_pa_pitcher__forward", "batter_pa_pitcher__reverse"],
+        ["batter_pa_pitcher__forward", "batter_pa_pitcher__reverse"],
+    ]
+    scheduled_model, _ = _model_and_batch(route_schedule=full_schedule)
+    scheduled_model.load_state_dict(default_model.state_dict(), strict=True)
+
+    _assert_tree_equal(default_model(batch), scheduled_model(batch))
+
+
+@pytest.mark.parametrize(
+    ("normalization", "schedule", "message"),
+    [
+        ("invalid", None, "route_message_normalization"),
+        ("none", [[]], "exactly 2 layer"),
+        ("none", [["unknown__forward"], []], "unavailable gate"),
+        (
+            "none",
+            [["batter_pa_pitcher__forward", "batter_pa_pitcher__forward"], []],
+            "duplicate gate",
+        ),
+    ],
+)
+def test_route_controls_reject_invalid_configuration(
+    normalization: str, schedule: Any, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _model_and_batch(
+            route_message_normalization=normalization,
+            route_schedule=schedule,
+        )

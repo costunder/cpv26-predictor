@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import json
+from dataclasses import asdict, replace
+from datetime import date
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -8,6 +11,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import cpv26.data.kbo_graph_dataset as graph_dataset_module  # noqa: E402
+import cpv26.training.kbo_graph_diagnostic as diagnostic_module  # noqa: E402
+import cpv26.training.kbo_runner as runner  # noqa: E402
 from cpv26.models.kbo_relgnn import (  # noqa: E402
     KBO_ROUTE_NAMES,
     KBORelGNNConfig,
@@ -18,6 +24,7 @@ from cpv26.training.kbo_graph_diagnostic import (  # noqa: E402
     KBOGraphBatchTransform,
     KBOGraphTransformSpec,
     RelGNNDiagnosticsCollector,
+    diagnose_kbo_graph_dependence,
     paired_prediction_sensitivity,
     recursive_numeric_metric_deltas,
     transform_kbo_graph_batch,
@@ -344,6 +351,8 @@ def test_collector_separates_forced_and_competitive_attention_gates_and_updates(
     previous = torch.ones((3, 4))
     candidate = previous + 0.5
     masks = torch.tensor([[True, False], [True, True], [False, False]])
+    pre_normalization_messages = torch.full((3, 2, 4), 2.0)
+    gate_input_messages = torch.ones((3, 2, 4))
     collector.observe_gates(
         layer_index=0,
         destination_channel="team",
@@ -351,7 +360,9 @@ def test_collector_separates_forced_and_competitive_attention_gates_and_updates(
         directions=("forward", "reverse"),
         source_channels=("player__batting", "team"),
         gate_keys=("route_a__forward", "route_b__reverse"),
-        messages=torch.ones((3, 2, 4)),
+        message_normalization="layer_norm",
+        pre_normalization_messages=pre_normalization_messages,
+        messages=gate_input_messages,
         masks=masks,
         route_attention=torch.tensor([[1.0, 0.0], [0.25, 0.75], [0.0, 0.0]]),
         previous_state=previous,
@@ -360,6 +371,7 @@ def test_collector_separates_forced_and_competitive_attention_gates_and_updates(
         updated_state=torch.where(masks.any(dim=1, keepdim=True), candidate, previous),
     )
     report = collector.report()
+    assert report["schema_version"] == 2
     attention = report["attention"]["by_layer_route_direction"]["layer_0|batter_pa_pitcher|forward"]
     assert attention["forced_singleton_destinations"] == 1
     assert attention["competitive_destinations"] == 1
@@ -371,13 +383,36 @@ def test_collector_separates_forced_and_competitive_attention_gates_and_updates(
     assert gates["forced_singleton_fraction"] == pytest.approx(0.5)
     route_gate = report["route_gates"]["by_route_direction"]["layer_0|team|route_b|reverse"]
     assert route_gate["competitive_winner_fraction"] == pytest.approx(1.0)
-    assert route_gate["raw_message_norm"]["count"] == 1
+    assert route_gate["message_normalization"] == "layer_norm"
+    assert route_gate["pre_normalization_message_norm"] == {
+        "count": 1,
+        "mean": pytest.approx(4.0),
+        "std": pytest.approx(0.0),
+        "min": pytest.approx(4.0),
+        "max": pytest.approx(4.0),
+    }
+    assert route_gate["gate_input_message_norm"]["mean"] == pytest.approx(2.0)
+    assert route_gate["gate_weighted_input_message_norm"]["mean"] == pytest.approx(1.5)
+    assert route_gate["raw_message_norm"] == route_gate["pre_normalization_message_norm"]
+    assert route_gate["gate_weighted_message_norm"] == route_gate[
+        "gate_weighted_input_message_norm"
+    ]
+    assert report["route_gates"]["compatibility_aliases"] == {
+        "raw_message_norm": "pre_normalization_message_norm",
+        "gate_weighted_message_norm": "gate_weighted_input_message_norm",
+    }
+    assert "before optional message normalization" in report["route_gates"][
+        "message_norm_definitions"
+    ]["pre_normalization_message_norm"]
+    assert "actual message supplied" in report["route_gates"]["message_norm_definitions"][
+        "gate_input_message_norm"
+    ]
     assert gates["actual_update_norm"]["count"] == 2
 
 
 def test_real_model_accepts_collector_and_emits_every_diagnostic_family() -> None:
     torch.manual_seed(17)
-    model = KBORelGNNModel(
+    model: Any = KBORelGNNModel(
         KBORelGNNConfig(
             node_feature_dims={"player": 4, "team": 8},
             role_feature_dims={"batting": 8, "pitching": 8},
@@ -386,8 +421,10 @@ def test_real_model_accepts_collector_and_emits_every_diagnostic_family() -> Non
             num_layers=1,
             num_attention_heads=2,
             dropout=0.0,
+            route_message_normalization="layer_norm",
         )
-    ).eval()
+    )
+    model.eval()
     batch = collate_kbo_day_graphs([_day()])
     collector = RelGNNDiagnosticsCollector()
     collector.begin_batch(batch)
@@ -397,6 +434,21 @@ def test_real_model_accepts_collector_and_emits_every_diagnostic_family() -> Non
     assert len(report["attention"]["by_layer_route_direction"]) == 8
     assert report["route_gates"]["by_layer_channel"]
     assert report["topology"]["query_counts"]["match"] == 1
+    route_reports = tuple(report["route_gates"]["by_route_direction"].values())
+    assert route_reports
+    assert all(item["message_normalization"] == "layer_norm" for item in route_reports)
+    assert all(
+        "pre_normalization_message_norm" in item
+        and "gate_input_message_norm" in item
+        and "gate_weighted_input_message_norm" in item
+        for item in route_reports
+    )
+    assert any(
+        item["pre_normalization_message_norm"]["count"]
+        and item["pre_normalization_message_norm"]["mean"]
+        != pytest.approx(item["gate_input_message_norm"]["mean"])
+        for item in route_reports
+    )
 
 
 def test_transform_spec_validation_is_strict() -> None:
@@ -410,3 +462,121 @@ def test_transform_spec_validation_is_strict() -> None:
     with pytest.raises(ValueError, match="non-negative integer"):
         # Constructor validation must not accept bool as an integer seed.
         KBOGraphTransformSpec(seed=True)
+
+
+@pytest.mark.parametrize(
+    ("saved_protocol", "message"),
+    [
+        (None, "missing its graph-control protocol"),
+        ("mismatch", "graph-control protocol differs"),
+    ],
+)
+def test_diagnostic_rejects_rewired_checkpoint_without_matching_saved_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    saved_protocol: str | None,
+    message: str,
+) -> None:
+    config = runner.KBOTrainingConfig(
+        device="cpu",
+        amp="off",
+        workers=0,
+        graph_control="permuted_endpoints",
+        graph_control_seed=73,
+    )
+    state: dict[str, Any] = {"training_config": asdict(config)}
+    if saved_protocol == "mismatch":
+        state["graph_control"] = runner._graph_control_report(
+            replace(config, graph_control_seed=74)
+        )
+    monkeypatch.setattr(runner, "_read_checkpoint", lambda _: state)
+
+    def unexpected_runtime(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("checkpoint lineage must be rejected before runtime setup")
+
+    monkeypatch.setattr(runner, "_device_and_precision", unexpected_runtime)
+    with pytest.raises(ValueError, match=message):
+        diagnose_kbo_graph_dependence(
+            tmp_path / "rewired.pt",
+            device="cpu",
+            amp="off",
+            workers=0,
+        )
+
+
+def test_diagnostic_allows_and_reports_legacy_intact_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "legacy-intact.pt"
+    checkpoint.write_bytes(b"legacy checkpoint fixture")
+    output = tmp_path / "diagnostic"
+    config = runner.KBOTrainingConfig(device="cpu", amp="off", workers=0)
+    state: dict[str, Any] = {
+        "training_config": asdict(config),
+        "dataset_directory": str(tmp_path / "graphs"),
+        "dataset_fingerprint": "fixture-fingerprint",
+        "model_config": {},
+        "model": {},
+        "epoch": 3,
+    }
+
+    class FakeDataset:
+        manifest = {"fingerprint": "fixture-fingerprint"}
+
+    class FakeModel:
+        def load_state_dict(self, state_dict: Any) -> None:
+            assert state_dict == {}
+
+        def to(self, device: Any) -> FakeModel:
+            return self
+
+        def eval(self) -> FakeModel:
+            return self
+
+    def fake_evaluate(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        return {"selection_loss": 1.0}, {}
+
+    monkeypatch.setattr(runner, "_read_checkpoint", lambda _: state)
+    monkeypatch.setattr(
+        runner,
+        "_device_and_precision",
+        lambda *args, **kwargs: (torch.device("cpu"), None, {"precision": "fp32"}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_split_days",
+        lambda *args, **kwargs: {
+            "train": (date(2023, 4, 1),),
+            "validation": (date(2024, 4, 1),),
+            "test": (date(2025, 4, 1),),
+        },
+    )
+    monkeypatch.setattr(runner, "_loader", lambda *args, **kwargs: ())
+    monkeypatch.setattr(runner, "_evaluate_model", fake_evaluate)
+    monkeypatch.setattr(runner, "_runtime_memory", lambda _: {})
+    monkeypatch.setattr(graph_dataset_module, "KBOGraphDataset", lambda _: FakeDataset())
+    monkeypatch.setattr(diagnostic_module, "KBORelGNNConfig", lambda **kwargs: kwargs)
+    monkeypatch.setattr(diagnostic_module, "KBORelGNNModel", lambda _: FakeModel())
+    monkeypatch.setattr(
+        diagnostic_module,
+        "_condition_specs",
+        lambda *args, **kwargs: (("intact", KBOGraphTransformSpec("intact")),),
+    )
+
+    report = diagnose_kbo_graph_dependence(
+        checkpoint,
+        device="cpu",
+        amp="off",
+        workers=0,
+        output_directory=output,
+        include_edge_attribute_permutation=False,
+    )
+
+    protocol = report["checkpoint_graph_control"]
+    assert protocol == {
+        **runner._graph_control_report(config),
+        "legacy_checkpoint_default": True,
+    }
+    saved = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert saved["checkpoint_graph_control"] == protocol

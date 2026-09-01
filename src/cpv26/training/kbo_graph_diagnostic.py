@@ -717,6 +717,8 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
             "route_names",
             "directions",
             "gate_keys",
+            "message_normalization",
+            "pre_normalization_messages",
             "messages",
             "masks",
             "route_attention",
@@ -728,23 +730,41 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
         missing = required - event.keys()
         if missing:
             raise ValueError(f"gate diagnostic event is missing {sorted(missing)}")
+        message_normalization = str(event["message_normalization"])
+        if message_normalization not in {"none", "layer_norm"}:
+            raise ValueError("gate diagnostic message_normalization is unsupported")
         key = f"layer_{event['layer_index']}|{event['destination_channel']}"
         bucket = self._gates.setdefault(
             key,
             {
                 "layer_index": int(event["layer_index"]),
                 "destination_channel": str(event["destination_channel"]),
+                "message_normalization": message_normalization,
                 "calls": 0,
                 "nodes_with_messages": 0,
                 "forced_singleton_nodes": 0,
                 "competitive_nodes": 0,
             },
         )
+        if bucket["message_normalization"] != message_normalization:
+            raise ValueError("gate diagnostic events mix message normalization policies")
         bucket["calls"] += 1
         masks = event["masks"].detach().bool()
         weights = event["route_attention"].detach().float()
         if masks.shape != weights.shape or masks.ndim != 2:
             raise ValueError("route gate masks and attention must share shape [nodes, routes]")
+        pre_normalization_messages = event["pre_normalization_messages"].detach().float()
+        gate_input_messages = event["messages"].detach().float()
+        if (
+            gate_input_messages.ndim != 3
+            or pre_normalization_messages.ndim != 3
+            or tuple(gate_input_messages.shape[:2]) != tuple(masks.shape)
+            or tuple(pre_normalization_messages.shape) != tuple(gate_input_messages.shape)
+        ):
+            raise ValueError(
+                "pre-normalization and gate-input messages must share shape "
+                "[nodes, routes, hidden]"
+            )
         active_count = masks.sum(dim=1)
         any_message = active_count > 0
         forced_nodes = active_count == 1
@@ -783,6 +803,7 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
                     "source_channel": source_channel,
                     "route_name": route_name,
                     "direction": direction,
+                    "message_normalization": message_normalization,
                     "active_nodes": 0,
                     "competitive_nodes": 0,
                 },
@@ -793,10 +814,18 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
             _moments(target, "competitive_gate_weight").add(
                 weights[masks[:, index] & competitive_nodes, index]
             )
-            message_norm = event["messages"].detach().float()[:, index].norm(dim=-1)
-            _moments(target, "raw_message_norm").add(message_norm[masks[:, index]])
-            _moments(target, "gate_weighted_message_norm").add(
-                message_norm[masks[:, index]] * weights[masks[:, index], index]
+            active = masks[:, index]
+            pre_normalization_norm = pre_normalization_messages[:, index].norm(dim=-1)
+            gate_input_norm = gate_input_messages[:, index].norm(dim=-1)
+            gate_weighted_input_norm = (
+                gate_input_messages[:, index] * weights[:, index, None]
+            ).norm(dim=-1)
+            _moments(target, "pre_normalization_message_norm").add(
+                pre_normalization_norm[active]
+            )
+            _moments(target, "gate_input_message_norm").add(gate_input_norm[active])
+            _moments(target, "gate_weighted_input_message_norm").add(
+                gate_weighted_input_norm[active]
             )
             if bool(competitive_nodes.any()):
                 winners = weights.argmax(dim=1) == index
@@ -879,12 +908,22 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
         gate_routes: dict[str, Any] = {}
         for key, value in sorted(self._gate_routes.items()):
             route_item = _report_bucket(value)
+            # Schema-v1 readers used these shorter names.  Keep them as exact
+            # report aliases while schema v2 makes each position around the
+            # optional normalization boundary explicit.
+            route_item["raw_message_norm"] = dict(
+                route_item["pre_normalization_message_norm"]
+            )
+            route_item["gate_weighted_message_norm"] = dict(
+                route_item["gate_weighted_input_message_norm"]
+            )
             competitive = int(value["competitive_nodes"])
             route_item["competitive_winner_fraction"] = (
                 int(value.get("competitive_winner_count", 0)) / competitive if competitive else None
             )
             gate_routes[key] = route_item
         return {
+            "schema_version": 2,
             "batches": self._batches,
             "days": len(self._days),
             "topology": {
@@ -902,6 +941,22 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
                 "forced_singleton_definition": (
                     "one active incoming route for a node; route-gate weight is forced to 1"
                 ),
+                "message_norm_definitions": {
+                    "pre_normalization_message_norm": (
+                        "L2 norm of the route aggregate before optional message normalization"
+                    ),
+                    "gate_input_message_norm": (
+                        "L2 norm of the actual message supplied to the route gate and combiner"
+                    ),
+                    "gate_weighted_input_message_norm": (
+                        "L2 norm after multiplying the actual gate-input message by its "
+                        "route-gate weight"
+                    ),
+                },
+                "compatibility_aliases": {
+                    "raw_message_norm": "pre_normalization_message_norm",
+                    "gate_weighted_message_norm": "gate_weighted_input_message_norm",
+                },
                 "by_layer_channel": gate_channels,
                 "by_route_direction": gate_routes,
             },
@@ -984,6 +1039,7 @@ def diagnose_kbo_graph_dependence(
         seed=seed,
         max_days_per_split=max_days if max_days is not None else options.max_days_per_split,
     )
+    checkpoint_graph_control = runner._validate_checkpoint_graph_control(state, options)
     selected, dtype, runtime = runner._device_and_precision(device, amp)
     directory = Path(dataset_directory or state["dataset_directory"]).expanduser().resolve()
     dataset = KBOGraphDataset(directory)
@@ -1054,6 +1110,7 @@ def diagnose_kbo_graph_dependence(
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "checkpoint_epoch": int(state["epoch"]),
+        "checkpoint_graph_control": checkpoint_graph_control,
         "dataset_directory": str(directory),
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "split": split,

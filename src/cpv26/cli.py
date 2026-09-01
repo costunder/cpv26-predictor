@@ -622,6 +622,21 @@ def relgnn_train(
     weight_decay: Annotated[float, typer.Option(min=0.0)] = 0.0001,
     amp: Annotated[str, typer.Option(help="auto selects GPU bf16/fp16; off uses fp32.")] = "auto",
     workers: Annotated[int, typer.Option(min=0, help="CPU graph-loading worker processes.")] = 2,
+    seed: Annotated[
+        int | None, typer.Option(min=0, help="Training/order seed; defaults to CPV26_RANDOM_SEED.")
+    ] = None,
+    route_message_normalization: Annotated[
+        str, typer.Option(help="Route message normalization: none or layer_norm.")
+    ] = "none",
+    route_schedule: Annotated[
+        str, typer.Option(help="Route schedule: full, staged, core, or node_only.")
+    ] = "full",
+    graph_control: Annotated[
+        str, typer.Option(help="Graph control: intact or permuted_endpoints.")
+    ] = "intact",
+    graph_control_seed: Annotated[
+        int, typer.Option(min=0, help="Epoch-independent graph-control seed.")
+    ] = 2026,
     accumulate_steps: Annotated[int, typer.Option(min=1)] = 1,
     max_pa_per_day: Annotated[
         int, typer.Option(min=0, help="Training PA limit per day; 0 uses every query.")
@@ -692,12 +707,16 @@ def relgnn_train(
             selection_target=selection_target,
             box_gradient_mode=box_gradient_mode,
             patience=patience,
-            seed=settings.random_seed,
+            seed=settings.random_seed if seed is None else seed,
             max_days_per_split=max_days_per_split,
             train_seasons=tuple(range(train_start_year, train_end_year + 1)),
             validation_season=validation_year,
             test_season=test_year,
             chronological=chronological,
+            route_message_normalization=route_message_normalization,
+            route_schedule=route_schedule,
+            graph_control=graph_control,
+            graph_control_seed=graph_control_seed,
         )
         report = train_kbo_relgnn(
             directory, output, config=config, resume=resume, progress=console.print
@@ -712,6 +731,170 @@ def relgnn_train(
     console.print(
         f"{config.test_season} test was not used; "
         "evaluate best.pt explicitly with relgnn-evaluate."
+    )
+
+
+@app.command("relgnn-ablation-train")
+def relgnn_ablation_train(
+    dataset: Annotated[
+        Path | None, typer.Option(help="Default: CPV26_HOME/datasets/kbo_graph.")
+    ] = None,
+    suite_dir: Annotated[
+        Path | None,
+        typer.Option(help="Matched-suite directory; reuse it to resume interrupted runs."),
+    ] = None,
+    device: Annotated[str, typer.Option(help="CUDA device for every matched run.")] = "cuda:0",
+    epochs: Annotated[int, typer.Option(min=1, help="Equal total epoch budget per run.")] = 30,
+    seed: Annotated[
+        list[int] | None,
+        typer.Option(
+            "--seed",
+            min=0,
+            help="Repeat for paired training seeds; default: CPV26_RANDOM_SEED.",
+        ),
+    ] = None,
+    graph_control_seed: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Fixed rewiring seed, independent of training seed and epoch.",
+        ),
+    ] = 2026,
+    train_start_year: Annotated[
+        int, typer.Option(min=1, max=9999, help="First training season, inclusive.")
+    ] = 2023,
+    train_end_year: Annotated[
+        int, typer.Option(min=1, max=9999, help="Last training season, inclusive.")
+    ] = 2023,
+    validation_year: Annotated[
+        int,
+        typer.Option(min=1, max=9999, help="Only split used to select and compare models."),
+    ] = 2024,
+    test_year: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=9999,
+            help="Held-out metadata only; this command never loads or evaluates it.",
+        ),
+    ] = 2025,
+    chronological: Annotated[
+        bool, typer.Option(help="Visit training dates oldest first within every epoch.")
+    ] = False,
+    batch_days: Annotated[int, typer.Option(min=1)] = 2,
+    hidden_dim: Annotated[int, typer.Option(min=4)] = 64,
+    layers: Annotated[int, typer.Option(min=1)] = 2,
+    heads: Annotated[int, typer.Option(min=1)] = 4,
+    dropout: Annotated[float, typer.Option(min=0.0, max=0.99)] = 0.1,
+    learning_rate: Annotated[float, typer.Option(min=1e-10)] = 0.0003,
+    weight_decay: Annotated[float, typer.Option(min=0.0)] = 0.0001,
+    amp: Annotated[str, typer.Option(help="auto selects GPU bf16/fp16; off uses fp32.")] = "auto",
+    workers: Annotated[int, typer.Option(min=0)] = 2,
+    accumulate_steps: Annotated[int, typer.Option(min=1)] = 1,
+    max_pa_per_day: Annotated[
+        int, typer.Option(min=0, help="Training PA limit per day; 0 uses every query.")
+    ] = 0,
+    max_edges_per_route: Annotated[
+        int, typer.Option(min=0, help="Relation edge limit per route; 0 uses every edge.")
+    ] = 0,
+    box_pa_weight: Annotated[float, typer.Option(min=0.0)] = 0.2,
+    box_pitch_weight: Annotated[float, typer.Option(min=0.0)] = 0.1,
+    selection_target: Annotated[
+        str, typer.Option(help="Checkpoint criterion: auto/weighted or match log loss.")
+    ] = "auto",
+    box_gradient_mode: Annotated[
+        str, typer.Option(help="auto/shared trains all layers; head_only isolates box decoders.")
+    ] = "auto",
+    max_days_per_split: Annotated[
+        int | None,
+        typer.Option(min=1, help="Explicit smoke limit per train/validation split."),
+    ] = None,
+) -> None:
+    """Retrain six graph variants from matched seeds and compare validation only."""
+    if train_start_year > train_end_year:
+        raise typer.BadParameter(
+            "--train-start-year must not exceed --train-end-year.",
+            param_hint="--train-start-year",
+        )
+    settings = _settings()
+    selected_seeds = seed or [settings.random_seed]
+    directory = (dataset or settings.home / "datasets" / "kbo_graph").expanduser().resolve()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    output = (
+        suite_dir
+        or settings.home / "runs" / "relgnn_ablations" / f"{stamp}-{uuid4().hex[:8]}"
+    ).expanduser().resolve()
+    console.print(
+        f"[yellow]Matched retraining starts {6 * len(selected_seeds)} runs "
+        f"(6 variants x {len(selected_seeds)} seeds); this can take much longer "
+        "than one run.[/yellow]"
+    )
+    console.print(
+        f"[yellow]{test_year} test is metadata only and will not be loaded or evaluated.[/yellow]"
+    )
+    try:
+        from cpv26.training.kbo_matched_ablation import train_matched_graph_ablations
+        from cpv26.training.kbo_runner import KBOTrainingConfig
+
+        config = KBOTrainingConfig(
+            device=device,
+            epochs=epochs,
+            batch_days=batch_days,
+            hidden_dim=hidden_dim,
+            layers=layers,
+            heads=heads,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            amp=amp,
+            workers=workers,
+            accumulate_steps=accumulate_steps,
+            max_pa_per_day=max_pa_per_day,
+            max_edges_per_route_per_day=max_edges_per_route,
+            box_pa_weight=box_pa_weight,
+            box_pitch_weight=box_pitch_weight,
+            selection_target=selection_target,
+            box_gradient_mode=box_gradient_mode,
+            patience=0,
+            seed=selected_seeds[0],
+            max_days_per_split=max_days_per_split,
+            train_seasons=tuple(range(train_start_year, train_end_year + 1)),
+            validation_season=validation_year,
+            test_season=test_year,
+            chronological=chronological,
+            graph_control_seed=graph_control_seed,
+        )
+        report = train_matched_graph_ablations(
+            directory,
+            output,
+            base_config=config,
+            seeds=selected_seeds,
+            progress=console.print,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]Matched RelGNN ablation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title="Matched validation-only graph ablation")
+    table.add_column("variant")
+    table.add_column("selection loss mean", justify="right")
+    table.add_column("population std", justify="right")
+    table.add_column("paired delta vs full", justify="right")
+    table.add_column("parameters", justify="right")
+    for variant, values in report["aggregate"].items():
+        selection = values["validation_selection_loss"]
+        table.add_row(
+            variant,
+            f"{selection['mean']:.6f}",
+            f"{selection['population_std']:.6f}",
+            f"{selection['paired_delta_vs_full_mean']:+.6f}",
+            f"{values['parameter_count']:,}",
+        )
+    console.print(table)
+    console.print(f"[green]Matched ablation finished[/green]: {output}")
+    console.print(f"Report: {output / 'matched_retraining_report.json'}")
+    console.print(
+        f"{test_year} test was not loaded or evaluated; all comparisons above use validation only."
     )
 
 

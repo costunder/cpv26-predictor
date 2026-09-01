@@ -50,6 +50,7 @@ def test_kbo_commands_are_available_without_loading_catboost() -> None:
         "gpu-check",
         "kbo-graph-build",
         "relgnn-train",
+        "relgnn-ablation-train",
         "relgnn-evaluate",
         "relgnn-graph-diagnose",
     ):
@@ -115,6 +116,10 @@ def test_relgnn_train_forwards_seasons_and_date_order_without_gpu(
     assert config.box_pitch_weight == 0.1
     assert config.selection_target == "auto"
     assert config.box_gradient_mode == "auto"
+    assert config.seed == 2026
+    assert config.route_message_normalization == "none"
+    assert config.route_schedule == "full"
+    assert config.graph_control == "intact"
     assert f"{test_season} test was not used" in result.output
     assert "Epochs: 17; best: 11" in result.output
     assert not runtime.exists()
@@ -228,6 +233,20 @@ def test_relgnn_season_help_describes_checkpoint_splits_and_epoch_date_order(
     assert "validation (default)" in diagnose_text
     assert "fixed checkpoint" in diagnose_text
 
+    ablation = runner.invoke(app, ["relgnn-ablation-train", "--help"], terminal_width=200)
+    assert ablation.exit_code == 0, ablation.output
+    ablation_text = Text.from_ansi(ablation.output).plain
+    for option in (
+        "--suite-dir",
+        "--seed",
+        "--graph-control-seed",
+        "--validation-year",
+        "--test-year",
+    ):
+        assert option in ablation_text
+    assert "validation only" in ablation_text
+    assert "never loads or evaluates" in ablation_text
+
 
 def test_relgnn_graph_diagnose_forwards_options_and_prints_compact_deltas(
     tmp_path: Path, monkeypatch: MonkeyPatch,
@@ -302,6 +321,74 @@ def test_relgnn_graph_diagnose_forwards_options_and_prints_compact_deltas(
     assert "report.json" in plain
     assert "matched retraining" in plain
     assert "Limited-date smoke diagnostic" in plain
+
+
+def test_relgnn_ablation_train_forwards_repeated_seeds_and_prints_protocol(
+    tmp_path: Path, monkeypatch: MonkeyPatch,
+) -> None:
+    from cpv26.training import kbo_matched_ablation
+
+    runtime = tmp_path / "runtime"
+    dataset = tmp_path / "graph"
+    output = tmp_path / "suite"
+    monkeypatch.setenv("CPV26_HOME", str(runtime))
+    calls: list[dict[str, Any]] = []
+
+    def fake_train(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"args": args, **kwargs})
+        aggregate = {
+            variant: {
+                "validation_selection_loss": {
+                    "mean": 4.0 + index / 10,
+                    "population_std": 0.01,
+                    "paired_delta_vs_full_mean": index / 10,
+                },
+                "parameter_count": 1234,
+            }
+            for index, variant in enumerate(kbo_matched_ablation.MATCHED_GRAPH_VARIANTS)
+        }
+        return {"aggregate": aggregate}
+
+    monkeypatch.setattr(kbo_matched_ablation, "train_matched_graph_ablations", fake_train)
+    result = CliRunner().invoke(
+        app,
+        [
+            "relgnn-ablation-train",
+            "--dataset", str(dataset),
+            "--suite-dir", str(output),
+            "--train-start-year", "2001",
+            "--train-end-year", "2024",
+            "--validation-year", "2025",
+            "--test-year", "2026",
+            "--device", "cpu",
+            "--amp", "off",
+            "--workers", "0",
+            "--epochs", "3",
+            "--seed", "11",
+            "--seed", "12",
+            "--graph-control-seed", "91",
+        ],
+        terminal_width=200,
+    )
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["args"] == (dataset.resolve(), output.resolve())
+    assert call["seeds"] == [11, 12]
+    config = call["base_config"]
+    assert config.seed == 11
+    assert config.graph_control_seed == 91
+    assert config.patience == 0
+    assert config.train_seasons == tuple(range(2001, 2025))
+    assert config.validation_season == 2025
+    assert config.test_season == 2026
+    plain = Text.from_ansi(result.output).plain
+    compact = " ".join(plain.split())
+    assert "12 runs" in plain
+    assert "much longer than one run" in compact
+    assert "metadata only" in plain
+    assert "validation only" in compact
+    assert "matched_retraining_report.json" in plain
 
 
 def test_kbo_fetch_uses_runtime_directory_and_requested_year(

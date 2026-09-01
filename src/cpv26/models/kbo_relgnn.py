@@ -22,7 +22,11 @@ from ._torch import ModuleBase, nn, require_torch
 from .heads import DirectRunDistributionHead, WDLHead
 from .interaction import PlateAppearanceInteractionDecoder
 from .player_encoder import RoleAwarePlayerEncoder
-from .relgnn import CompositeRelGNNBackbone, RelGNNDiagnosticsObserver
+from .relgnn import (
+    CompositeRelGNNBackbone,
+    RelGNNDiagnosticsObserver,
+    _normalize_route_schedule,
+)
 
 KBO_ROUTE_NAMES = (
     "batter_pa_pitcher",
@@ -90,6 +94,8 @@ class KBORelGNNConfig:
     box_batting_feature_dim: int = 19
     box_pitching_feature_dim: int = 21
     box_gradient_mode: str = "shared"
+    route_message_normalization: str = "none"
+    route_schedule: tuple[tuple[str, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         for name in ("node_feature_dims", "role_feature_dims", "route_feature_dims"):
@@ -127,6 +133,18 @@ class KBORelGNNConfig:
             raise ValueError("box-score feature widths must be positive")
         if self.box_gradient_mode not in {"shared", "head_only"}:
             raise ValueError("box_gradient_mode must be shared or head_only")
+        if self.route_message_normalization not in {"none", "layer_norm"}:
+            raise ValueError("route_message_normalization must be none or layer_norm")
+        object.__setattr__(
+            self,
+            "route_schedule",
+            _normalize_route_schedule(
+                self.route_schedule,
+                num_layers=self.num_layers,
+                route_names=self.route_feature_dims,
+                registry=kbo_route_registry(),
+            ),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +163,12 @@ class KBORelGNNConfig:
             "box_batting_feature_dim": self.box_batting_feature_dim,
             "box_pitching_feature_dim": self.box_pitching_feature_dim,
             "box_gradient_mode": self.box_gradient_mode,
+            "route_message_normalization": self.route_message_normalization,
+            "route_schedule": (
+                None
+                if self.route_schedule is None
+                else [list(layer) for layer in self.route_schedule]
+            ),
         }
 
 
@@ -182,6 +206,8 @@ class KBORelGNNModel(ModuleBase):
             dropout=config.dropout,
             player_encoder=encoder,
             registry=kbo_route_registry(),
+            route_message_normalization=config.route_message_normalization,
+            route_schedule=config.route_schedule,
         )
         self.match_head: Any = WDLHead(
             config.hidden_dim,

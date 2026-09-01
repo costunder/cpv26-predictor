@@ -7,7 +7,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from cpv26.graph import (
     PLAYER_ROLE_NAMES,
@@ -35,6 +35,62 @@ def _state_channel(node_type: str, role: str) -> str:
 def _gate_key(route_name: str, reverse: bool) -> str:
     direction = "reverse" if reverse else "forward"
     return f"{route_name}__{direction}"
+
+
+_ROUTE_MESSAGE_NORMALIZATIONS = frozenset(("none", "layer_norm"))
+
+
+def _normalize_route_schedule(
+    route_schedule: Any,
+    *,
+    num_layers: int,
+    route_names: Iterable[str],
+    registry: RouteRegistry,
+) -> tuple[tuple[str, ...], ...] | None:
+    """Normalize a JSON-compatible per-layer route-direction schedule."""
+
+    if route_schedule is None:
+        return None
+    if isinstance(route_schedule, (str, bytes)):
+        raise ValueError("route_schedule must be a sequence with one route list per layer")
+    try:
+        raw_layers = tuple(route_schedule)
+    except TypeError as exc:
+        raise ValueError(
+            "route_schedule must be a sequence with one route list per layer"
+        ) from exc
+    if len(raw_layers) != num_layers:
+        raise ValueError(f"route_schedule must contain exactly {num_layers} layer entries")
+
+    allowed: set[str] = set()
+    for route_name in route_names:
+        route = registry.require(route_name)
+        allowed.add(_gate_key(route_name, False))
+        if route.bidirectional:
+            allowed.add(_gate_key(route_name, True))
+
+    normalized: list[tuple[str, ...]] = []
+    for layer_index, raw_layer in enumerate(raw_layers):
+        if isinstance(raw_layer, (str, bytes)):
+            raise ValueError(f"route_schedule layer {layer_index} must be a sequence of gate keys")
+        try:
+            gate_keys = tuple(raw_layer)
+        except TypeError as exc:
+            raise ValueError(
+                f"route_schedule layer {layer_index} must be a sequence of gate keys"
+            ) from exc
+        if any(not isinstance(gate_key, str) for gate_key in gate_keys):
+            raise ValueError(f"route_schedule layer {layer_index} gate keys must be strings")
+        if len(set(gate_keys)) != len(gate_keys):
+            raise ValueError(f"route_schedule layer {layer_index} contains duplicate gate keys")
+        unknown = set(gate_keys) - allowed
+        if unknown:
+            raise ValueError(
+                f"route_schedule layer {layer_index} contains unavailable gate keys: "
+                f"{sorted(unknown)}"
+            )
+        normalized.append(gate_keys)
+    return tuple(normalized)
 
 
 class RelGNNDiagnosticsObserver(Protocol):
@@ -74,6 +130,8 @@ class RelGNNDiagnosticsObserver(Protocol):
         directions: tuple[Literal["forward", "reverse"], ...],
         source_channels: tuple[str, ...],
         gate_keys: tuple[str, ...],
+        message_normalization: Literal["none", "layer_norm"],
+        pre_normalization_messages: Any,
         messages: Any,
         masks: Any,
         route_attention: Any,
@@ -123,7 +181,8 @@ class RelGNNState:
 
 @dataclass(frozen=True, slots=True)
 class _IncomingRouteMessage:
-    message: Any
+    pre_normalization_message: Any
+    gate_input_message: Any
     mask: Any
     gate_key: str
     route_name: str
@@ -367,11 +426,13 @@ class _CompositeRouteLayer(ModuleBase):
         num_heads: int,
         dropout: float,
         include_publication_delay: bool,
+        route_message_normalization: Literal["none", "layer_norm"],
     ) -> None:
         require_torch()
         super().__init__()
         self.hidden_dim = hidden_dim
         self.registry = registry
+        self.route_message_normalization = route_message_normalization
         self.messages = nn.ModuleDict(
             {
                 route_name: _CompositeRouteAttention(
@@ -404,6 +465,11 @@ class _CompositeRouteLayer(ModuleBase):
             nn.Tanh(),
             nn.Linear(self.hidden_dim, 1, bias=False),
         )
+
+    def _gate_input_message(self, message: Any) -> Any:
+        if self.route_message_normalization == "none":
+            return message
+        return nn.functional.layer_norm(message, (self.hidden_dim,))
 
     @staticmethod
     def _endpoint_channel(
@@ -489,6 +555,7 @@ class _CompositeRouteLayer(ModuleBase):
         reuse_route_context: bool = True,
         layer_index: int = 0,
         diagnostics_observer: RelGNNDiagnosticsObserver | None = None,
+        enabled_gate_keys: frozenset[str] | None = None,
     ) -> RelGNNState:
         torch, _ = require_torch()
         channels = state.channels()
@@ -518,33 +585,46 @@ class _CompositeRouteLayer(ModuleBase):
             if validate_routes:
                 self._validate_tensor_batch(route, batch, source_state, destination_state)
 
+            forward_gate_key = _gate_key(batch.route_name, False)
+            reverse_gate_key = _gate_key(batch.route_name, True)
+            forward_enabled = (
+                enabled_gate_keys is None or forward_gate_key in enabled_gate_keys
+            )
+            reverse_enabled = route.bidirectional and (
+                enabled_gate_keys is None or reverse_gate_key in enabled_gate_keys
+            )
+            if not forward_enabled and not reverse_enabled:
+                continue
+
             attention = self.messages[batch.route_name]
             encoded_context = None
             if reuse_route_context and route.bidirectional and batch.num_edges:
                 encoded_context = attention.encode_route_context(batch)
 
-            message, mask = attention.aggregate(
-                source_state,
-                destination_state,
-                batch,
-                reverse=False,
-                encoded_context=encoded_context,
-                layer_index=layer_index,
-                source_channel=source_channel,
-                destination_channel=destination_channel,
-                diagnostics_observer=diagnostics_observer,
-            )
-            incoming[destination_channel].append(
-                _IncomingRouteMessage(
-                    message,
-                    mask,
-                    _gate_key(batch.route_name, False),
-                    batch.route_name,
-                    "forward",
-                    source_channel,
+            if forward_enabled:
+                message, mask = attention.aggregate(
+                    source_state,
+                    destination_state,
+                    batch,
+                    reverse=False,
+                    encoded_context=encoded_context,
+                    layer_index=layer_index,
+                    source_channel=source_channel,
+                    destination_channel=destination_channel,
+                    diagnostics_observer=diagnostics_observer,
                 )
-            )
-            if route.bidirectional:
+                incoming[destination_channel].append(
+                    _IncomingRouteMessage(
+                        message,
+                        self._gate_input_message(message),
+                        mask,
+                        forward_gate_key,
+                        batch.route_name,
+                        "forward",
+                        source_channel,
+                    )
+                )
+            if reverse_enabled:
                 reverse_message, reverse_mask = attention.aggregate(
                     destination_state,
                     source_state,
@@ -559,8 +639,9 @@ class _CompositeRouteLayer(ModuleBase):
                 incoming[source_channel].append(
                     _IncomingRouteMessage(
                         reverse_message,
+                        self._gate_input_message(reverse_message),
                         reverse_mask,
-                        _gate_key(batch.route_name, True),
+                        reverse_gate_key,
                         batch.route_name,
                         "reverse",
                         destination_channel,
@@ -572,12 +653,23 @@ class _CompositeRouteLayer(ModuleBase):
             previous = channels[channel]
             if not route_messages or int(previous.shape[0]) == 0:
                 continue
-            messages = torch.stack([item.message for item in route_messages], dim=1)
+            messages = torch.stack(
+                [item.gate_input_message for item in route_messages], dim=1
+            )
+            pre_normalization_messages = None
+            if diagnostics_observer is not None:
+                pre_normalization_messages = (
+                    messages
+                    if self.route_message_normalization == "none"
+                    else torch.stack(
+                        [item.pre_normalization_message for item in route_messages], dim=1
+                    )
+                )
             masks = torch.stack([item.mask for item in route_messages], dim=1)
             gate_scores = torch.cat(
                 [
                     self.route_gates[item.gate_key](
-                        torch.cat((previous, item.message), dim=-1)
+                        torch.cat((previous, item.gate_input_message), dim=-1)
                     )
                     for item in route_messages
                 ],
@@ -604,6 +696,7 @@ class _CompositeRouteLayer(ModuleBase):
             )
             updated_channels[channel] = updated
             if diagnostics_observer is not None:
+                assert pre_normalization_messages is not None
                 diagnostics_observer.observe_gates(
                     layer_index=layer_index,
                     destination_channel=channel,
@@ -611,6 +704,8 @@ class _CompositeRouteLayer(ModuleBase):
                     directions=tuple(item.direction for item in route_messages),
                     source_channels=tuple(item.source_channel for item in route_messages),
                     gate_keys=tuple(item.gate_key for item in route_messages),
+                    message_normalization=self.route_message_normalization,
+                    pre_normalization_messages=pre_normalization_messages.detach(),
                     messages=messages.detach(),
                     masks=masks.detach(),
                     route_attention=route_attention.detach(),
@@ -652,6 +747,8 @@ class CompositeRelGNNBackbone(ModuleBase):
         include_publication_delay: bool = False,
         player_encoder: RoleAwarePlayerEncoder | None = None,
         registry: RouteRegistry | None = None,
+        route_message_normalization: str = "none",
+        route_schedule: Any = None,
     ) -> None:
         require_torch()
         super().__init__()
@@ -668,6 +765,8 @@ class CompositeRelGNNBackbone(ModuleBase):
             raise ValueError("hidden_dim must be divisible by num_attention_heads")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
+        if route_message_normalization not in _ROUTE_MESSAGE_NORMALIZATIONS:
+            raise ValueError("route_message_normalization must be 'none' or 'layer_norm'")
 
         normalized_node_dims = {
             node_type: int(feature_dim) for node_type, feature_dim in configured_node_dims.items()
@@ -709,6 +808,20 @@ class CompositeRelGNNBackbone(ModuleBase):
         self.node_feature_dims = normalized_node_dims
         self.node_input_dims = normalized_node_dims
         self.route_feature_dims = normalized_route_dims
+        self.route_message_normalization = cast(
+            Literal["none", "layer_norm"], route_message_normalization
+        )
+        self.route_schedule = _normalize_route_schedule(
+            route_schedule,
+            num_layers=num_layers,
+            route_names=normalized_route_dims,
+            registry=self.registry,
+        )
+        self._enabled_gate_keys_by_layer = (
+            None
+            if self.route_schedule is None
+            else tuple(frozenset(layer) for layer in self.route_schedule)
+        )
         self.player_encoder = player_encoder
         self.node_encoders = nn.ModuleDict(
             {
@@ -731,6 +844,7 @@ class CompositeRelGNNBackbone(ModuleBase):
                     num_heads=num_attention_heads,
                     dropout=dropout,
                     include_publication_delay=include_publication_delay,
+                    route_message_normalization=self.route_message_normalization,
                 )
                 for _ in range(num_layers)
             ]
@@ -898,6 +1012,11 @@ class CompositeRelGNNBackbone(ModuleBase):
             dtype=first_features.dtype,
         )
         for layer_index, layer in enumerate(self.layers):
+            enabled_gate_keys = (
+                None
+                if self._enabled_gate_keys_by_layer is None
+                else self._enabled_gate_keys_by_layer[layer_index]
+            )
             state = layer(
                 state,
                 tensor_batches,
@@ -905,6 +1024,7 @@ class CompositeRelGNNBackbone(ModuleBase):
                 reuse_route_context=self._execution_optimization_enabled,
                 layer_index=layer_index,
                 diagnostics_observer=diagnostics_observer,
+                enabled_gate_keys=enabled_gate_keys,
             )
         return state
 

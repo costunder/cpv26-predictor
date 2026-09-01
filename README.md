@@ -223,7 +223,7 @@ PA 집계를 완전한 박스스코어로 간주하지 않습니다. 집계 사�
 
 ## 5. 2001년부터 RelGNN 학습
 
-4절이 끝난 뒤 실행합니다. A100 MIG 10GB 예시는 날짜 한 개씩 학습합니다.
+4절이 끝난 뒤 실행합니다. A100 MIG 10GB 예시는 날짜 8개를 한 minibatch로 학습합니다.
 
 ~~~bash
 cpv26 relgnn-train \
@@ -236,7 +236,7 @@ cpv26 relgnn-train \
   --chronological \
   --device cuda:0 \
   --epochs 30 \
-  --batch-days 1 \
+  --batch-days 8 \
   --max-pa-per-day 0 \
   --max-edges-per-route 0 \
   --amp auto
@@ -331,13 +331,138 @@ cpv26 relgnn-graph-diagnose \
 여러 seed로 비교해야 합니다. 그 결정까지 validation에서 하고 2026 test는 마지막 평가에만
 사용합니다.
 
-## 6. 2026 부분 시즌 test 평가
+### 5-2. 같은 초기화와 예산으로 그래프 구조 재학습 비교
 
-5절 학습이 끝난 뒤 best.pt를 명시해 실행합니다. 다른 run 이름을 썼다면 경로도 바꿉니다.
+고정 checkpoint 진단 다음에는 여섯 조건을 처음부터 다시 학습합니다. 아래 명령은 seed 3개마다
+조건 6개, 즉 전체 학습 18회를 순서대로 실행하므로 단일 학습보다 훨씬 오래 걸립니다. 먼저
+`--seed 2026` 하나와 `--max-days-per-split`으로 실행 경로만 확인할 수 있지만 그 결과는
+전체 기간 비교가 아닙니다.
 
 ~~~bash
+cpv26 relgnn-ablation-train \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --suite-dir var/runs/relgnn_ablations/kbo_2001_2024_v5 \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
+  --device cuda:0 \
+  --epochs 30 \
+  --batch-days 8 \
+  --workers 0 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
+  --amp auto \
+  --seed 2026 \
+  --seed 2027 \
+  --seed 2028 \
+  --graph-control-seed 2026
+~~~
+
+짧은 실행 확인은 full suite 디렉터리에 쓰지 않습니다. 아래처럼 이름에 `_smoke`를 붙인
+별도 디렉터리를 사용해야 `max_days_per_split` 설정으로 본 실험 manifest를 오염시키지 않습니다.
+
+~~~bash
+cpv26 relgnn-ablation-train \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --suite-dir var/runs/relgnn_ablations/kbo_2001_2024_v5_smoke \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
+  --device cuda:0 \
+  --epochs 1 \
+  --batch-days 8 \
+  --workers 0 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
+  --max-days-per-split 3 \
+  --amp auto \
+  --seed 2026 \
+  --graph-control-seed 2026
+~~~
+
+| 조건 | 관계 메시지 설정 | 그래프 입력 |
+|---|---|---|
+| `full` | 모든 layer에서 모든 관계·방향, normalization 없음 | 원본 |
+| `normalized` | `full` + parameter 없는 route message layer normalization | 원본 |
+| `staged` | 첫 layer는 PA 양방향, 타자→팀, 팀→투수, 홈↔원정 팀만; 이후 core | 원본 |
+| `core` | 모든 layer에서 PA 양방향과 타자↔팀만 | 원본 |
+| `node_only` | 관계 메시지 전달만 제거 | 원본 |
+| `rewired` | `full`, normalization 없음 | 날짜·관계별 endpoint 고정 재배선 |
+
+같은 seed의 여섯 모델은 초기 `state_dict` SHA-256과 parameter 수가 완전히 같은지 먼저
+검사합니다. `node_only`도 사용하지 않는 route parameter를 그대로 보유해 이 비교에서 모델
+parameter 예산을 바꾸지 않습니다. 따라서 `node_only`는 순수 tabular 모델이 아닙니다.
+그래프에서 만든 node/role feature는 그대로 남고 **관계 message passing만** 제거됩니다.
+
+모든 조건은 early stopping 없이 같은 epoch와 optimizer-step 시도 예산을 받습니다. FP16
+overflow로 실제 갱신을 건너뛴 수는 별도 기록합니다. `rewired`의 변환 seed는 학습 seed,
+epoch, batch 순서와 무관하며 같은 날짜의 train·validation에서 같은 방식으로 적용됩니다.
+변환 mode·seed·algorithm version과 fingerprint는 config/checkpoint/report에 저장되고 재개 시
+일치하지 않으면 중단합니다.
+해석된 precision, PyTorch/CUDA runtime, GPU 이름·compute capability·메모리도 suite manifest에
+고정합니다. 같은 `cuda:0` 문자열이어도 다른 GPU나 runtime이면 기존 suite 재개를 거부합니다.
+
+각 `best.pt`는 **2025 validation으로만** 다시 평가하며 seed별 full 대비 paired delta와
+selection loss, Match/LiveHit/PA의 log loss·accuracy·ECE·Brier mean/std를
+`matched_retraining_report.json`에 저장합니다. 이 명령은 2026 test graph나 label을 로드하거나
+평가하지 않습니다. 구조를 선택한 뒤 선택한 run의 `best.pt`만 6절에서 test 평가합니다.
+
+중단되면 같은 `--suite-dir`과 동일 옵션으로 다시 실행합니다. 완료 조건은 건너뛰고
+`last.pt`가 있는 조건만 재개합니다. `--epochs`는 늘릴 수 있지만 device, batch, AMP,
+worker, accumulation, 분할, 모델, sampling, loss와 graph-control 설정은 바꿀 수 없습니다.
+기존 seed는 제거하거나 재정렬할 수 없고, 기존 순서를 유지한 채 뒤에 새 seed만 추가할 수
+있습니다.
+MIG 10GB에서 `--batch-days 8`이 OOM이면 실행을 시작하기 전에 4, 그다음 2로 낮춥니다.
+이미 child checkpoint가 생긴 suite의 batch days는 바꿀 수 없으므로, OOM 뒤 값을 바꿀 때는
+새 `--suite-dir`에서 여섯 조건을 같은 값으로 다시 시작합니다.
+
+처음 같은 suite를 `--seed 2026` 하나로 끝낸 뒤 seed를 추가할 때는 기존 seed를 빼지 않고
+아래처럼 같은 순서의 앞부분으로 유지합니다. 그러면 2026의 완료 run 6개는 재사용하고
+2027·2028 run만 추가합니다. 기존 seed 제거·재정렬은 거부됩니다.
+
+~~~bash
+cpv26 relgnn-ablation-train \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --suite-dir var/runs/relgnn_ablations/kbo_2001_2024_v5 \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
+  --device cuda:0 \
+  --epochs 30 \
+  --batch-days 8 \
+  --workers 0 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
+  --amp auto \
+  --seed 2026 \
+  --seed 2027 \
+  --seed 2028 \
+  --graph-control-seed 2026
+~~~
+
+## 6. 2026 부분 시즌 test 평가
+
+5-2절까지 실행했다면 `matched_retraining_report.json`의 **seed aggregate validation**으로
+variant를 선택합니다. 그 뒤 가장 validation이 좋았던 seed까지 고르면 seed cherry-picking이
+되므로 checkpoint seed는 결과를 보기 전에 고정합니다. 아래는 seed 2026을 사전 고정했고
+aggregate 결과에서 `normalized`를 선택했다는 실행 예입니다. 사전 정의했다면 모든 seed를
+각각 test하거나 ensemble하는 별도 protocol도 가능하지만 이 CLI가 자동 ensemble하지는 않습니다.
+child checkpoint 경로 형식은
+`var/runs/relgnn_ablations/kbo_2001_2024_v5/seed-<seed>/<selected_variant>/best.pt`입니다.
+보고서에서 다른 variant가 선택됐다면 `SELECTED_VARIANT`를 그 값으로 바꿉니다. standalone
+5절 경로를 그대로 평가하면 matched 비교에서 선택한 모델의 test가 아닙니다.
+
+~~~bash
+SELECTED_SEED=2026
+SELECTED_VARIANT=normalized
 cpv26 relgnn-evaluate \
-  --checkpoint var/runs/relgnn/kbo_2001_2024_v5/best.pt \
+  --checkpoint "var/runs/relgnn_ablations/kbo_2001_2024_v5/seed-${SELECTED_SEED}/${SELECTED_VARIANT}/best.pt" \
   --split test \
   --device cuda:0
 ~~~
@@ -360,8 +485,10 @@ evaluations/test-<run-id>/
 학습이나 평가를 새로 실행하지 않습니다.
 
 ~~~bash
+SELECTED_SEED=2026
+SELECTED_VARIANT=normalized
 python scripts/show_relgnn_results.py \
-  --run-dir var/runs/relgnn/kbo_2001_2024_v5
+  --run-dir "var/runs/relgnn_ablations/kbo_2001_2024_v5/seed-${SELECTED_SEED}/${SELECTED_VARIANT}"
 ~~~
 
 GPU 사용률이 낮을 때는 [병목 진단](docs/GPU_BOTTLENECK_DIAGNOSIS.md)을 사용합니다.
@@ -404,7 +531,7 @@ cpv26 relgnn-train \
   --chronological \
   --device cuda:0 \
   --epochs 50 \
-  --batch-days 1 \
+  --batch-days 8 \
   --max-pa-per-day 0 \
   --max-edges-per-route 0 \
   --amp auto
@@ -420,8 +547,8 @@ cpv26 relgnn-train \
 
 ## 8. VRAM 부족
 
-5절은 이미 `--batch-days 1`입니다. 메모리가 부족하면 `--hidden-dim 32`처럼 모델 크기를
-줄이고 새 run 이름으로 실행합니다.
+5절은 `--batch-days 8`입니다. 메모리가 부족하면 먼저 4, 이어서 2로 낮추고,
+그래도 부족하면 `--hidden-dim 32`처럼 모델 크기를 줄여 새 run 이름으로 실행합니다.
 
 CLI의 `--max-pa-per-day`와 `--max-edges-per-route` 기본값은 `0`으로, 질의·관계를
 전부 사용합니다. 양수를 직접 지정한 경우에만 표본화하며, 그 제한을 학습 보고서에 기록합니다.

@@ -411,6 +411,115 @@ GNN 구조가 node-only 모델보다 일반화 성능이 좋다는 뜻은 아닙
 마지막 한 번의 평가에 사용합니다. `--max-days` 결과는 실행 경로를 확인하는 smoke 진단으로만
 취급합니다.
 
+## Matched-from-scratch 그래프 ablation
+
+`relgnn-ablation-train`은 고정 checkpoint intervention과 별개로 여섯 조건을 처음부터
+재학습합니다. seed마다 모든 조건이 같은 데이터 순서·sampling·초기화를 사용하며, 초기
+`state_dict` SHA-256과 parameter 수가 하나라도 다르면 학습 전에 중단합니다.
+
+~~~bash
+cpv26 relgnn-ablation-train \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --suite-dir var/runs/relgnn_ablations/kbo_2001_2024_v5 \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
+  --device cuda:0 \
+  --epochs 30 \
+  --batch-days 8 \
+  --workers 0 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
+  --amp auto \
+  --seed 2026 \
+  --seed 2027 \
+  --seed 2028 \
+  --graph-control-seed 2026
+~~~
+
+`--max-days-per-split` smoke는 full suite와 같은 디렉터리에 쓰지 않습니다. 다음처럼 별도
+`..._smoke` 디렉터리를 사용해야 제한 날짜 manifest가 본 실험의 재개를 막지 않습니다.
+
+~~~bash
+cpv26 relgnn-ablation-train \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --suite-dir var/runs/relgnn_ablations/kbo_2001_2024_v5_smoke \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
+  --device cuda:0 \
+  --epochs 1 \
+  --batch-days 8 \
+  --workers 0 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
+  --max-days-per-split 3 \
+  --amp auto \
+  --seed 2026 \
+  --graph-control-seed 2026
+~~~
+
+이 예시는 6 conditions × 3 seeds = 전체 학습 18회라 단일 run보다 오래 걸립니다.
+`--seed`를 생략하면 `CPV26_RANDOM_SEED` 한 개를 사용합니다. seed 하나는 실행 확인에는
+쓸 수 있지만 seed 간 분산을 추정하지 못합니다.
+MIG 10GB에서 기본 예시의 `--batch-days 8`이 OOM이면 학습 시작 전에 4, 이어서 2로
+낮춥니다. checkpoint가 생긴 suite의 batch days는 공정성 설정이라 재개하면서 바꿀 수
+없으므로, 값을 바꾼 실험은 새 `--suite-dir`에서 시작합니다.
+
+| preset | normalization | layer별 활성 route 방향 | graph control |
+| --- | --- | --- | --- |
+| `full` | 없음 | 모든 layer에서 4개 관계 양방향 | intact |
+| `normalized` | parameter 없는 layer norm | `full` | intact |
+| `staged` | parameter 없는 layer norm | L0: PA 양방향, batter→team, team→pitcher, home↔away; L1+: core | intact |
+| `core` | parameter 없는 layer norm | 모든 layer에서 PA 양방향 + batter↔team | intact |
+| `node_only` | 없음 | 모든 layer에서 route message 없음 | intact |
+| `rewired` | 없음 | `full` | 날짜·관계 내부 endpoint 재배선 |
+
+`node_only`는 graph builder가 만든 node/role feature를 유지하고 relational message passing만
+끕니다. 또한 parameter 수를 같은 예산으로 유지하려고 사용하지 않는 route parameter를
+삭제하지 않습니다. 그러므로 parameter 수가 같다는 사실은 모든 parameter가 gradient를
+받는다는 뜻이 아니며, 이 조건을 완전한 비그래프 tabular baseline으로 해석하지 않습니다.
+
+Matched suite는 `patience=0`을 강제해 각 조건에 같은 총 epoch와 optimizer-step 시도 예산을
+줍니다. accepted step과 AMP overflow로 건너뛴 step은 각각 기록합니다. 각 seed의 모든 조건은
+동일한 attempted-step 수인지도 검사합니다. best checkpoint 선택과 최종 조건 비교는 오직
+validation에서 합니다. 각 `best.pt`를 validation으로 다시 평가한 뒤 selection loss와
+Match/LiveHit/PA log loss·accuracy·ECE·Brier의 seed mean, population std, 같은 seed의
+`full` 대비 paired delta를 `matched_retraining_report.json`에 저장합니다.
+
+이 명령은 test 날짜의 graph나 label을 **로드하지도 평가하지도 않습니다**. test 연도는
+sealed split metadata로만 checkpoint에 남습니다. 선택한 조건의 독립 test 평가는 suite가
+끝난 뒤 해당 `best.pt`에 `relgnn-evaluate --split test`를 명시해 한 번 실행합니다.
+Variant는 여러 seed의 aggregate validation으로 선택합니다. 그 뒤 가장 좋은 개별 seed까지
+고르는 것은 seed cherry-picking이므로 checkpoint seed는 결과 전에 고정합니다. 예를 들어
+seed 2026을 사전 고정했고 aggregate에서 `normalized`를 골랐다면
+`var/runs/relgnn_ablations/kbo_2001_2024_v5/seed-2026/normalized/best.pt`를 평가합니다.
+사전 정의한 모든 replicate를 각각 test하거나 ensemble하는 protocol도 가능하지만 이 runner가
+자동 ensemble하지는 않습니다.
+
+`rewired`는 학습 seed와 별도인 `graph_control_seed`를 사용합니다. 변환은 날짜 ID·관계·endpoint
+방향으로 결정되므로 epoch, minibatch 구성, worker 수나 학습 seed가 바뀌어도 같은 날짜의
+endpoint mapping은 같습니다. train과 validation, 이후 명시적 evaluate/profile에도 같은
+control을 적용합니다. `{mode, control_seed, transform_algorithm_version}`와 SHA-256 fingerprint를
+checkpoint와 report에 저장하고, non-intact checkpoint에서 누락되거나 다르면 거부합니다.
+해석된 precision, PyTorch/CUDA runtime, GPU 이름·compute capability·메모리도 suite manifest에
+저장하며, 같은 `cuda:0` 문자열이어도 이 numerical runtime이 달라지면 재개를 거부합니다.
+
+재개는 같은 `--suite-dir`과 같은 옵션으로 실행합니다. 완료된 child는 건너뛰며, 중단된 child는
+그 디렉터리의 `last.pt`가 있을 때만 재개합니다. suite 설정 중 `--epochs`만 늘릴 수 있고
+device, AMP, batch days, accumulation, worker, sampling, seed, 분할, loss, 모델과 graph control은
+모두 정확히 같아야 합니다. 중단 checkpoint도 학습 호출 전에 dataset fingerprint, model config,
+graph-control fingerprint와 초기 state hash를 다시 확인합니다.
+
+단, 완료된 single-seed screening 뒤 seed를 늘리는 것은 허용합니다. 처음 위와 같은 명령을
+`--seed 2026`만 넣어 실행했다면, 같은 `--suite-dir`과 나머지 옵션을 그대로 둔 채 위 예시처럼
+`--seed 2026 --seed 2027 --seed 2028`로 다시 실행합니다. 기존 2026 run은 건너뛰고 새 seed만
+학습합니다. 기존 seed를 빼거나 `--seed 2027 --seed 2026`처럼 재정렬하는 것은 거부합니다.
+
 ## 아직 연결되지 않은 범위와 해석 한계
 
 출처의 `events`가 없는 구간은 완료 PA 라벨에 포함되지 않습니다. canonical PA만 보고

@@ -38,6 +38,65 @@ def test_probability_roundoff_is_repaired_but_invalid_probabilities_rejected() -
             _float64_probabilities(np.asarray(malformed))
 
 
+def test_route_schedule_presets_resolve_exact_directions() -> None:
+    full = (
+        "batter_pa_pitcher__forward",
+        "batter_pa_pitcher__reverse",
+        "batter_participation_team__forward",
+        "batter_participation_team__reverse",
+        "pitcher_participation_team__forward",
+        "pitcher_participation_team__reverse",
+        "home_team_game_away_team__forward",
+        "home_team_game_away_team__reverse",
+    )
+    staged_first = (
+        "batter_pa_pitcher__forward",
+        "batter_pa_pitcher__reverse",
+        "batter_participation_team__forward",
+        "pitcher_participation_team__reverse",
+        "home_team_game_away_team__forward",
+        "home_team_game_away_team__reverse",
+    )
+    core = (
+        "batter_pa_pitcher__forward",
+        "batter_pa_pitcher__reverse",
+        "batter_participation_team__forward",
+        "batter_participation_team__reverse",
+    )
+    assert runner_module._resolved_route_schedule(
+        KBOTrainingConfig(layers=2, route_schedule="full")
+    ) is None
+    assert full == runner_module._FULL_ROUTE_GATE_KEYS
+    assert runner_module._resolved_route_schedule(
+        KBOTrainingConfig(layers=2, route_schedule="staged")
+    ) == (staged_first, core)
+    assert runner_module._resolved_route_schedule(
+        KBOTrainingConfig(layers=2, route_schedule="core")
+    ) == (core, core)
+    assert runner_module._resolved_route_schedule(
+        KBOTrainingConfig(layers=2, route_schedule="node_only")
+    ) == ((), ())
+
+
+def test_matched_suite_manifest_allows_seed_append_only(tmp_path: Path) -> None:
+    from cpv26.training.kbo_matched_ablation import _validate_or_write_manifest
+
+    def manifest(seeds: list[int]) -> dict[str, Any]:
+        return {
+            "protocol_version": 1,
+            "seeds": seeds,
+            "base_training_config": {"epochs": 3, "batch_days": 8},
+        }
+
+    path = tmp_path / "suite_config.json"
+    _validate_or_write_manifest(path, manifest([17]))
+    _validate_or_write_manifest(path, manifest([17, 29]))
+    assert json.loads(path.read_text(encoding="utf-8"))["seeds"] == [17, 29]
+    for invalid in ([29], [29, 17], [17]):
+        with pytest.raises(ValueError, match="appended"):
+            _validate_or_write_manifest(path, manifest(invalid))
+
+
 @pytest.fixture
 def graph_directory(tmp_path: Path) -> Path:
     """Small real-schema rows, generated only in pytest's temporary directory."""
@@ -251,7 +310,14 @@ def test_real_graph_train_resume_and_test_artifacts(graph_directory: Path, tmp_p
     assert first["completed_epochs"] == 1
     assert not first["test_used_during_training"]
     assert first["best_checkpoint_sha256"] == sha256_file(run / "best.pt")
+    assert len(first["initial_model_state_sha256"]) == 64
+    assert first["parameter_count"] > 0
+    assert first["attempted_optimizer_steps"] == (
+        first["optimizer_steps"] + first["skipped_optimizer_steps"]
+    )
     state = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+    assert state["initial_model_state_sha256"] == first["initial_model_state_sha256"]
+    assert state["parameter_count"] == first["parameter_count"]
     assert state["optimizer"]["state"]
     assert state["model"]
     assert state["history"][0]["training_samples"]["match"] == 2
@@ -394,6 +460,88 @@ def test_epoch_resume_matches_uninterrupted_training(
     uninterrupted = torch.load(full / "last.pt", map_location="cpu", weights_only=True)
     for key, tensor in resumed["model"].items():
         torch.testing.assert_close(tensor, uninterrupted["model"][key], rtol=0, atol=0)
+
+
+def test_cuda_rng_resume_restores_selected_device_across_visible_count_changes() -> None:
+    restored: list[tuple[Any, Any]] = []
+
+    def device(value: str) -> Any:
+        kind, separator, raw_index = value.partition(":")
+        return SimpleNamespace(type=kind, index=int(raw_index) if separator else None)
+
+    torch = SimpleNamespace(
+        device=device,
+        cuda=SimpleNamespace(
+            device_count=lambda: 1,
+            set_rng_state=lambda value, device=None: restored.append((value, device)),
+        ),
+    )
+    current = torch.device("cuda:0")
+    selected = object()
+    runner_module._restore_cuda_rng_state(
+        torch,
+        {
+            "selected_cuda_device": "cuda:6",
+            "selected_cuda_rng_state": selected,
+            "cuda_rng_states": [object()] * 8,
+            "training_config": asdict(KBOTrainingConfig(device="cuda:6")),
+        },
+        current,
+    )
+    assert len(restored) == 1
+    assert restored[0][0] is selected and restored[0][1] is current
+
+    restored.clear()
+    legacy = [object() for _ in range(8)]
+    runner_module._restore_cuda_rng_state(
+        torch,
+        {
+            "cuda_rng_states": legacy,
+            "training_config": asdict(KBOTrainingConfig(device="cuda:6")),
+        },
+        current,
+    )
+    assert len(restored) == 1
+    assert restored[0][0] is legacy[6] and restored[0][1] is current
+
+
+def test_cuda_rng_resume_rejects_missing_state_but_cpu_resume_remains_compatible() -> None:
+    restored: list[Any] = []
+
+    def device(value: str) -> Any:
+        kind, separator, raw_index = value.partition(":")
+        return SimpleNamespace(type=kind, index=int(raw_index) if separator else None)
+
+    torch = SimpleNamespace(
+        device=device,
+        cuda=SimpleNamespace(
+            set_rng_state=lambda value, device=None: restored.append((value, device))
+        ),
+    )
+    current = torch.device("cuda:0")
+    with pytest.raises(ValueError, match="selected-device RNG state"):
+        runner_module._restore_cuda_rng_state(
+            torch,
+            {"selected_cuda_rng_state": None},
+            current,
+        )
+    with pytest.raises(ValueError, match="no restorable CUDA RNG state"):
+        runner_module._restore_cuda_rng_state(
+            torch,
+            {"cuda_rng_states": [], "training_config": asdict(KBOTrainingConfig())},
+            current,
+        )
+    with pytest.raises(ValueError, match="configured device"):
+        runner_module._restore_cuda_rng_state(
+            torch,
+            {
+                "cuda_rng_states": [object()],
+                "training_config": asdict(KBOTrainingConfig(device="cpu")),
+            },
+            current,
+        )
+    runner_module._restore_cuda_rng_state(torch, {}, torch.device("cpu"))
+    assert not restored
 
 
 def test_resume_refuses_wrong_lineage_and_overwrites(graph_directory: Path, tmp_path: Path) -> None:
@@ -612,6 +760,8 @@ def test_legacy_checkpoint_without_new_policy_fields_still_resumes_and_evaluates
     run = tmp_path / "legacy-run"
     train_kbo_relgnn(graph_directory, run, config=_config(), progress=lambda _: None)
     state = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+    state.pop("selected_cuda_device")
+    state.pop("selected_cuda_rng_state")
     state["model_config"].pop("box_gradient_mode")
     if version == 2:
         for key in (
@@ -808,15 +958,61 @@ def test_loader_orders_training_dates_only_when_requested(
     assert loader["multiprocessing_context"] == ("spawn" if workers else None)
     assert loader["batch_size"] == config.batch_days
     assert loader["pin_memory"] is False
-    assert loader["collate_fn"].func is runner_module.collate_kbo_day_graphs
+    assert loader["collate_fn"].func is runner_module._collate_loader_days
     assert loader["collate_fn"].keywords == {
-        "device": "cpu",
-        "max_pa_per_day": config.max_pa_per_day if training else None,
-        "max_edges_per_route_per_day": config.max_edges_per_route_per_day,
-        "seed": config.seed + 3 if training else config.seed,
+        "config": config,
+        "epoch": 3,
+        "training": training,
     }
     expected_days = days if expected_shuffle else tuple(sorted(days))
     assert loader["dataset"].selected_days == expected_days
+
+
+@pytest.mark.parametrize("manifest_version", [2, 3, 4, 5])
+def test_training_never_loads_held_out_test_graphs_for_any_dataset_version(
+    graph_directory: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_version: int,
+) -> None:
+    pytest.importorskip("torch")
+    dataset = runner_module.KBOGraphDataset(graph_directory)
+    dataset.manifest["dataset_version"] = manifest_version
+    original_load = dataset.load_day
+    loaded: list[date] = []
+
+    def tracked_load(day: date | str) -> Any:
+        selected = date.fromisoformat(day) if isinstance(day, str) else day
+        loaded.append(selected)
+        return original_load(day)
+
+    monkeypatch.setattr(dataset, "load_day", tracked_load)
+    monkeypatch.setattr(runner_module, "KBOGraphDataset", lambda _: dataset)
+
+    class StopAfterSplitSummary(Exception):
+        pass
+
+    def stop_before_model(*args: Any, **kwargs: Any) -> None:
+        raise StopAfterSplitSummary
+
+    monkeypatch.setattr(runner_module, "KBORelGNNModel", stop_before_model)
+    with pytest.raises(StopAfterSplitSummary):
+        train_kbo_relgnn(
+            graph_directory,
+            tmp_path / f"sealed-test-v{manifest_version}",
+            config=_config(),
+            progress=lambda _: None,
+        )
+    assert all(day.year != 2025 for day in loaded)
+    assert runner_module._sealed_split_summary(
+        (date(2025, 4, 1), date(2025, 4, 2))
+    ) == {
+        "seasons": [2025],
+        "days": 2,
+        "date_start": "2025-04-01",
+        "date_end": "2025-04-02",
+        "labels_or_graphs_loaded": False,
+    }
 
 
 def test_multi_year_chronological_training_and_2026_evaluation(

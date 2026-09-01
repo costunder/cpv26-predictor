@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -34,6 +35,33 @@ from .batch_transfer import move_batch
 from .optimizer_state import make_adamw, optimizer_parameter_names
 
 CHECKPOINT_VERSION = 1
+GRAPH_CONTROL_PROTOCOL_VERSION = 1
+ROUTE_MESSAGE_NORMALIZATIONS = ("none", "layer_norm")
+ROUTE_SCHEDULE_PRESETS = ("full", "staged", "core", "node_only")
+GRAPH_CONTROL_MODES = ("intact", "permuted_endpoints")
+_FULL_ROUTE_GATE_KEYS = tuple(
+    f"{route_name}__{direction}"
+    for route_name in (
+        "batter_pa_pitcher",
+        "batter_participation_team",
+        "pitcher_participation_team",
+        "home_team_game_away_team",
+    )
+    for direction in ("forward", "reverse")
+)
+_CORE_ROUTE_GATE_KEYS = tuple(
+    f"{route_name}__{direction}"
+    for route_name in ("batter_pa_pitcher", "batter_participation_team")
+    for direction in ("forward", "reverse")
+)
+_STAGED_FIRST_ROUTE_GATE_KEYS = (
+    "batter_pa_pitcher__forward",
+    "batter_pa_pitcher__reverse",
+    "batter_participation_team__forward",
+    "pitcher_participation_team__reverse",
+    "home_team_game_away_team__forward",
+    "home_team_game_away_team__reverse",
+)
 BOX_PITCH_TARGET_NAMES = (
     "batters_faced", "outs_recorded", "pitches_thrown", "at_bats", "hits_allowed",
     "home_runs_allowed", "walks_hbp", "strikeouts", "runs_allowed", "earned_runs",
@@ -72,6 +100,10 @@ class KBOTrainingConfig:
     validation_season: int = 2024
     test_season: int = 2025
     chronological: bool = False
+    route_message_normalization: str = "none"
+    route_schedule: str = "full"
+    graph_control: str = "intact"
+    graph_control_seed: int = 2026
 
     def __post_init__(self) -> None:
         positive = (
@@ -106,8 +138,8 @@ class KBOTrainingConfig:
                 raise ValueError(f"{name} must be finite and non-negative")
         if self.match_weight <= 0 or self.live_hit_weight <= 0:
             raise ValueError("both match and Live Hit tasks must have positive weights")
-        if min(self.workers, self.patience, self.seed) < 0:
-            raise ValueError("workers, patience and seed must be non-negative")
+        if min(self.workers, self.patience, self.seed, self.graph_control_seed) < 0:
+            raise ValueError("workers, patience and seeds must be non-negative")
         if self.max_days_per_split is not None and self.max_days_per_split < 1:
             raise ValueError("max_days_per_split must be positive when supplied")
         if self.amp not in {"auto", "off", "fp16", "bf16"}:
@@ -118,6 +150,12 @@ class KBOTrainingConfig:
             raise ValueError("selection_target must be auto, match, or weighted")
         if self.box_gradient_mode not in {"auto", "shared", "head_only"}:
             raise ValueError("box_gradient_mode must be auto, shared, or head_only")
+        if self.route_message_normalization not in ROUTE_MESSAGE_NORMALIZATIONS:
+            raise ValueError("route_message_normalization must be none or layer_norm")
+        if self.route_schedule not in ROUTE_SCHEDULE_PRESETS:
+            raise ValueError("route_schedule must be full, staged, core, or node_only")
+        if self.graph_control not in GRAPH_CONTROL_MODES:
+            raise ValueError("graph_control must be intact or permuted_endpoints")
         seasons = (*self.train_seasons, self.validation_season, self.test_season)
         if any(
             isinstance(year, bool) or not isinstance(year, int) or not 1 <= year <= 9999
@@ -135,6 +173,10 @@ class KBOTrainingConfig:
     def from_dict(cls, value: Mapping[str, Any]) -> KBOTrainingConfig:
         options = dict(value)
         options["train_seasons"] = tuple(options.get("train_seasons", (2023,)))
+        options.setdefault("route_message_normalization", "none")
+        options.setdefault("route_schedule", "full")
+        options.setdefault("graph_control", "intact")
+        options.setdefault("graph_control_seed", 2026)
         return cls(**options)
 
 
@@ -234,6 +276,22 @@ def _read_checkpoint(path: Path) -> dict[str, Any]:
     return state
 
 
+def _model_state_sha256(model: Any) -> str:
+    """Hash a model state independently of torch.save container metadata."""
+
+    torch, _ = require_torch()
+    digest = hashlib.sha256()
+    for name, value in sorted(model.state_dict().items()):
+        if not torch.is_tensor(value):
+            raise TypeError(f"model state {name!r} is not a tensor")
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _move(value: Any, device: Any) -> Any:
     return move_batch(value, device, packed=True)
 
@@ -251,6 +309,75 @@ class _DayDataset:
         if self._dataset is None:
             self._dataset = KBOGraphDataset(self.directory)
         return self._dataset.load_day(self.selected_days[index])
+
+
+def _graph_control_report(config: KBOTrainingConfig) -> dict[str, Any]:
+    transform_algorithm_version = (
+        f"identity_v{GRAPH_CONTROL_PROTOCOL_VERSION}"
+        if config.graph_control == "intact"
+        else f"day_local_source_destination_node_bijection_v{GRAPH_CONTROL_PROTOCOL_VERSION}"
+    )
+    payload: dict[str, Any] = {
+        "mode": config.graph_control,
+        "control_seed": config.graph_control_seed,
+        "transform_algorithm_version": transform_algorithm_version,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {**payload, "fingerprint": hashlib.sha256(encoded).hexdigest()}
+
+
+def _validate_checkpoint_graph_control(
+    state: Mapping[str, Any], config: KBOTrainingConfig
+) -> dict[str, Any]:
+    expected = _graph_control_report(config)
+    saved = state.get("graph_control")
+    if saved is None:
+        if config.graph_control != "intact":
+            raise ValueError("non-intact checkpoint is missing its graph-control protocol")
+        return {**expected, "legacy_checkpoint_default": True}
+    if saved != expected:
+        raise ValueError(
+            "checkpoint graph-control protocol differs from the training configuration"
+        )
+    return expected
+
+
+def _prepare_graph_batch(
+    batch: Mapping[str, Any], config: KBOTrainingConfig
+) -> Mapping[str, Any]:
+    """Apply one epoch-invariant graph control before pinning or device transfer."""
+
+    if config.graph_control == "intact":
+        return batch
+    from cpv26.training.kbo_graph_diagnostic import (
+        KBOGraphTransformSpec,
+        transform_kbo_graph_batch,
+    )
+
+    transformed, _ = transform_kbo_graph_batch(
+        batch,
+        KBOGraphTransformSpec("permute_endpoints", seed=config.graph_control_seed),
+    )
+    return transformed
+
+
+def _collate_loader_days(
+    days: Sequence[GraphDay],
+    *,
+    config: KBOTrainingConfig,
+    epoch: int,
+    training: bool,
+) -> Mapping[str, Any]:
+    batch = collate_kbo_day_graphs(
+        days,
+        device="cpu",
+        max_pa_per_day=config.max_pa_per_day if training else None,
+        max_edges_per_route_per_day=config.max_edges_per_route_per_day,
+        seed=config.seed + epoch if training else config.seed,
+    )
+    return _prepare_graph_batch(batch, config)
 
 
 def _loader(
@@ -275,11 +402,10 @@ def _loader(
         pin_memory=config.device.startswith("cuda"),
         generator=generator,
         collate_fn=partial(
-            collate_kbo_day_graphs,
-            device="cpu",
-            max_pa_per_day=config.max_pa_per_day if training else None,
-            max_edges_per_route_per_day=config.max_edges_per_route_per_day,
-            seed=config.seed + epoch if training else config.seed,
+            _collate_loader_days,
+            config=config,
+            epoch=epoch,
+            training=training,
         ),
     )
 
@@ -368,6 +494,18 @@ def _split_summary(
     return summary
 
 
+def _sealed_split_summary(days: Sequence[date]) -> dict[str, Any]:
+    """Describe a held-out split without reading any graph or label payload."""
+
+    return {
+        "seasons": sorted({day.year for day in days}),
+        "days": len(days),
+        "date_start": min(days).isoformat() if days else None,
+        "date_end": max(days).isoformat() if days else None,
+        "labels_or_graphs_loaded": False,
+    }
+
+
 def _losses(outputs: Mapping[str, Any], batch: Mapping[str, Any], config: KBOTrainingConfig) -> Any:
     return kbo_multitask_loss(
         outputs,
@@ -394,6 +532,20 @@ def _counts(batch: Mapping[str, Any], *, include_boxscore: bool = False) -> dict
     return counts
 
 
+def _resolved_route_schedule(
+    config: KBOTrainingConfig,
+) -> tuple[tuple[str, ...], ...] | None:
+    if config.route_schedule == "full":
+        return None
+    if config.route_schedule == "staged":
+        return (_STAGED_FIRST_ROUTE_GATE_KEYS,) + (_CORE_ROUTE_GATE_KEYS,) * (
+            config.layers - 1
+        )
+    if config.route_schedule == "core":
+        return (_CORE_ROUTE_GATE_KEYS,) * config.layers
+    return ((),) * config.layers
+
+
 def _model_config(dataset: KBOGraphDataset, config: KBOTrainingConfig) -> KBORelGNNConfig:
     manifest = dataset.manifest
     return KBORelGNNConfig(
@@ -409,6 +561,8 @@ def _model_config(dataset: KBOGraphDataset, config: KBOTrainingConfig) -> KBORel
         box_batting_feature_dim=manifest.get("boxscore_feature_dims", {}).get("batting", 19),
         box_pitching_feature_dim=manifest.get("boxscore_feature_dims", {}).get("pitching", 21),
         box_gradient_mode=_training_policies(config)["box_gradient_mode"],
+        route_message_normalization=config.route_message_normalization,
+        route_schedule=_resolved_route_schedule(config),
     )
 
 
@@ -452,6 +606,14 @@ def _policy_report(config: KBOTrainingConfig, model_config: KBORelGNNConfig) -> 
         "selection_target": _training_policies(config)["selection_target"],
         "requested_box_gradient_mode": config.box_gradient_mode,
         "box_gradient_mode": model_config.box_gradient_mode,
+        "route_message_normalization": config.route_message_normalization,
+        "route_schedule_preset": config.route_schedule,
+        "resolved_route_schedule": (
+            [list(layer) for layer in model_config.route_schedule]
+            if model_config.route_schedule is not None
+            else None
+        ),
+        "graph_control": _graph_control_report(config),
         "gradient_clipping": groups,
         "loss_weights": {
             name: getattr(config, f"{name}_weight")
@@ -734,6 +896,7 @@ def _checkpoint_state(
     dataset_directory: Path,
     config: KBOTrainingConfig,
     model_config: KBORelGNNConfig,
+    device: Any,
     epoch: int,
     global_step: int,
     best_score: float,
@@ -741,6 +904,8 @@ def _checkpoint_state(
     stale_epochs: int,
     skipped_optimizer_steps: int,
     history: Sequence[Mapping[str, Any]],
+    initial_model_state_sha256: str,
+    parameter_count: int,
 ) -> dict[str, Any]:
     torch, _ = require_torch()
     return {
@@ -749,6 +914,9 @@ def _checkpoint_state(
         "dataset_directory": str(dataset_directory),
         "model_config": model_config.to_dict(),
         "training_config": asdict(config),
+        "graph_control": _graph_control_report(config),
+        "initial_model_state_sha256": initial_model_state_sha256,
+        "parameter_count": parameter_count,
         "epoch": epoch,
         "global_step": global_step,
         "best_score": best_score,
@@ -762,6 +930,13 @@ def _checkpoint_state(
         "scaler": scaler.state_dict(),
         "torch_rng_state": torch.get_rng_state(),
         "python_rng_state": random.getstate(),
+        "selected_cuda_device": str(device) if device.type == "cuda" else None,
+        "selected_cuda_rng_state": (
+            torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+        ),
+        # Retain the legacy field so older readers can still inspect new checkpoints.
+        # New resumes use the selected-device state above and do not depend on
+        # the number of devices visible to the current process.
         "cuda_rng_states": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
     }
 
@@ -774,6 +949,36 @@ def _resume_compatible(state: Mapping[str, Any], config: KBOTrainingConfig) -> N
             raise ValueError(f"resume configuration changes {key}; start a separate run instead")
     if config.epochs < int(state["epoch"]):
         raise ValueError("epochs is the total target and cannot precede the saved epoch")
+
+
+def _restore_cuda_rng_state(torch: Any, state: Mapping[str, Any], device: Any) -> None:
+    """Restore the saved training device RNG without requiring the old device topology."""
+
+    if device.type != "cuda":
+        return
+    if "selected_cuda_rng_state" in state:
+        selected_state = state["selected_cuda_rng_state"]
+        if selected_state is None:
+            raise ValueError("CUDA resume checkpoint has no selected-device RNG state")
+    else:
+        legacy_states = state.get("cuda_rng_states")
+        if not isinstance(legacy_states, (list, tuple)) or not legacy_states:
+            raise ValueError("legacy CUDA checkpoint has no restorable CUDA RNG state")
+        previous_device = torch.device(
+            KBOTrainingConfig.from_dict(state["training_config"]).device
+        )
+        previous_index = previous_device.index
+        if (
+            previous_device.type != "cuda"
+            or previous_index is None
+            or previous_index < 0
+            or previous_index >= len(legacy_states)
+        ):
+            raise ValueError(
+                "legacy CUDA checkpoint has no RNG state for its configured device"
+            )
+        selected_state = legacy_states[previous_index]
+    torch.cuda.set_rng_state(selected_state, device=device)
 
 
 def train_kbo_relgnn(
@@ -792,7 +997,11 @@ def train_kbo_relgnn(
     output = Path(run_directory).expanduser().resolve()
     dataset = KBOGraphDataset(directory)
     splits = _split_days(dataset, options)
-    split_summary = _split_summary(dataset, splits)
+    split_summary = _split_summary(
+        dataset,
+        {name: splits[name] for name in ("train", "validation")},
+    )
+    split_summary["test"] = _sealed_split_summary(splits["test"])
     training_order = "chronological" if options.chronological else "shuffled"
     model_config = _model_config(dataset, options)
     torch.manual_seed(options.seed)
@@ -803,6 +1012,8 @@ def train_kbo_relgnn(
     else:
         torch.set_num_threads(min(4, os.cpu_count() or 1))
     model: Any = KBORelGNNModel(model_config)
+    initial_model_state_sha256 = _model_state_sha256(model)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
     model.to(device)
     optimizer = make_adamw(
         model,
@@ -823,7 +1034,14 @@ def train_kbo_relgnn(
             raise ValueError("checkpoint dataset fingerprint differs from the graph dataset")
         if KBORelGNNConfig(**state["model_config"]).to_dict() != model_config.to_dict():
             raise ValueError("checkpoint model/feature/route configuration differs")
+        _validate_checkpoint_graph_control(state, options)
         _resume_compatible(state, options)
+        saved_initial_hash = state.get("initial_model_state_sha256")
+        if saved_initial_hash is not None and saved_initial_hash != initial_model_state_sha256:
+            raise ValueError("checkpoint initial model state differs from the configured seed")
+        saved_parameter_count = state.get("parameter_count")
+        if saved_parameter_count is not None and int(saved_parameter_count) != parameter_count:
+            raise ValueError("checkpoint parameter count differs from the current model")
         model.load_state_dict(state["model"])
         optimizer = make_adamw(
             model, learning_rate=options.learning_rate, weight_decay=options.weight_decay,
@@ -833,12 +1051,7 @@ def train_kbo_relgnn(
             scaler.load_state_dict(state["scaler"])
         torch.set_rng_state(state["torch_rng_state"])
         random.setstate(state["python_rng_state"])
-        if (
-            device.type == "cuda"
-            and state["cuda_rng_states"]
-            and len(state["cuda_rng_states"]) == torch.cuda.device_count()
-        ):
-            torch.cuda.set_rng_state_all(state["cuda_rng_states"])
+        _restore_cuda_rng_state(torch, state, device)
         start_epoch = int(state["epoch"])
         global_step = int(state["global_step"])
         skipped_optimizer_steps = int(state.get("skipped_optimizer_steps", 0))
@@ -870,7 +1083,7 @@ def train_kbo_relgnn(
         )
     progress(
         f"RelGNN device={device} precision={runtime['precision']} "
-        f"parameters={sum(p.numel() for p in model.parameters()):,}; "
+        f"parameters={parameter_count:,}; "
         f"train_days={len(splits['train'])}, validation_days={len(splits['validation'])}; "
         f"{options.test_season} test is not used during training"
     )
@@ -988,6 +1201,7 @@ def train_kbo_relgnn(
             dataset_directory=directory,
             config=options,
             model_config=model_config,
+            device=device,
             epoch=epoch + 1,
             global_step=global_step,
             best_score=best_score,
@@ -995,6 +1209,8 @@ def train_kbo_relgnn(
             stale_epochs=stale_epochs,
             skipped_optimizer_steps=skipped_optimizer_steps,
             history=history,
+            initial_model_state_sha256=initial_model_state_sha256,
+            parameter_count=parameter_count,
         )
         if improved:
             _atomic_checkpoint(output / "best.pt", state)
@@ -1015,6 +1231,9 @@ def train_kbo_relgnn(
         "configuration": asdict(options),
         "model_config": model_config.to_dict(),
         "training_policies": policy,
+        "graph_control": _graph_control_report(options),
+        "initial_model_state_sha256": initial_model_state_sha256,
+        "parameter_count": parameter_count,
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "training_seasons": list(options.train_seasons),
         "validation_season": options.validation_season,
@@ -1036,6 +1255,7 @@ def train_kbo_relgnn(
         "best_validation_loss": best_score,
         "optimizer_steps": global_step,
         "skipped_optimizer_steps": skipped_optimizer_steps,
+        "attempted_optimizer_steps": global_step + skipped_optimizer_steps,
         "best_checkpoint": str(output / "best.pt"),
         "last_checkpoint": str(output / "last.pt"),
         "best_checkpoint_sha256": sha256_file(output / "best.pt"),
@@ -1106,6 +1326,7 @@ def evaluate_kbo_relgnn(
         batch_days=batch_days,
         workers=workers,
     )
+    graph_control = _validate_checkpoint_graph_control(state, options)
     selected, dtype, runtime = _device_and_precision(device, amp)
     directory = Path(dataset_directory or state["dataset_directory"]).expanduser().resolve()
     dataset = KBOGraphDataset(directory)
@@ -1168,6 +1389,7 @@ def evaluate_kbo_relgnn(
         "date_end": max(days).isoformat(),
         "days": len(days),
         "runtime": runtime,
+        "graph_control": graph_control,
         "metrics": metrics,
         "training_policies": _policy_report(options, model.config),
         "prediction_artifacts": artifacts,
