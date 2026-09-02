@@ -260,7 +260,7 @@ def test_candidate_config_allows_only_the_128x3_capacity_change() -> None:
     assert "seeds" not in inspect.signature(capacity.train_kbo_capacity_comparison).parameters
 
 
-def test_baseline_requires_exactly_one_completed_seed_and_sealed_test(
+def test_multi_seed_baseline_requires_explicit_selection_and_sealed_test(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -269,10 +269,13 @@ def test_baseline_requires_exactly_one_completed_seed_and_sealed_test(
     report_path = suite / "matched_retraining_report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     report["seeds"] = [SEED, SEED + 1]
-    report["runs"][str(SEED + 1)] = report["runs"][str(SEED)]
     report_path.write_text(json.dumps(report), encoding="utf-8")
+    manifest_path = suite / "suite_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seeds"] = [SEED, SEED + 1]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="exactly one training seed"):
+    with pytest.raises(ValueError, match="declares multiple seeds"):
         capacity.train_kbo_capacity_comparison(
             graph,
             suite,
@@ -281,8 +284,6 @@ def test_baseline_requires_exactly_one_completed_seed_and_sealed_test(
             progress=lambda _: None,
         )
 
-    report["seeds"] = [SEED]
-    report["runs"].pop(str(SEED + 1))
     report["test_used_for_training_selection_or_comparison"] = True
     report_path.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(ValueError, match="held-out test stayed sealed"):
@@ -291,6 +292,52 @@ def test_baseline_requires_exactly_one_completed_seed_and_sealed_test(
             suite,
             tmp_path / "output",
             config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_running_baseline_is_rejected_even_when_selected_seed_is_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    report_path = suite / "matched_retraining_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["status"] = "running"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="still running"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "output",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_failed_partial_suite_requires_both_selected_seed_children(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    report_path = suite / "matched_retraining_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["status"] = "failed"
+    report["runs"][str(SEED)].pop("node_only")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no completed node_only child"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "output",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
             progress=lambda _: None,
         )
 
@@ -303,12 +350,22 @@ def test_trains_only_128x3_full_and_node_only_and_reuses_baseline(
     _patch_protocol_runtime(monkeypatch)
     trained, evaluated = _patch_candidate_runs(monkeypatch)
     output = tmp_path / "capacity"
+    report_path = suite / "matched_retraining_report.json"
+    baseline_report = json.loads(report_path.read_text(encoding="utf-8"))
+    baseline_report["status"] = "failed"
+    baseline_report["seeds"] = [SEED, SEED + 1]
+    report_path.write_text(json.dumps(baseline_report), encoding="utf-8")
+    manifest_path = suite / "suite_config.json"
+    baseline_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    baseline_manifest["seeds"] = [SEED, SEED + 1]
+    manifest_path.write_text(json.dumps(baseline_manifest), encoding="utf-8")
 
     report = capacity.train_kbo_capacity_comparison(
         graph,
         suite,
         output,
         config=replace(base, hidden_dim=128, layers=3),
+        baseline_seed=SEED,
         progress=lambda _: None,
     )
 

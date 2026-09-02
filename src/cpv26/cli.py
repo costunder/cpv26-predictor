@@ -963,9 +963,19 @@ def relgnn_capacity_compare(
         typer.Option(
             exists=True,
             file_okay=False,
-            help="Completed one-seed 64x2 matched suite to reuse; it is never retrained.",
+            help="Existing 64x2 matched suite to reuse; it is never retrained.",
         ),
     ],
+    baseline_seed: Annotated[
+        int | None,
+        typer.Option(
+            min=0,
+            help=(
+                "Existing seed to reuse. Required when the matched suite declares "
+                "multiple seeds."
+            ),
+        ),
+    ] = None,
     dataset: Annotated[
         Path | None, typer.Option(help="Default: CPV26_HOME/datasets/kbo_graph.")
     ] = None,
@@ -973,7 +983,7 @@ def relgnn_capacity_compare(
         Path | None, typer.Option(help="Comparison directory; reuse it to resume safely.")
     ] = None,
 ) -> None:
-    """Reuse 64x2 and train only one-seed 128x3 full/node_only."""
+    """Select one existing 64x2 seed and train only 128x3 full/node_only."""
 
     from dataclasses import replace
 
@@ -994,18 +1004,34 @@ def relgnn_capacity_compare(
         with (baseline / "matched_retraining_report.json").open(encoding="utf-8") as handle:
             baseline_report = json.load(handle)
         seeds = baseline_report.get("seeds")
-        if not isinstance(seeds, list) or len(seeds) != 1:
-            raise ValueError("baseline suite must contain exactly one seed")
+        if not isinstance(seeds, list) or not seeds:
+            raise ValueError("baseline suite does not declare any seeds")
+        if baseline_seed is None:
+            if len(seeds) != 1:
+                raise ValueError(
+                    "baseline suite declares multiple seeds; pass --baseline-seed"
+                )
+            selected_seed = seeds[0]
+        else:
+            selected_seed = baseline_seed
+        if (
+            isinstance(selected_seed, bool)
+            or not isinstance(selected_seed, int)
+            or selected_seed < 0
+            or selected_seed not in seeds
+        ):
+            raise ValueError("selected baseline seed is not declared by the suite")
         raw_config = baseline_report.get("base_training_config")
         if not isinstance(raw_config, dict):
             raise ValueError("baseline suite has no base training configuration")
         base = KBOTrainingConfig.from_dict(raw_config)
-        config = replace(base, seed=int(seeds[0]), hidden_dim=128, layers=3)
+        config = replace(base, seed=selected_seed, hidden_dim=128, layers=3)
         report = train_kbo_capacity_comparison(
             directory,
             baseline,
             target,
             config=config,
+            baseline_seed=selected_seed,
             progress=console.print,
         )
     except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:

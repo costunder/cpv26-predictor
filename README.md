@@ -357,12 +357,15 @@ cpv26 kbo-graph-audit \
 ~~~bash
 cpv26 relgnn-capacity-compare \
   --baseline-suite var/runs/relgnn_ablations/kbo_2001_2024_v5 \
+  --baseline-seed 2026 \
   --dataset var/datasets/kbo_graph_2001_2026_v5 \
   --output var/runs/relgnn_capacity/kbo_2001_2024_v5_64x2_vs_128x3
 ~~~
 
-`--baseline-suite`는 정확히 seed 하나로 완료된 64×2 matched suite여야 합니다. 이 명령은
-그 안의 64×2 모델을 재학습하지 않고, 128×3 두 run만 추가합니다. 데이터 fingerprint,
+`--baseline-seed`는 기존 matched suite에 선언되고 완료된 seed 하나를 선택합니다. suite 전체가
+실패 상태여도 선택한 seed의 `full`과 `node_only`가 완전히 검증되면 재사용하지만, 실행 중인
+suite는 거부합니다. 이 명령은 그 안의 64×2 모델을 재학습하지 않고, 선택한 seed로 128×3
+두 run만 추가합니다. 데이터 fingerprint,
 각 용량 안의 `full`/`node_only` 초기화, 학습 예산과 split lineage가 맞지 않거나 test 봉인을
 증명하지 못하면 중단합니다.
 

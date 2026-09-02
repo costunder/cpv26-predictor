@@ -439,12 +439,15 @@ test 날짜의 실제 query 선수나 분포를 감사에 포함하지 않는다
 ~~~bash
 cpv26 relgnn-capacity-compare \
   --baseline-suite var/runs/relgnn_ablations/kbo_2001_2024_v5 \
+  --baseline-seed 2026 \
   --dataset var/datasets/kbo_graph_2001_2026_v5 \
   --output var/runs/relgnn_capacity/kbo_2001_2024_v5_64x2_vs_128x3
 ~~~
 
-baseline은 정확히 seed 하나로 완료된 64×2 suite여야 한다. 이 명령은 64×2 모델이나 나머지
-네 조건을 재학습하지 않는다. 데이터 fingerprint, 각 용량 안의 `full`/`node_only` 초기 state,
+`--baseline-seed`는 기존 matched suite에 선언되고 완료된 seed 하나를 선택한다. suite 전체가
+실패 상태여도 선택한 seed의 `full`과 `node_only`가 완전히 검증되면 재사용하지만, 실행 중인
+suite는 거부한다. 이 명령은 64×2 모델이나 나머지 네 조건을 재학습하지 않는다. 데이터
+fingerprint, 각 용량 안의 `full`/`node_only` 초기 state,
 attempted-step 예산, train/validation 날짜와 test 봉인 lineage가 맞지 않으면 fail-closed로
 중단한다.
 

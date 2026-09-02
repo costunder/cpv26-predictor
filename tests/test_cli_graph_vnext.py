@@ -99,7 +99,7 @@ def test_capacity_command_reuses_baseline_and_requests_only_128x3(
         device="cpu", amp="off", workers=0, hidden_dim=64, layers=2, seed=17
     )
     (baseline / "matched_retraining_report.json").write_text(
-        json.dumps({"seeds": [17], "base_training_config": asdict(base)}),
+        json.dumps({"seeds": [17, 23], "base_training_config": asdict(base)}),
         encoding="utf-8",
     )
     calls: list[dict[str, Any]] = []
@@ -123,6 +123,8 @@ def test_capacity_command_reuses_baseline_and_requests_only_128x3(
             "relgnn-capacity-compare",
             "--baseline-suite",
             str(baseline),
+            "--baseline-seed",
+            "17",
             "--dataset",
             str(dataset),
             "--output",
@@ -133,6 +135,7 @@ def test_capacity_command_reuses_baseline_and_requests_only_128x3(
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
     assert calls[0]["args"] == (dataset.resolve(), baseline.resolve(), output.resolve())
+    assert calls[0]["baseline_seed"] == 17
     config = calls[0]["config"]
     assert (config.hidden_dim, config.layers, config.seed) == (128, 3, 17)
 

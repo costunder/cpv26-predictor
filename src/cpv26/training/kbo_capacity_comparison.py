@@ -58,20 +58,54 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _single_seed(report: Mapping[str, Any]) -> int:
-    seeds = report.get("seeds")
+def _declared_seeds(value: Any, *, context: str) -> tuple[int, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{context} must declare at least one training seed")
+    seeds: list[int] = []
+    for raw_seed in value:
+        if isinstance(raw_seed, bool) or not isinstance(raw_seed, int) or raw_seed < 0:
+            raise ValueError(f"{context} contains an invalid training seed")
+        seeds.append(raw_seed)
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"{context} contains duplicate training seeds")
+    return tuple(seeds)
+
+
+def _select_baseline_seed(
+    report: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    requested_seed: int | None,
+) -> tuple[int, tuple[int, ...]]:
+    report_seeds = _declared_seeds(
+        report.get("seeds"), context="baseline matched-suite report"
+    )
+    manifest_seeds = _declared_seeds(
+        manifest.get("seeds"), context="baseline matched-suite manifest"
+    )
+    if report_seeds != manifest_seeds:
+        raise ValueError("baseline suite report and manifest seed declarations differ")
+    if requested_seed is None:
+        if len(report_seeds) != 1:
+            raise ValueError(
+                "baseline suite declares multiple seeds; select one with baseline_seed"
+            )
+        seed = report_seeds[0]
+    else:
+        if (
+            isinstance(requested_seed, bool)
+            or not isinstance(requested_seed, int)
+            or requested_seed < 0
+        ):
+            raise ValueError("baseline_seed must be a non-negative integer")
+        seed = requested_seed
+    if seed not in report_seeds:
+        raise ValueError(
+            f"selected baseline seed {seed} is not declared by the report and manifest"
+        )
     runs = report.get("runs")
-    if (
-        not isinstance(seeds, list)
-        or len(seeds) != 1
-        or isinstance(seeds[0], bool)
-        or not isinstance(seeds[0], int)
-        or seeds[0] < 0
-        or not isinstance(runs, Mapping)
-        or list(runs) != [str(seeds[0])]
-    ):
-        raise ValueError("baseline matched suite must contain exactly one training seed")
-    return int(seeds[0])
+    if not isinstance(runs, Mapping) or str(seed) not in runs:
+        raise ValueError(f"baseline suite has no saved run record for selected seed {seed}")
+    return seed, report_seeds
 
 
 def _baseline_run_directory(
@@ -193,13 +227,20 @@ def _validate_baseline_suite(
     dataset: KBOGraphDataset,
     dataset_directory: Path,
     suite_directory: Path,
+    *,
+    requested_seed: int | None,
 ) -> _BaselineSuite:
     report_path = suite_directory / "matched_retraining_report.json"
     manifest_path = suite_directory / "suite_config.json"
     report = _load_json(report_path)
     manifest = _load_json(manifest_path)
-    if report.get("status") != "completed":
-        raise ValueError("baseline matched suite must be completed")
+    suite_status = report.get("status")
+    if suite_status == "running":
+        raise ValueError("baseline matched suite is still running and may change")
+    if suite_status not in {"completed", "failed"}:
+        raise ValueError(
+            "baseline matched suite must be completed or have a verified failed snapshot"
+        )
     if report.get("protocol") != "matched_from_scratch_validation_graph_ablation":
         raise ValueError("baseline is not a matched validation graph-ablation suite")
     if report.get("protocol_version") not in {
@@ -218,9 +259,7 @@ def _validate_baseline_suite(
         or manifest.get("dataset_fingerprint") != fingerprint
     ):
         raise ValueError("baseline suite and requested graph dataset fingerprints differ")
-    seed = _single_seed(report)
-    if manifest.get("seeds") != [seed]:
-        raise ValueError("baseline suite manifest does not have the same single seed")
+    seed, _ = _select_baseline_seed(report, manifest, requested_seed)
     report_variants = report.get("variants")
     manifest_variants = manifest.get("variants")
     if not isinstance(report_variants, list) or not set(
@@ -289,7 +328,8 @@ def _validate_baseline_suite(
         raise ValueError("baseline held-out test-season lineage differs")
 
     raw_runs = report.get("runs")
-    assert isinstance(raw_runs, Mapping)
+    if not isinstance(raw_runs, Mapping):
+        raise ValueError("baseline matched suite has no saved runs")
     per_seed = raw_runs[str(seed)]
     if not isinstance(per_seed, Mapping):
         raise ValueError("baseline single-seed run record is malformed")
@@ -897,6 +937,7 @@ def train_kbo_capacity_comparison(
     output_directory: str | Path,
     *,
     config: runner.KBOTrainingConfig,
+    baseline_seed: int | None = None,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Reuse one 64x2 suite and train only 128x3 full/node_only on validation."""
@@ -907,7 +948,12 @@ def train_kbo_capacity_comparison(
     if output == baseline_directory:
         raise ValueError("capacity output directory must differ from the baseline suite")
     dataset = KBOGraphDataset(directory)
-    baseline = _validate_baseline_suite(dataset, directory, baseline_directory)
+    baseline = _validate_baseline_suite(
+        dataset,
+        directory,
+        baseline_directory,
+        requested_seed=baseline_seed,
+    )
     _validate_candidate_config(config, baseline.config)
     split_fingerprint, split_days = matched._split_day_fingerprint(dataset, config)
     if split_fingerprint != baseline.split_day_fingerprint:
