@@ -34,6 +34,12 @@ KBO_ROUTE_NAMES = (
     "pitcher_participation_team",
     "home_team_game_away_team",
 )
+KBO_VNEXT_ROUTE_NAMES = (
+    *KBO_ROUTE_NAMES,
+    "batter_game_participation",
+    "pitcher_game_participation",
+    "team_game_context",
+)
 
 
 def kbo_route_registry() -> RouteRegistry:
@@ -73,6 +79,30 @@ def kbo_route_registry() -> RouteRegistry:
                 "home_team",
                 "away_team",
             ),
+            AtomicRoute(
+                "batter_game_participation",
+                "player",
+                "observed_batting_game_participation",
+                "game",
+                "batting",
+                "shared",
+            ),
+            AtomicRoute(
+                "pitcher_game_participation",
+                "player",
+                "observed_pitching_game_participation",
+                "game",
+                "pitching",
+                "shared",
+            ),
+            AtomicRoute(
+                "team_game_context",
+                "team",
+                "known_game_matchup",
+                "game",
+                "shared",
+                "shared",
+            ),
         )
     )
 
@@ -105,15 +135,19 @@ class KBORelGNNConfig:
             ):
                 raise ValueError(f"{name} must contain integer dimensions")
             object.__setattr__(self, name, values)
-        if set(self.node_feature_dims) != {"player", "team"}:
-            raise ValueError("KBO graph requires exactly player and team node features")
+        node_types = set(self.node_feature_dims)
+        if node_types not in ({"player", "team"}, {"player", "team", "game"}):
+            raise ValueError("KBO graph requires player/team, with optional game node features")
         if any(width < 1 for width in self.node_feature_dims.values()):
             raise ValueError("node feature widths must be positive")
         if set(self.role_feature_dims) - {"batting", "pitching"}:
             raise ValueError("KBO role features must be batting/pitching observations")
         if any(width < 0 for width in self.role_feature_dims.values()):
             raise ValueError("role feature widths cannot be negative")
-        if not self.route_feature_dims or set(self.route_feature_dims) - set(KBO_ROUTE_NAMES):
+        allowed_routes = (
+            set(KBO_VNEXT_ROUTE_NAMES) if "game" in node_types else set(KBO_ROUTE_NAMES)
+        )
+        if not self.route_feature_dims or set(self.route_feature_dims) - allowed_routes:
             raise ValueError("route_feature_dims must name reviewed KBO routes")
         if any(width < 0 for width in self.route_feature_dims.values()):
             raise ValueError("route feature widths cannot be negative")
@@ -179,10 +213,13 @@ class KBORelGNNModel(ModuleBase):
         torch, _ = require_torch()
         super().__init__()
         self.config = config
+        self.uses_game_nodes = "game" in config.node_feature_dims
         node_widths = dict(config.node_feature_dims)
         role_widths = dict(config.role_feature_dims)
         if config.include_boxscore_heads:
-            for kind in node_widths:
+            # Box priors describe player/team history. Game nodes intentionally
+            # remain on their small, leakage-safe structural feature contract.
+            for kind in ("player", "team"):
                 node_widths[kind] += (
                     config.box_batting_feature_dim + config.box_pitching_feature_dim
                 )
@@ -211,6 +248,7 @@ class KBORelGNNModel(ModuleBase):
         )
         self.match_head: Any = WDLHead(
             config.hidden_dim,
+            context_dim=config.hidden_dim if self.uses_game_nodes else 0,
             hidden_dim=config.hidden_dim,
             dropout=config.dropout,
         )
@@ -232,6 +270,7 @@ class KBORelGNNModel(ModuleBase):
         self.run_head: Any = (
             DirectRunDistributionHead(
                 config.hidden_dim,
+                context_dim=config.hidden_dim if self.uses_game_nodes else 0,
                 hidden_dim=config.hidden_dim * 2,
                 dropout=config.dropout,
             )
@@ -278,13 +317,17 @@ class KBORelGNNModel(ModuleBase):
         roles = batch["role_features"]
         if self.config.include_boxscore_heads:
             nodes = {
-                kind: torch.cat(
-                    (
-                        values,
-                        batch[f"{kind}_box_batting_features"],
-                        batch[f"{kind}_box_pitching_features"],
-                    ),
-                    dim=-1,
+                kind: (
+                    torch.cat(
+                        (
+                            values,
+                            batch[f"{kind}_box_batting_features"],
+                            batch[f"{kind}_box_pitching_features"],
+                        ),
+                        dim=-1,
+                    )
+                    if kind in {"player", "team"}
+                    else values
                 )
                 for kind, values in nodes.items()
             }
@@ -306,8 +349,12 @@ class KBORelGNNModel(ModuleBase):
         pitching = state.player_role_states["pitching"]
         home = teams[batch["match_home_team_index"]]
         away = teams[batch["match_away_team_index"]]
-        match_logits = self.match_head(home, away)
+        games = state.node_states.get("game")
+        match_game = games[batch["match_game_index"]] if games is not None else None
+        match_logits = self.match_head(home, away, game_context=match_game)
         player = batting[batch["live_hit_player_index"]]
+        if games is not None:
+            player = player + games[batch["live_hit_game_index"]]
         offense = teams[batch["live_hit_team_index"]]
         defense = teams[batch["live_hit_opponent_index"]]
         live_features = torch.cat(
@@ -331,20 +378,32 @@ class KBORelGNNModel(ModuleBase):
             "live_hit_hit_probability": joint[:, :, 1:].sum(dim=(1, 2)),
             "live_hit_expected_hits": (joint * cast(Any, self).hit_support).sum(dim=(1, 2)),
             "live_hit_expected_pa": (joint * cast(Any, self).pa_support[:, None]).sum(dim=(1, 2)),
-            "pa_logits": self.pa_head(
-                batting[batch["pa_batter_index"]],
-                pitching[batch["pa_pitcher_index"]],
-                game_context=batch["pa_context"],
-            ),
         }
+        pa_batter = batting[batch["pa_batter_index"]]
+        pa_pitcher = pitching[batch["pa_pitcher_index"]]
+        if games is not None:
+            pa_game = games[batch["pa_game_index"]]
+            pa_batter = pa_batter + pa_game
+            pa_pitcher = pa_pitcher + pa_game
+        output["pa_logits"] = self.pa_head(
+            pa_batter,
+            pa_pitcher,
+            game_context=batch["pa_context"],
+        )
         if self.run_head is not None:
-            output["match_run_parameters"] = self.run_head(home, away)
+            output["match_run_parameters"] = self.run_head(
+                home,
+                away,
+                game_context=match_game,
+            )
         if self.config.include_boxscore_heads:
             for task, player_states, head in (
                 ("box_pa", batting, self.box_pa_head),
                 ("box_pitch", pitching, self.box_pitch_head),
             ):
                 player = player_states[batch[f"{task}_player_index"]]
+                if games is not None:
+                    player = player + games[batch[f"{task}_game_index"]]
                 team = teams[batch[f"{task}_team_index"]]
                 opponent = teams[batch[f"{task}_opponent_index"]]
                 features = torch.cat(
@@ -548,11 +607,20 @@ def collate_kbo_day_graphs(
     max_pa_per_day = max_pa_per_day or None
     max_edges_per_route_per_day = max_edges_per_route_per_day or None
     registry = kbo_route_registry()
-    node_parts: dict[str, list[Any]] = {"player": [], "team": []}
+    first_nodes = _get(days[0], "node_features")
+    if not isinstance(first_nodes, Mapping):
+        raise ValueError("each day needs node_features")
+    node_types = set(first_nodes)
+    if node_types not in ({"player", "team"}, {"player", "team", "game"}):
+        raise ValueError("each day needs player/team, with optional game node_features")
+    ordered_node_types = tuple(
+        kind for kind in ("player", "team", "game") if kind in node_types
+    )
+    node_parts: dict[str, list[Any]] = {kind: [] for kind in ordered_node_types}
     role_parts: dict[str, list[Any]] = {}
     box_feature_parts: dict[str, list[Any]] = {}
     box_feature_widths: dict[str, int] = {}
-    node_graph_parts: dict[str, list[Any]] = {"player": [], "team": []}
+    node_graph_parts: dict[str, list[Any]] = {kind: [] for kind in ordered_node_types}
     route_parts: dict[str, dict[str, list[Any]]] = {}
     vector_parts: dict[str, list[Any]] = {}
     matrix_parts: dict[str, list[Any]] = {
@@ -563,7 +631,7 @@ def collate_kbo_day_graphs(
         name: [] for name in ("match", "live_hit", "pa", "box_pa", "box_pitch")
     }
     day_ids: list[str] = []
-    offsets = {"player": 0, "team": 0}
+    offsets = dict.fromkeys(ordered_node_types, 0)
     node_widths: dict[str, int] = {}
     role_widths: dict[str, int] = {}
     route_widths: dict[str, int] = {}
@@ -576,8 +644,8 @@ def collate_kbo_day_graphs(
         day_id = str(_get(day, "day_id", graph_index))
         day_ids.append(day_id)
         nodes = _get(day, "node_features")
-        if not isinstance(nodes, Mapping) or set(nodes) != {"player", "team"}:
-            raise ValueError("each day needs player/team node_features")
+        if not isinstance(nodes, Mapping) or set(nodes) != node_types:
+            raise ValueError("node feature keys must agree across days")
         counts: dict[str, int] = {}
         for kind, raw in nodes.items():
             values = _float_array(raw, f"{kind} node_features", ndim=2)
@@ -618,6 +686,10 @@ def collate_kbo_day_graphs(
             raise ValueError("routes must map reviewed names to numeric arrays")
         for name, raw_route in routes.items():
             route = registry.require(name)
+            if route.source_type not in counts or route.destination_type not in counts:
+                raise ValueError(
+                    f"route {name!r} requires {route.source_type}/{route.destination_type} nodes"
+                )
             source = _integer_vector(raw_route["source_index"], f"{name} source_index")
             destination = _integer_vector(
                 raw_route["destination_index"], f"{name} destination_index"
@@ -675,6 +747,12 @@ def collate_kbo_day_graphs(
                 ("box_pitch_opponent_index", "team"),
             ),
         }
+        if "game" in node_types:
+            for task in query_specs:
+                query_specs[task] = (
+                    *query_specs[task],
+                    (f"{task}_game_index", "game"),
+                )
         for task, specifications in query_specs.items():
             indices = {
                 name: _integer_vector(_get(day, name, []), name) for name, _ in specifications
@@ -830,6 +908,7 @@ def collate_kbo_day_graphs(
 
 __all__ = [
     "KBO_ROUTE_NAMES",
+    "KBO_VNEXT_ROUTE_NAMES",
     "KBORelGNNConfig",
     "KBORelGNNModel",
     "collate_kbo_day_graphs",

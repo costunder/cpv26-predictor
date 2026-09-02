@@ -31,6 +31,8 @@ from cpv26.simulation.adapter import NEURAL_PA_OUTCOMES, neural_training_target_
 from cpv26.simulation.events import TerminalPlateAppearanceEvent
 
 GRAPH_DATASET_VERSION = 5
+GRAPH_VNEXT_DATASET_VERSION = 6
+GRAPH_SCHEMAS = ("v5", "vnext")
 _KST = ZoneInfo("Asia/Seoul")
 Array = NDArray[Any]
 BOX_BATTING_FIELDS = (
@@ -76,6 +78,12 @@ NODE_FEATURE_NAMES = {
         "recency",
     ),
 }
+VNEXT_GAME_FEATURE_NAMES = (
+    "is_current_query_game",
+    "is_historical_game",
+    "age_days_div90",
+    "scheduled_start_fraction_of_day",
+)
 ROLE_FEATURE_NAMES = {
     "batting": (
         "pa_log500",
@@ -153,6 +161,44 @@ ROUTE_METADATA = {
         "meaning": "historical final game, oriented historical home to away",
     },
 }
+VNEXT_ROUTE_FEATURE_NAMES = {
+    **ROUTE_FEATURE_NAMES,
+    "batter_game_participation": _PA_ROUTE_FEATURES,
+    "pitcher_game_participation": _PA_ROUTE_FEATURES,
+    "team_game_context": (
+        "is_current_query_game",
+        "is_home_team",
+        "is_away_team",
+        "is_historical_game",
+    ),
+}
+VNEXT_ROUTE_METADATA = {
+    **ROUTE_METADATA,
+    "batter_game_participation": {
+        "source_type": "player",
+        "destination_type": "game",
+        "source_role": "batting",
+        "destination_role": "shared",
+        "bidirectional": True,
+        "meaning": "past player-game batting participation; never a current-day appearance",
+    },
+    "pitcher_game_participation": {
+        "source_type": "player",
+        "destination_type": "game",
+        "source_role": "pitching",
+        "destination_role": "shared",
+        "bidirectional": True,
+        "meaning": "past player-game pitching participation; never a current-day appearance",
+    },
+    "team_game_context": {
+        "source_type": "team",
+        "destination_type": "game",
+        "source_role": "shared",
+        "destination_role": "shared",
+        "bidirectional": True,
+        "meaning": "known matchup structure for historical and current query games; no result",
+    },
+}
 PA_CONTEXT_FEATURE_NAMES = (
     "inning_div12",
     "is_bottom",
@@ -187,6 +233,7 @@ class GraphDay:
     player_ids: tuple[str, ...]
     team_ids: tuple[str, ...]
     arrays: dict[str, Array]
+    game_ids: tuple[str, ...] = ()
 
     @property
     def day_id(self) -> str:
@@ -194,7 +241,13 @@ class GraphDay:
 
     @property
     def node_features(self) -> dict[str, Array]:
-        return {"player": self.arrays["player_features"], "team": self.arrays["team_features"]}
+        result = {
+            "player": self.arrays["player_features"],
+            "team": self.arrays["team_features"],
+        }
+        if "game_features" in self.arrays:
+            result["game"] = self.arrays["game_features"]
+        return result
 
     @property
     def role_features(self) -> dict[str, Array]:
@@ -204,7 +257,8 @@ class GraphDay:
     def routes(self) -> dict[str, dict[str, Array]]:
         return {
             route: {key: self.arrays[f"{route}__{key}"] for key in _ROUTE_ARRAY_FIELDS}
-            for route in ROUTE_METADATA
+            for route in VNEXT_ROUTE_METADATA
+            if f"{route}__source_index" in self.arrays
         }
 
     def __getattr__(self, name: str) -> Any:
@@ -223,8 +277,31 @@ class KBOGraphDataset:
         self.directory = Path(directory).expanduser().resolve()
         with (self.directory / "manifest.json").open(encoding="utf-8") as handle:
             self.manifest: dict[str, Any] = json.load(handle)
-        if self.manifest.get("dataset_version") not in (2, 3, 4, GRAPH_DATASET_VERSION):
+        version = self.manifest.get("dataset_version")
+        if version not in (
+            2,
+            3,
+            4,
+            GRAPH_DATASET_VERSION,
+            GRAPH_VNEXT_DATASET_VERSION,
+        ):
             raise ValueError("unsupported KBO graph dataset version")
+        self.dataset_version = int(version)
+        node_dims = self.manifest.get("node_feature_dims")
+        route_dims = self.manifest.get("route_feature_dims")
+        if self.dataset_version == GRAPH_VNEXT_DATASET_VERSION:
+            if self.manifest.get("graph_schema") != "vnext":
+                raise ValueError("version-six graph manifest must declare graph_schema=vnext")
+            if not isinstance(node_dims, dict) or set(node_dims) != {"player", "team", "game"}:
+                raise ValueError("version-six graph manifest must declare game node features")
+            if not isinstance(route_dims, dict) or set(route_dims) != set(
+                VNEXT_ROUTE_FEATURE_NAMES
+            ):
+                raise ValueError("version-six graph manifest must declare every vNext route")
+        elif self.manifest.get("graph_schema") == "vnext" or (
+            isinstance(node_dims, dict) and "game" in node_dims
+        ):
+            raise ValueError("legacy graph versions cannot declare the vNext game schema")
         self._entries = {entry["day"]: entry for entry in self.manifest["days"]}
         if len(self._entries) != len(self.manifest["days"]):
             raise ValueError("duplicate graph days in manifest")
@@ -244,10 +321,14 @@ class KBOGraphDataset:
             raise ValueError(f"graph cache checksum mismatch: {key}")
         with np.load(path, allow_pickle=False) as archive:
             arrays = {name: archive[name] for name in archive.files}
+        has_game_ids = "_game_ids" in arrays
+        if has_game_ids != (self.dataset_version == GRAPH_VNEXT_DATASET_VERSION):
+            raise ValueError("graph archive game-node contract disagrees with manifest version")
         players = tuple(str(value) for value in arrays.pop("_player_ids"))
         teams = tuple(str(value) for value in arrays.pop("_team_ids"))
+        games = tuple(str(value) for value in arrays.pop("_game_ids", ()))
         _add_box_defaults(arrays, len(players), len(teams))
-        graph = GraphDay(date.fromisoformat(key), players, teams, arrays)
+        graph = GraphDay(date.fromisoformat(key), players, teams, arrays, games)
         _validate_graph(graph)
         return graph
 
@@ -305,8 +386,11 @@ class _Aggregate:
 class _History:
     """Incremental rolling aggregates, including publication/validity revisions."""
 
-    def __init__(self, records: list[_Record], rolling_days: int) -> None:
+    def __init__(
+        self, records: list[_Record], rolling_days: int, *, graph_schema: str = "v5"
+    ) -> None:
         self.rolling_days = rolling_days
+        self.graph_schema = graph_schema
         self.versions: dict[tuple[str, str], list[_Record]] = defaultdict(list)
         schedule: dict[date, set[tuple[str, str]]] = defaultdict(set)
         for record in records:
@@ -332,13 +416,17 @@ class _History:
         self.box_pitching: dict[str, _Aggregate] = {}
         self.box_team_batting: dict[str, _Aggregate] = {}
         self.box_team_pitching: dict[str, _Aggregate] = {}
+        self.games: dict[str, _Record] = {}
         # Active source versions, NOT latest retrospective labels. Rebuild only
         # changed player-game groups after publication/revision/expiry updates.
         self.box_inputs: dict[tuple[str, str, str], dict[str, _Record]] = defaultdict(dict)
         self.box_applied: dict[tuple[str, str, str], list[_Record]] = {}
         self.changed_box_groups: set[tuple[str, str, str]] = set()
+        route_names = list(ROUTE_METADATA)
+        if graph_schema == "vnext":
+            route_names.extend(("batter_game_participation", "pitcher_game_participation"))
         self.routes: dict[str, dict[tuple[str, str], _Aggregate]] = {
-            route: {} for route in ROUTE_METADATA
+            route: {} for route in route_names
         }
 
     def advance(self, day: date) -> None:
@@ -413,6 +501,18 @@ class _History:
                 ("pitcher_participation_team", (pitcher, data["fielding_team_id"])),
             ):
                 update(self.routes[route], key, record, record.values, add)
+            if self.graph_schema == "vnext":
+                for route, player in (
+                    ("batter_game_participation", batter),
+                    ("pitcher_game_participation", pitcher),
+                ):
+                    update(
+                        self.routes[route],
+                        (player, data["game_id"]),
+                        record,
+                        record.values,
+                        add,
+                    )
             for role, team in (
                 ("batting", data["batting_team_id"]),
                 ("pitching", data["fielding_team_id"]),
@@ -421,6 +521,11 @@ class _History:
         elif record.kind.startswith("box_"):
             self._track_box_input(record, data["role"], data["team_id"], add)
         else:
+            game_id = str(data["game_id"])
+            if add and _has_final_score(data):
+                self.games[game_id] = record
+            elif not add:
+                self.games.pop(game_id, None)
             if not _has_final_score(data):
                 return  # A cancellation/withdrawal still supersedes the old source row.
             home, away = data["home_team_id"], data["away_team_id"]
@@ -483,6 +588,19 @@ class _History:
                 values if values is not None else np.zeros(7),
                 add,
             )
+            if self.graph_schema == "vnext":
+                game_route = (
+                    "batter_game_participation"
+                    if role == "batting"
+                    else "pitcher_game_participation"
+                )
+                update(
+                    self.routes[game_route],
+                    (identity, data["game_id"]),
+                    record,
+                    values if values is not None else np.zeros(7),
+                    add,
+                )
 
 
 def build_kbo_graph_dataset(
@@ -493,6 +611,7 @@ def build_kbo_graph_dataset(
     start_day: date | str | None = None,
     end_day: date | str | None = None,
     knowledge_at: datetime | None = None,
+    graph_schema: str = "v5",
 ) -> KBOGraphDataset:
     """Build/reuse daily graphs; date filters NEVER truncate preceding history.
 
@@ -504,6 +623,8 @@ def build_kbo_graph_dataset(
     """
     if isinstance(rolling_days, bool) or not isinstance(rolling_days, int) or rolling_days < 1:
         raise ValueError("rolling_days must be a positive integer")
+    if graph_schema not in GRAPH_SCHEMAS:
+        raise ValueError(f"graph_schema must be one of: {', '.join(GRAPH_SCHEMAS)}")
     if knowledge_at is not None and knowledge_at.utcoffset() is None:
         raise ValueError("knowledge_at must be timezone-aware")
     first, last = _as_date(start_day), _as_date(end_day)
@@ -526,8 +647,19 @@ def build_kbo_graph_dataset(
         raise ValueError("no final KBO games in the requested date range")
     directory = Path(output_dir).expanduser().resolve()
     (directory / "days").mkdir(parents=True, exist_ok=True)
+    dataset_version = (
+        GRAPH_VNEXT_DATASET_VERSION if graph_schema == "vnext" else GRAPH_DATASET_VERSION
+    )
+    route_feature_names = (
+        VNEXT_ROUTE_FEATURE_NAMES if graph_schema == "vnext" else ROUTE_FEATURE_NAMES
+    )
+    route_metadata = VNEXT_ROUTE_METADATA if graph_schema == "vnext" else ROUTE_METADATA
+    node_feature_names = dict(NODE_FEATURE_NAMES)
+    if graph_schema == "vnext":
+        node_feature_names["game"] = VNEXT_GAME_FEATURE_NAMES
     config = {
-        "dataset_version": GRAPH_DATASET_VERSION,
+        "dataset_version": dataset_version,
+        **({"graph_schema": graph_schema} if graph_schema == "vnext" else {}),
         "rolling_days": rolling_days,
         "pa_incomplete_transition_context": "mask_pre_scores_unknown",
         "boxscore_history_policy": "common_player_game_observed_fields_v3",
@@ -540,7 +672,7 @@ def build_kbo_graph_dataset(
         else "database_snapshot",
     }
     config_fingerprint = _json_sha256(config)
-    history = _History(records, rolling_days)
+    history = _History(records, rolling_days, graph_schema=graph_schema)
     entries = []
     reused = 0
     for day in selected_days:
@@ -579,12 +711,17 @@ def build_kbo_graph_dataset(
             entries.append(cached)
             reused += 1
             continue
-        graph = _make_graph(day, history, labels[day])
+        graph = _make_graph(day, history, labels[day], graph_schema=graph_schema)
         _validate_graph(graph)
         temporary = path.with_suffix(".npz.part")
         archive_arrays: dict[str, Any] = {
             "_player_ids": np.asarray(graph.player_ids, dtype=np.str_),
             "_team_ids": np.asarray(graph.team_ids, dtype=np.str_),
+            **(
+                {"_game_ids": np.asarray(graph.game_ids, dtype=np.str_)}
+                if graph_schema == "vnext"
+                else {}
+            ),
             **graph.arrays,
         }
         with temporary.open("wb") as handle:
@@ -597,6 +734,7 @@ def build_kbo_graph_dataset(
             "input_fingerprint": input_fingerprint,
             "players": len(graph.player_ids),
             "teams": len(graph.team_ids),
+            **({"graph_game_nodes": len(graph.game_ids)} if graph_schema == "vnext" else {}),
             "games": len(graph.arrays["match_targets"]),
             "live_hit_queries": len(graph.arrays["live_hit_pa"]),
             "pa_queries": len(graph.arrays["pa_targets"]),
@@ -632,7 +770,7 @@ def build_kbo_graph_dataset(
         "season_coverage": _season_coverage(entries),
         "cache_reused_days": reused,
         "cache_built_days": len(entries) - reused,
-        "node_feature_dims": {key: len(value) for key, value in NODE_FEATURE_NAMES.items()},
+        "node_feature_dims": {key: len(value) for key, value in node_feature_names.items()},
         "role_feature_dims": {key: len(value) for key, value in ROLE_FEATURE_NAMES.items()},
         "player_role_feature_dims": {key: len(value) for key, value in ROLE_FEATURE_NAMES.items()},
         "boxscore_feature_dims": BOX_FEATURE_DIMS,
@@ -642,13 +780,13 @@ def build_kbo_graph_dataset(
             "encoding": "log1p observed sum / log501, log1p observed field count / log501, recency",
         },
         "box_pitch_target_fields": BOX_PITCHING_FIELDS,
-        "route_feature_dims": {key: len(value) for key, value in ROUTE_FEATURE_NAMES.items()},
+        "route_feature_dims": {key: len(value) for key, value in route_feature_names.items()},
         "feature_names": {
-            "nodes": NODE_FEATURE_NAMES,
+            "nodes": node_feature_names,
             "roles": ROLE_FEATURE_NAMES,
-            "routes": ROUTE_FEATURE_NAMES,
+            "routes": route_feature_names,
         },
-        "route_metadata": ROUTE_METADATA,
+        "route_metadata": route_metadata,
         "pa_context_dim": len(PA_CONTEXT_FEATURE_NAMES),
         "pa_context_feature_names": PA_CONTEXT_FEATURE_NAMES,
         "pa_target_classes": NEURAL_PA_OUTCOMES,
@@ -705,6 +843,17 @@ def build_kbo_graph_dataset(
             "ingestion": "retrospective database knowledge snapshot, not historical live ingestion",
             "same_day": "all same-day PA/boxscore/final stats are labels only, regardless of order",
             "current_players": "isolated query-only nodes unless they have eligible prior history",
+            "current_player_game_relation": (
+                "none_without_timestamped_asof_lineup_or_roster_source"
+                if graph_schema == "vnext"
+                else "not represented"
+            ),
+            "game_nodes": (
+                "rolling historical games plus current query games; current nodes contain no "
+                "score, result, lineup, starter, or observed appearance"
+                if graph_schema == "vnext"
+                else "not represented"
+            ),
             "team_membership": "past role-specific appearances, never today's actual roster",
             "match_queries": "home and away team only; no actual current lineup or pitcher",
             "live_hit": "conditional completed observed PA >= 1; not an appearance forecast",
@@ -995,17 +1144,45 @@ def _has_final_score(row: Mapping[str, Any]) -> bool:
     )
 
 
-def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay:
+def _make_graph(
+    day: date,
+    history: _History,
+    labels: list[_Record],
+    *,
+    graph_schema: str = "v5",
+) -> GraphDay:
+    vnext = graph_schema == "vnext"
     games = [row for row in labels if row.kind == "game"]
     pas = [row for row in labels if row.kind == "pa"]
     boxes = _label_boxes(labels)
     box_queries = {(row.data["player_id"], row.data["role"]): row.data for row in boxes}
+    current_game_records = {row.data["game_id"]: row for row in games}
+    historical_game_records = dict(history.games) if vnext else {}
+    game_route_aggregates: dict[str, _Aggregate] = {}
+    if vnext:
+        for route in ("batter_game_participation", "pitcher_game_participation"):
+            for (_, game_id), aggregate in history.routes[route].items():
+                previous = game_route_aggregates.get(game_id)
+                if previous is None or aggregate.last_event > previous.last_event:
+                    game_route_aggregates[game_id] = aggregate
     player_ids = tuple(
         sorted(
             set(history.batting)
             | set(history.pitching)
             | set(history.box_batting)
             | set(history.box_pitching)
+            | (
+                {
+                    key[0]
+                    for route in (
+                        "batter_game_participation",
+                        "pitcher_game_participation",
+                    )
+                    for key in history.routes[route]
+                }
+                if vnext
+                else set()
+            )
             | {key[0] for key in box_queries}
             | {row.data[key] for row in pas for key in ("batter_id", "pitcher_id")}
         )
@@ -1018,11 +1195,32 @@ def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay
                 for name in ("batter_participation_team", "pitcher_participation_team")
                 for key in history.routes[name]
             }
+            | (
+                {
+                    record.data[key]
+                    for record in historical_game_records.values()
+                    for key in ("home_team_id", "away_team_id")
+                }
+                if vnext
+                else set()
+            )
             | {row.data[key] for row in games for key in ("home_team_id", "away_team_id")}
         )
     )
+    game_ids = (
+        tuple(
+            sorted(
+                set(historical_game_records)
+                | set(game_route_aggregates)
+                | {row.data["game_id"] for row in games}
+            )
+        )
+        if vnext
+        else ()
+    )
     players = {value: index for index, value in enumerate(player_ids)}
     teams = {value: index for index, value in enumerate(team_ids)}
+    game_nodes = {value: index for index, value in enumerate(game_ids)}
     cutoff = datetime.combine(day, time.min, tzinfo=_KST).timestamp()
 
     def role_history(player: str, role: str) -> _Aggregate | None:
@@ -1061,6 +1259,22 @@ def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay
             dtype=np.float32,
         ).reshape(-1, 8),
     }
+    if vnext:
+        current_game_ids = {row.data["game_id"] for row in games}
+        arrays["game_features"] = np.asarray(
+            [
+                _game_node_features(
+                    game_id,
+                    current=game_id in current_game_ids,
+                    record=current_game_records.get(game_id)
+                    or historical_game_records.get(game_id),
+                    fallback=game_route_aggregates.get(game_id),
+                    cutoff=cutoff,
+                )
+                for game_id in game_ids
+            ],
+            dtype=np.float32,
+        ).reshape(-1, len(VNEXT_GAME_FEATURE_NAMES))
     for role, dimension in BOX_FEATURE_DIMS.items():
         personal = getattr(history, f"box_{role}")
         team_prior = getattr(history, f"box_team_{role}")
@@ -1085,10 +1299,12 @@ def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay
             ],
             dtype=np.float32,
         ).reshape(-1, dimension)
+    route_metadata = VNEXT_ROUTE_METADATA if vnext else ROUTE_METADATA
+    node_mappings = {"player": players, "team": teams, "game": game_nodes}
     for route, aggregates in history.routes.items():
-        metadata = ROUTE_METADATA[route]
-        source = players if metadata["source_type"] == "player" else teams
-        destination = players if metadata["destination_type"] == "player" else teams
+        metadata = route_metadata[route]
+        source = node_mappings[cast(str, metadata["source_type"])]
+        destination = node_mappings[cast(str, metadata["destination_type"])]
         keys = sorted(aggregates)
         prefix = f"{route}__"
         arrays[prefix + "source_index"] = np.asarray(
@@ -1101,7 +1317,7 @@ def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay
         arrays[prefix + "event_features"] = np.asarray(
             [_route_features(aggregates[key], cutoff, history.rolling_days, route) for key in keys],
             dtype=np.float32,
-        ).reshape(-1, 6)
+        ).reshape(-1, len(VNEXT_ROUTE_FEATURE_NAMES[route]))
         arrays[prefix + "event_age_seconds"] = np.asarray(
             [cutoff - aggregates[key].last_event for key in keys],
             dtype=np.float32,
@@ -1112,8 +1328,91 @@ def _make_graph(day: date, history: _History, labels: list[_Record]) -> GraphDay
         )
         # Count is already encoded as a feature; each aggregate is one relation.
         arrays[prefix + "weights"] = np.ones(len(keys), dtype=np.float32)
-    arrays.update(_queries(games, pas, players, teams, boxes))
-    return GraphDay(day, player_ids, team_ids, arrays)
+    if vnext:
+        _add_team_game_context_route(
+            arrays,
+            current_games=games,
+            historical_games=historical_game_records,
+            teams=teams,
+            games=game_nodes,
+            cutoff=cutoff,
+        )
+    arrays.update(_queries(games, pas, players, teams, boxes, game_nodes if vnext else None))
+    return GraphDay(day, player_ids, team_ids, arrays, game_ids)
+
+
+def _game_node_features(
+    game_id: str,
+    *,
+    current: bool,
+    record: _Record | None,
+    fallback: _Aggregate | None,
+    cutoff: float,
+) -> list[float]:
+    scheduled = record.data.get("scheduled_start") if record is not None else None
+    scheduled_fraction = 0.0
+    if isinstance(scheduled, datetime):
+        local = scheduled.astimezone(_KST)
+        scheduled_fraction = (
+            local.hour * 3600 + local.minute * 60 + local.second
+        ) / 86400
+    if current:
+        return [1.0, 0.0, 0.0, scheduled_fraction]
+    event_at = record.event_at.timestamp() if record is not None else None
+    if event_at is None and fallback is not None:
+        event_at = fallback.last_event
+    age_days = max(0.0, cutoff - event_at) / 86400 if event_at is not None else 90.0
+    return [0.0, 1.0, min(age_days / 90.0, 1.0), scheduled_fraction]
+
+
+def _add_team_game_context_route(
+    arrays: dict[str, Array],
+    *,
+    current_games: list[_Record],
+    historical_games: dict[str, _Record],
+    teams: dict[str, int],
+    games: dict[str, int],
+    cutoff: float,
+) -> None:
+    rows: list[tuple[str, str, bool, bool, _Record]] = []
+    for current, records in ((False, historical_games.values()), (True, current_games)):
+        for record in records:
+            game_id = record.data["game_id"]
+            rows.extend(
+                (
+                    (record.data["home_team_id"], game_id, True, current, record),
+                    (record.data["away_team_id"], game_id, False, current, record),
+                )
+            )
+    rows.sort(key=lambda row: (row[1], not row[2], row[0]))
+    prefix = "team_game_context__"
+    arrays[prefix + "source_index"] = np.asarray(
+        [teams[team_id] for team_id, *_ in rows], dtype=np.int64
+    )
+    arrays[prefix + "destination_index"] = np.asarray(
+        [games[game_id] for _, game_id, *_ in rows], dtype=np.int64
+    )
+    arrays[prefix + "event_features"] = np.asarray(
+        [
+            [float(current), float(home), float(not home), float(not current)]
+            for _, _, home, current, _ in rows
+        ],
+        dtype=np.float32,
+    ).reshape(-1, len(VNEXT_ROUTE_FEATURE_NAMES["team_game_context"]))
+    arrays[prefix + "event_age_seconds"] = np.asarray(
+        [0.0 if current else cutoff - record.event_at.timestamp() for *_, current, record in rows],
+        dtype=np.float32,
+    )
+    arrays[prefix + "publication_delay_seconds"] = np.asarray(
+        [
+            0.0
+            if current
+            else max(0.0, record.available_at.timestamp() - record.event_at.timestamp())
+            for *_, current, record in rows
+        ],
+        dtype=np.float32,
+    )
+    arrays[prefix + "weights"] = np.ones(len(rows), dtype=np.float32)
 
 
 def _box_prior_id(role: str, team: str) -> str:
@@ -1523,6 +1822,7 @@ def _queries(
     players: dict[str, int],
     teams: dict[str, int],
     boxes: list[_Record] | None = None,
+    game_nodes: dict[str, int] | None = None,
 ) -> dict[str, Array]:
     match_rows = [row.data for row in games]
     live: dict[tuple[str, str], list[Any]] = {}
@@ -1648,12 +1948,29 @@ def _queries(
         "pa_context": np.asarray(context, dtype=np.float32).reshape(-1, 10),
         "pa_query_ids": np.asarray([row["plate_appearance_id"] for row in pa_rows], dtype=np.str_),
     }
-    arrays.update(_box_queries(boxes or [], players, teams))
+    if game_nodes is not None:
+        arrays.update(
+            {
+                "match_game_index": np.asarray(
+                    [game_nodes[row["game_id"]] for row in match_rows], dtype=np.int64
+                ),
+                "live_hit_game_index": np.asarray(
+                    [game_nodes[key[0]] for key in live_keys], dtype=np.int64
+                ),
+                "pa_game_index": np.asarray(
+                    [game_nodes[row["game_id"]] for row in pa_rows], dtype=np.int64
+                ),
+            }
+        )
+    arrays.update(_box_queries(boxes or [], players, teams, game_nodes))
     return arrays
 
 
 def _box_queries(
-    boxes: list[_Record], players: dict[str, int], teams: dict[str, int]
+    boxes: list[_Record],
+    players: dict[str, int],
+    teams: dict[str, int],
+    game_nodes: dict[str, int] | None = None,
 ) -> dict[str, Array]:
     batting, pitching = [], []
     pa_counts, pitch_targets, pitch_masks = [], [], []
@@ -1699,6 +2016,10 @@ def _box_queries(
         arrays[f"{prefix}_query_ids"] = np.asarray(
             [row["observation_id"] for row in rows], dtype=np.str_
         )
+        if game_nodes is not None:
+            arrays[f"{prefix}_game_index"] = np.asarray(
+                [game_nodes[row["game_id"]] for row in rows], dtype=np.int64
+            )
     arrays["box_pa_counts"] = np.asarray(pa_counts, dtype=np.float32).reshape(-1, 10)
     arrays["box_pitch_targets"] = np.asarray(pitch_targets, dtype=np.float32).reshape(-1, 10)
     arrays["box_pitch_mask"] = np.asarray(pitch_masks, dtype=np.bool_).reshape(-1, 10)
@@ -1875,8 +2196,9 @@ def _identity_audit(labels: list[_Record]) -> dict[str, int]:
 
 
 def _validate_graph(graph: GraphDay) -> None:
-    if len(set(graph.player_ids)) != len(graph.player_ids) or len(set(graph.team_ids)) != len(
-        graph.team_ids
+    if any(
+        len(set(node_ids)) != len(node_ids)
+        for node_ids in (graph.player_ids, graph.team_ids, graph.game_ids)
     ):
         raise ValueError("duplicate graph node IDs")
     for name, array in graph.arrays.items():
@@ -1889,23 +2211,62 @@ def _validate_graph(graph: GraphDay) -> None:
         ("player_batting_features", len(graph.player_ids), 8),
         ("player_pitching_features", len(graph.player_ids), 8),
         ("team_features", len(graph.team_ids), 8),
+        *(
+            (("game_features", len(graph.game_ids), len(VNEXT_GAME_FEATURE_NAMES)),)
+            if "game_features" in graph.arrays
+            else ()
+        ),
     ):
         if graph.arrays[name].shape != (size, dimension):
             raise ValueError(f"invalid node feature dimensions: {name}")
+    if bool(graph.game_ids) != ("game_features" in graph.arrays):
+        raise ValueError("game node IDs/features must be present together")
+    route_metadata = (
+        VNEXT_ROUTE_METADATA if "game_features" in graph.arrays else ROUTE_METADATA
+    )
+    if set(graph.routes) != set(route_metadata):
+        raise ValueError("graph archive is missing required reviewed route arrays")
+    node_sizes = {
+        "player": len(graph.player_ids),
+        "team": len(graph.team_ids),
+        "game": len(graph.game_ids),
+    }
     for name, arrays in graph.routes.items():
-        metadata = ROUTE_METADATA[name]
+        metadata = route_metadata[name]
         count = len(arrays["source_index"])
         for side in ("source", "destination"):
-            limit = len(
-                graph.player_ids if metadata[f"{side}_type"] == "player" else graph.team_ids
-            )
-            index = arrays[f"{side}_index"]
-            if index.shape != (count,) or np.any(index < 0) or np.any(index >= limit):
+            limit = node_sizes[cast(str, metadata[f"{side}_type"])]
+            route_index = arrays[f"{side}_index"]
+            if (
+                route_index.shape != (count,)
+                or np.any(route_index < 0)
+                or np.any(route_index >= limit)
+            ):
                 raise ValueError(f"invalid route {side} indices: {name}")
-        if arrays["event_features"].shape != (count, 6):
+        if arrays["event_features"].shape != (
+            count,
+            len(VNEXT_ROUTE_FEATURE_NAMES[name]),
+        ):
             raise ValueError(f"invalid route features: {name}")
         if np.any(arrays["event_age_seconds"] < arrays["publication_delay_seconds"]):
             raise ValueError(f"route includes information unavailable at cutoff: {name}")
+    if "game_features" in graph.arrays:
+        query_counts = {
+            "match": len(graph.arrays["match_targets"]),
+            "live_hit": len(graph.arrays["live_hit_pa"]),
+            "pa": len(graph.arrays["pa_targets"]),
+            "box_pa": len(graph.arrays["box_pa_counts"]),
+            "box_pitch": len(graph.arrays["box_pitch_targets"]),
+        }
+        for prefix, count in query_counts.items():
+            query_game_index = graph.arrays.get(f"{prefix}_game_index")
+            if (
+                query_game_index is None
+                or query_game_index.shape != (count,)
+                or np.any(query_game_index < 0)
+                or np.any(query_game_index >= len(graph.game_ids))
+            ):
+                raise ValueError(f"invalid {prefix} game indices")
     live_pa = graph.arrays["live_hit_pa"]
     live_min = graph.arrays.get("live_hit_pa_min", live_pa)
     if (

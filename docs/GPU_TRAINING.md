@@ -411,11 +411,101 @@ GNN 구조가 node-only 모델보다 일반화 성능이 좋다는 뜻은 아닙
 마지막 한 번의 평가에 사용합니다. `--max-days` 결과는 실행 경로를 확인하는 smoke 진단으로만
 취급합니다.
 
-## Matched-from-scratch 그래프 ablation
+## 이번 범위의 1~5단계 capacity·graph-vNext 비교
+
+여기서는 이미 완료된 **단일 seed × 6조건 × 64 hidden × 2 layer** suite를 다시 학습하지
+않는다. 기존 결과를 감사·재사용하고, 새 학습은 128×3 `full`/`node_only` 두 run과
+graph-vNext `full`/`node_only` 두 run으로 제한한다. multi-seed 확장은 이 범위에 없다.
+
+1. 기존 v5 그래프의 연도·관계별 노드/edge 수, route별 복원 관계 이벤트가 edge로 압축된 비율,
+   질의 노드의 고립률·차수와 1-hop/2-hop 도달 범위를 감사한다.
+
+~~~bash
+cpv26 kbo-graph-audit \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --end-date 2025-12-31 \
+  --output var/reports/kbo_graph_audit_v5.json
+~~~
+
+이 명령은 정적 그래프 구조 검사다. 앞 절의 `relgnn-graph-diagnose`처럼 checkpoint의 예측을
+intervention 전후로 비교하지 않는다. `--end-date`는 validation 종료일이어야 하며 held-out
+test 날짜의 실제 query 선수나 분포를 감사에 포함하지 않는다.
+
+2. 완료된 단일-seed 64×2 matched suite에서 `full`과 `node_only` 결과를 읽기 전용 baseline으로
+   재사용한다.
+3. baseline과 같은 seed·split·loss·optimizer·epoch 예산으로 128×3 `full`과 `node_only`만
+   새로 학습한다.
+
+~~~bash
+cpv26 relgnn-capacity-compare \
+  --baseline-suite var/runs/relgnn_ablations/kbo_2001_2024_v5 \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --output var/runs/relgnn_capacity/kbo_2001_2024_v5_64x2_vs_128x3
+~~~
+
+baseline은 정확히 seed 하나로 완료된 64×2 suite여야 한다. 이 명령은 64×2 모델이나 나머지
+네 조건을 재학습하지 않는다. 데이터 fingerprint, 각 용량 안의 `full`/`node_only` 초기 state,
+attempted-step 예산, train/validation 날짜와 test 봉인 lineage가 맞지 않으면 fail-closed로
+중단한다.
+
+4. DB schema 5는 유지한 채 별도 graph cache version 6인 graph-vNext를 만든다.
+
+~~~bash
+cpv26 kbo-graph-build \
+  --output var/datasets/kbo_graph_2001_2026_vnext \
+  --start-date 2001-01-01 \
+  --end-date 2026-07-26 \
+  --graph-schema vnext
+~~~
+
+vNext는 기존 player/team 노드와 네 관계를 유지하면서 `game` 노드를 추가한다. rolling window의
+과거 경기와 당일 예측 질의 경기가 각각 하나의 game node가 되며, 확인된 **과거** 타자·투수
+출전만 `batter_game_participation`/`pitcher_game_participation`으로 연결한다. 과거와 현재 경기의
+홈·원정 팀은 `team_game_context`로 연결한다. 현재 game node와 team-game edge에는 대진과
+예정 시작시각만 있고 점수·결과·당일 실제 출전은 없다.
+
+시점이 명시된 사전 라인업·선발·roster 원천이 없으므로 현재 경기의 player-game edge,
+라인업이나 선발 관계를 추정해서 만들지 않는다. 현재 선수 출전이 정답에서 입력으로 새는
+것도 허용하지 않는다. 더블헤더의 각 경기는 서로 다른 game node를 사용하고, 같은 날 먼저
+끝난 경기 결과도 다른 경기의 과거 입력이 되지 않는다.
+
+5. vNext에서 같은 초기화·학습 예산으로 `full`과 `node_only`를 seed 하나씩만 학습한다.
+
+~~~bash
+cpv26 relgnn-pair-train \
+  --dataset var/datasets/kbo_graph_2001_2026_vnext \
+  --output var/runs/relgnn_pairs/kbo_2001_2024_vnext_128x3_seed2026 \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
+  --device cuda:0 \
+  --epochs 30 \
+  --batch-days 8 \
+  --hidden-dim 128 \
+  --layers 3 \
+  --heads 4 \
+  --workers 0 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
+  --amp auto \
+  --seed 2026
+~~~
+
+두 비교 명령은 validation으로 checkpoint를 고르고 조건 차이를 계산한다. 지정한 test 시즌은
+sealed metadata일 뿐 graph나 label을 로드하거나 평가하지 않는다. 단일 seed의 validation
+차이는 capacity/schema 확장 방향을 고르는 screening이며 seed 간 분산이나 안정성의 근거가
+아니다. 이 단계에서는 seed를 추가하지 않고 test도 계속 봉인한다.
+
+## Matched-from-scratch 그래프 ablation (기존 6조건, 이번 범위에서는 사용하지 않음)
 
 `relgnn-ablation-train`은 고정 checkpoint intervention과 별개로 여섯 조건을 처음부터
 재학습합니다. seed마다 모든 조건이 같은 데이터 순서·sampling·초기화를 사용하며, 초기
 `state_dict` SHA-256과 parameter 수가 하나라도 다르면 학습 전에 중단합니다.
+
+아래 절은 기존 전체 ablation 재현 절차로 그대로 보존한다. 위 1~5단계에서는 실행하지 않고,
+이미 완료된 단일-seed suite를 2~3단계의 baseline으로만 읽는다.
 
 ~~~bash
 cpv26 relgnn-ablation-train \

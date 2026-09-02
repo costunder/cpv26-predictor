@@ -327,6 +327,120 @@ def test_same_day_results_and_lineup_do_not_change_graph_features(tmp_path: Path
     assert before.live_hit_hits.tolist() != after.live_hit_hits.tolist()
 
 
+def test_vnext_adds_game_resolution_without_current_player_game_leakage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    legacy = build_kbo_graph_dataset(database, tmp_path / "legacy")
+    dataset = build_kbo_graph_dataset(
+        database, tmp_path / "vnext", graph_schema="vnext"
+    )
+
+    assert legacy.manifest["dataset_version"] == 5
+    assert "graph_schema" not in legacy.manifest
+    assert legacy.manifest["node_feature_dims"] == {"player": 4, "team": 8}
+    assert dataset.manifest["dataset_version"] == 6
+    assert dataset.manifest["graph_schema"] == "vnext"
+    assert dataset.manifest["node_feature_dims"] == {"player": 4, "team": 8, "game": 4}
+
+    second = dataset.load_day("2023-04-02")
+    assert set(second.game_ids) == {"g1", "g2"}
+    assert second.node_features["game"][second.game_ids.index("g1")].tolist()[:2] == [0, 1]
+    assert second.node_features["game"][second.game_ids.index("g2")].tolist()[:2] == [1, 0]
+    assert second.match_game_index.tolist() == [second.game_ids.index("g2")]
+
+    for route_name in ("batter_game_participation", "pitcher_game_participation"):
+        route = second.routes[route_name]
+        destinations = {second.game_ids[index] for index in route["destination_index"]}
+        assert destinations == {"g1"}
+    context = second.routes["team_game_context"]
+    assert len(context["source_index"]) == 4
+    current = context["event_features"][:, 0].astype(bool)
+    assert current.sum() == 2
+    assert set(context["event_age_seconds"][current]) == {0}
+    for route in second.routes.values():
+        assert np.all(route["event_age_seconds"] >= route["publication_delay_seconds"])
+
+    third = dataset.load_day("2023-04-03")
+    route = third.routes["batter_game_participation"]
+    old = third.player_ids.index("old-batter")
+    old_games = {
+        third.game_ids[destination]
+        for source, destination in zip(
+            route["source_index"], route["destination_index"], strict=True
+        )
+        if source == old
+    }
+    assert old_games == {"g1", "g2"}
+
+
+def test_vnext_inputs_are_invariant_to_current_day_results(tmp_path: Path) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    before = build_kbo_graph_dataset(
+        database, tmp_path / "before-vnext", graph_schema="vnext"
+    ).load_day("2023-04-02")
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("UPDATE game SET home_score = 30 WHERE game_id = 'g2'")
+        connection.execute("""
+            UPDATE observed_plate_appearance SET is_hit = false, total_bases = 0,
+                outcome = 'strikeout', home_score_before = 19 WHERE game_id = 'g2'
+        """)
+    after = build_kbo_graph_dataset(
+        database, tmp_path / "after-vnext", graph_schema="vnext"
+    ).load_day("2023-04-02")
+
+    assert before.player_ids == after.player_ids
+    assert before.team_ids == after.team_ids
+    assert before.game_ids == after.game_ids
+    for key in before.arrays:
+        if key.endswith("features") or "__" in key or key.endswith("_game_index"):
+            np.testing.assert_array_equal(before.arrays[key], after.arrays[key])
+    assert before.match_runs.tolist() != after.match_runs.tolist()
+    assert before.live_hit_hits.tolist() != after.live_hit_hits.tolist()
+
+
+def test_vnext_current_doubleheaders_have_distinct_known_time_features(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    with duckdb.connect(str(database)) as connection:
+        _game(connection, "g2-doubleheader", 2)
+        connection.execute("""
+            UPDATE game
+            SET scheduled_start = TIMESTAMPTZ '2023-04-02 18:30:00+09'
+            WHERE game_id = 'g2-doubleheader'
+        """)
+    graph = build_kbo_graph_dataset(
+        database, tmp_path / "vnext-doubleheader", graph_schema="vnext"
+    ).load_day("2023-04-02")
+
+    assert set(graph.match_query_ids.tolist()) == {"g2", "g2-doubleheader"}
+    by_game = {
+        game_id: graph.game_features[graph.game_ids.index(game_id), -1]
+        for game_id in ("g2", "g2-doubleheader")
+    }
+    assert by_game["g2"] == 0
+    assert by_game["g2-doubleheader"] == pytest.approx(18.5 / 24)
+    assert len(set(graph.match_game_index.tolist())) == 2
+
+
+def test_vnext_manifest_contract_is_fail_closed(tmp_path: Path) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    directory = tmp_path / "vnext"
+    build_kbo_graph_dataset(database, directory, graph_schema="vnext")
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("graph_schema")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="graph_schema=vnext"):
+        KBOGraphDataset(directory)
+
+
 def test_window_expiry_and_range_filter_keep_original_history(tmp_path: Path) -> None:
     database = tmp_path / "canonical.duckdb"
     _database(database)

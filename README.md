@@ -331,12 +331,96 @@ cpv26 relgnn-graph-diagnose \
 여러 seed로 비교해야 합니다. 그 결정까지 validation에서 하고 2026 test는 마지막 평가에만
 사용합니다.
 
-### 5-2. 같은 초기화와 예산으로 그래프 구조 재학습 비교
+### 5-2. 이번 범위의 1~5단계: 크기와 그래프 해상도 확인
+
+이번 작업은 이미 끝난 **단일 seed × 6조건 × 64 hidden × 2 layer** 결과를 다시 돌리지
+않습니다. 아래 1~5단계까지만 실행하며 multi-seed 확장은 포함하지 않습니다.
+
+1. 기존 v5 그래프의 노드·관계 수, route별 복원 관계 이벤트의 edge 압축률, 질의 노드 고립률·차수,
+   1-hop/2-hop 도달 범위를 감사합니다.
+
+~~~bash
+cpv26 kbo-graph-audit \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --end-date 2025-12-31 \
+  --output var/reports/kbo_graph_audit_v5.json
+~~~
+
+이 감사는 그래프 자체의 크기와 연결 범위를 재는 정적 검사입니다. 5-1절의
+`relgnn-graph-diagnose`처럼 학습된 checkpoint의 예측 의존도를 재평가하는 명령이 아닙니다.
+`--end-date`는 validation 종료일로 지정해야 하며 held-out test 날짜를 포함하면 안 됩니다.
+
+2. 완료된 단일-seed 64×2 suite의 `full`과 `node_only` validation 결과를 그대로 읽습니다.
+3. 같은 seed·분할·loss·optimizer·epoch 예산으로 **128×3의 `full`과 `node_only`만** 새로
+   학습해 용량 증가 전후의 `node_only - full` validation 차이를 비교합니다.
+
+~~~bash
+cpv26 relgnn-capacity-compare \
+  --baseline-suite var/runs/relgnn_ablations/kbo_2001_2024_v5 \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --output var/runs/relgnn_capacity/kbo_2001_2024_v5_64x2_vs_128x3
+~~~
+
+`--baseline-suite`는 정확히 seed 하나로 완료된 64×2 matched suite여야 합니다. 이 명령은
+그 안의 64×2 모델을 재학습하지 않고, 128×3 두 run만 추가합니다. 데이터 fingerprint,
+각 용량 안의 `full`/`node_only` 초기화, 학습 예산과 split lineage가 맞지 않거나 test 봉인을
+증명하지 못하면 중단합니다.
+
+4. 관계를 한 쌍의 90일 집계 edge에만 압축하는 한계를 확인하기 위해 graph-vNext를 별도
+   디렉터리에 만듭니다. DB schema는 5를 유지하고 graph cache version만 6이 됩니다.
+
+~~~bash
+cpv26 kbo-graph-build \
+  --output var/datasets/kbo_graph_2001_2026_vnext \
+  --start-date 2001-01-01 \
+  --end-date 2026-07-26 \
+  --graph-schema vnext
+~~~
+
+vNext는 과거 경기와 당일 질의 경기의 `game` 노드를 추가합니다. 확인된 **과거**
+타자/투수 출전만 player-game 관계로 연결하고, 과거·현재 경기의 홈/원정 팀은
+team-game 관계로 연결합니다. 현재 경기 노드와 team-game 관계에는 대진·예정 시작시각만 있으며
+점수·결과·실제 출전은 없습니다. 시점이 명시된 사전 라인업·선발 원천이 없으므로 현재
+player-game, 라인업, 선발 관계를 추정하거나 만들지 않습니다.
+
+5. vNext에서 같은 초기화와 예산의 `full`과 `node_only`를 seed 하나로 한 번씩만 학습합니다.
+
+~~~bash
+cpv26 relgnn-pair-train \
+  --dataset var/datasets/kbo_graph_2001_2026_vnext \
+  --output var/runs/relgnn_pairs/kbo_2001_2024_vnext_128x3_seed2026 \
+  --train-start-year 2001 \
+  --train-end-year 2024 \
+  --validation-year 2025 \
+  --test-year 2026 \
+  --chronological \
+  --device cuda:0 \
+  --epochs 30 \
+  --batch-days 8 \
+  --hidden-dim 128 \
+  --layers 3 \
+  --heads 4 \
+  --workers 0 \
+  --max-pa-per-day 0 \
+  --max-edges-per-route 0 \
+  --amp auto \
+  --seed 2026
+~~~
+
+두 비교 명령은 checkpoint 선택과 조건 비교에 validation만 사용하며, 지정한 test 시즌의
+graph와 label을 로드하거나 평가하지 않습니다. 단일 seed 결과는 용량·schema 변경의 다음
+실험 방향을 고르는 screening일 뿐 seed 간 분산이나 안정성의 근거가 아닙니다. 이번 범위에는
+seed 추가와 multi-seed 결론이 없으며 test는 계속 봉인합니다.
+
+### 5-3. 기존 여섯 조건 전체 비교 (이번 범위에서는 사용하지 않음)
 
 고정 checkpoint 진단 다음에는 여섯 조건을 처음부터 다시 학습합니다. 아래 명령은 seed 3개마다
 조건 6개, 즉 전체 학습 18회를 순서대로 실행하므로 단일 학습보다 훨씬 오래 걸립니다. 먼저
 `--seed 2026` 하나와 `--max-days-per-split`으로 실행 경로만 확인할 수 있지만 그 결과는
 전체 기간 비교가 아닙니다.
+
+이 절은 기존 전체 ablation 재현용으로 보존합니다. 위 1~5단계에서는 이 명령을 실행하지
+않으며, 완료된 단일-seed suite를 2~3단계의 읽기 전용 baseline으로만 사용합니다.
 
 ~~~bash
 cpv26 relgnn-ablation-train \
@@ -464,7 +548,7 @@ cpv26 relgnn-ablation-train \
 
 ## 6. 2026 부분 시즌 test 평가
 
-5-2절까지 실행했다면 `matched_retraining_report.json`의 **seed aggregate validation**으로
+5-3절의 기존 전체 비교를 실행했다면 `matched_retraining_report.json`의 **seed aggregate validation**으로
 variant를 선택합니다. 그 뒤 가장 validation이 좋았던 seed까지 고르면 seed cherry-picking이
 되므로 checkpoint seed는 결과를 보기 전에 고정합니다. 아래는 seed 2026을 사전 고정했고
 aggregate 결과에서 `normalized`를 선택했다는 실행 예입니다. 사전 정의했다면 모든 seed를

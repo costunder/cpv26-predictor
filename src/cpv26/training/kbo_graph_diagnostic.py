@@ -24,7 +24,12 @@ import numpy as np
 
 from cpv26.graph import TorchAtomicRouteBatch
 from cpv26.models._torch import require_torch
-from cpv26.models.kbo_relgnn import KBO_ROUTE_NAMES, KBORelGNNConfig, KBORelGNNModel
+from cpv26.models.kbo_relgnn import (
+    KBO_ROUTE_NAMES,
+    KBO_VNEXT_ROUTE_NAMES,
+    KBORelGNNConfig,
+    KBORelGNNModel,
+)
 from cpv26.models.relgnn import RelGNNDiagnosticsObserver
 
 _ROUTE_TENSOR_FIELDS = (
@@ -57,17 +62,61 @@ class KBOGraphTransformSpec:
     mode: str = "intact"
     seed: int = 2026
     route_name: str | None = None
+    reviewed_route_names: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in _TRANSFORM_MODES:
             raise ValueError(f"unsupported graph transform mode: {self.mode}")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
             raise ValueError("graph transform seed must be a non-negative integer")
+        reviewed: tuple[str, ...] = KBO_ROUTE_NAMES
+        if self.reviewed_route_names is not None:
+            if not isinstance(self.reviewed_route_names, tuple):
+                raise TypeError("reviewed_route_names must be a tuple when supplied")
+            reviewed = _validated_route_names(self.reviewed_route_names)
+            object.__setattr__(self, "reviewed_route_names", reviewed)
         if self.mode == "route_knockout":
-            if self.route_name not in KBO_ROUTE_NAMES:
+            if self.route_name not in reviewed:
                 raise ValueError("route knockout requires one reviewed KBO route")
         elif self.route_name is not None:
             raise ValueError("route_name is valid only for route_knockout")
+
+
+def _validated_route_names(route_names: Sequence[str]) -> tuple[str, ...]:
+    names = tuple(route_names)
+    if not names:
+        raise ValueError("diagnostic route names cannot be empty")
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("diagnostic route names must be non-empty strings")
+    if len(names) != len(set(names)):
+        raise ValueError("diagnostic route names must be unique")
+    return names
+
+
+def _checkpoint_route_names(state: Mapping[str, Any]) -> tuple[str, ...]:
+    """Read the exact route contract saved by this checkpoint.
+
+    Checkpoints predating ``route_feature_dims`` used only the four legacy KBO
+    routes, so that genuinely old format retains its historical diagnostic
+    condition set.  Modern legacy and vNext checkpoints take their names from
+    their own model config rather than a process-global route union.
+    """
+
+    model_config = state.get("model_config")
+    if not isinstance(model_config, Mapping):
+        raise ValueError("checkpoint model_config must be a mapping")
+    raw_route_dims = model_config.get("route_feature_dims")
+    if raw_route_dims is None:
+        return KBO_ROUTE_NAMES
+    if not isinstance(raw_route_dims, Mapping):
+        raise ValueError("checkpoint route_feature_dims must be a mapping")
+    saved = _validated_route_names(tuple(raw_route_dims))
+    # JSON manifests are written with sorted keys, which must not reorder the
+    # established diagnostic conditions.  The checkpoint still controls the
+    # exact route *set*; this only restores the reviewed semantic order.
+    reviewed = tuple(name for name in KBO_VNEXT_ROUTE_NAMES if name in saved)
+    unknown = tuple(name for name in saved if name not in KBO_VNEXT_ROUTE_NAMES)
+    return (*reviewed, *unknown)
 
 
 def _stable_seed(*parts: object) -> int:
@@ -964,8 +1013,11 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
 
 
 def _condition_specs(
-    seed: int, include_edge_attribute_permutation: bool
+    seed: int,
+    include_edge_attribute_permutation: bool,
+    route_names: Sequence[str] = KBO_ROUTE_NAMES,
 ) -> tuple[tuple[str, KBOGraphTransformSpec], ...]:
+    reviewed_route_names = _validated_route_names(route_names)
     result = [
         ("intact", KBOGraphTransformSpec("intact", seed)),
         ("no_routes", KBOGraphTransformSpec("no_routes", seed)),
@@ -981,9 +1033,14 @@ def _condition_specs(
     result.extend(
         (
             f"without_{route_name}",
-            KBOGraphTransformSpec("route_knockout", seed, route_name),
+            KBOGraphTransformSpec(
+                "route_knockout",
+                seed,
+                route_name,
+                reviewed_route_names=reviewed_route_names,
+            ),
         )
-        for route_name in KBO_ROUTE_NAMES
+        for route_name in reviewed_route_names
     )
     return tuple(result)
 
@@ -1040,6 +1097,7 @@ def diagnose_kbo_graph_dependence(
         max_days_per_split=max_days if max_days is not None else options.max_days_per_split,
     )
     checkpoint_graph_control = runner._validate_checkpoint_graph_control(state, options)
+    route_names = _checkpoint_route_names(state)
     selected, dtype, runtime = runner._device_and_precision(device, amp)
     directory = Path(dataset_directory or state["dataset_directory"]).expanduser().resolve()
     dataset = KBOGraphDataset(directory)
@@ -1074,7 +1132,9 @@ def diagnose_kbo_graph_dependence(
     baseline_metrics: dict[str, Any] | None = None
     baseline_predictions: dict[str, list[dict[str, Any]]] | None = None
     conditions: dict[str, Any] = {}
-    for name, spec in _condition_specs(seed, include_edge_attribute_permutation):
+    for name, spec in _condition_specs(
+        seed, include_edge_attribute_permutation, route_names
+    ):
         transform = KBOGraphBatchTransform(spec)
         # Full tensor statistics force device-to-host synchronisation.  One
         # intact pass is sufficient to inspect learned attention/gates; the
@@ -1111,6 +1171,7 @@ def diagnose_kbo_graph_dependence(
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "checkpoint_epoch": int(state["epoch"]),
         "checkpoint_graph_control": checkpoint_graph_control,
+        "route_names": list(route_names),
         "dataset_directory": str(directory),
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "split": split,

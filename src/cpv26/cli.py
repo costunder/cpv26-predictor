@@ -544,7 +544,10 @@ def gpu_check(
 @app.command("kbo-graph-build")
 def kbo_graph_build(
     output: Annotated[
-        Path | None, typer.Option(help="Default: CPV26_HOME/datasets/kbo_graph.")
+        Path | None,
+        typer.Option(
+            help="Default: datasets/kbo_graph for v5, datasets/kbo_graph_vnext for vnext."
+        ),
     ] = None,
     rolling_days: Annotated[int, typer.Option(min=1, help="Past-only graph history window.")] = 90,
     start_date: Annotated[
@@ -553,11 +556,18 @@ def kbo_graph_build(
     end_date: Annotated[
         str, typer.Option(help="Last prediction date (YYYY-MM-DD).")
     ] = "2025-12-31",
+    graph_schema: Annotated[
+        str,
+        typer.Option(
+            help="Graph cache schema: v5 (legacy aggregate graph) or vnext (game-resolved v6)."
+        ),
+    ] = "v5",
 ) -> None:
     """Materialize actual KBO history into leakage-resistant day graphs."""
     settings = _settings()
     _require_database(settings.database_path)
-    directory = (output or settings.home / "datasets" / "kbo_graph").expanduser().resolve()
+    default_name = "kbo_graph_vnext" if graph_schema == "vnext" else "kbo_graph"
+    directory = (output or settings.home / "datasets" / default_name).expanduser().resolve()
     try:
         from cpv26.data.kbo_graph_dataset import build_kbo_graph_dataset
 
@@ -567,12 +577,60 @@ def kbo_graph_build(
             rolling_days=rolling_days,
             start_day=date.fromisoformat(start_date),
             end_day=date.fromisoformat(end_date),
+            graph_schema=graph_schema,
         )
     except (DuckDBError, ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
         error_console.print(f"[red]KBO graph preparation failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     console.print(f"[green]Graph dataset ready[/green]: {directory}")
     console.print(f"Days: {len(dataset.days())}; fingerprint: {dataset.manifest['fingerprint']}")
+
+
+@app.command("kbo-graph-audit")
+def kbo_graph_audit(
+    end_date: Annotated[
+        str,
+        typer.Option(
+            help="Last audited date (YYYY-MM-DD); set this to validation end, before test."
+        ),
+    ],
+    dataset: Annotated[
+        Path | None, typer.Option(help="Default: CPV26_HOME/datasets/kbo_graph.")
+    ] = None,
+    output: Annotated[
+        Path | None, typer.Option(help="Default: CPV26_HOME/reports/kbo_graph_audit.json.")
+    ] = None,
+    start_date: Annotated[
+        str | None, typer.Option(help="Optional first audited date (YYYY-MM-DD).")
+    ] = None,
+) -> None:
+    """Audit graph size, relation compression, isolation, and one/two-hop coverage."""
+
+    settings = _settings()
+    directory = (dataset or settings.home / "datasets" / "kbo_graph").expanduser().resolve()
+    target = (
+        output or settings.home / "reports" / "kbo_graph_audit.json"
+    ).expanduser().resolve()
+    try:
+        from cpv26.data.kbo_graph_audit import audit_kbo_graph_dataset
+
+        report = audit_kbo_graph_dataset(
+            directory,
+            start_day=date.fromisoformat(start_date) if start_date is not None else None,
+            end_day=date.fromisoformat(end_date),
+        )
+        _write_json_report(target, report)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]KBO graph audit failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    summary = report["totals"]
+    node_occurrences = sum(summary["node_occurrences"].values())
+    edge_occurrences = summary["history_compression"]["unique_edge_occurrences"]
+    console.print(f"[green]Graph audit ready[/green]: {target}")
+    console.print(
+        f"Days: {summary['days']}; node occurrences: {node_occurrences}; "
+        f"unique edge occurrences: {edge_occurrences}"
+    )
 
 
 @app.command("relgnn-train")
@@ -896,6 +954,169 @@ def relgnn_ablation_train(
     console.print(
         f"{test_year} test was not loaded or evaluated; all comparisons above use validation only."
     )
+
+
+@app.command("relgnn-capacity-compare")
+def relgnn_capacity_compare(
+    baseline_suite: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            help="Completed one-seed 64x2 matched suite to reuse; it is never retrained.",
+        ),
+    ],
+    dataset: Annotated[
+        Path | None, typer.Option(help="Default: CPV26_HOME/datasets/kbo_graph.")
+    ] = None,
+    output: Annotated[
+        Path | None, typer.Option(help="Comparison directory; reuse it to resume safely.")
+    ] = None,
+) -> None:
+    """Reuse 64x2 and train only one-seed 128x3 full/node_only."""
+
+    from dataclasses import replace
+
+    settings = _settings()
+    directory = (dataset or settings.home / "datasets" / "kbo_graph").expanduser().resolve()
+    baseline = baseline_suite.expanduser().resolve()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    target = (
+        output
+        or settings.home / "runs" / "relgnn_capacity" / f"{stamp}-{uuid4().hex[:8]}"
+    ).expanduser().resolve()
+    try:
+        from cpv26.training.kbo_capacity_comparison import (
+            train_kbo_capacity_comparison,
+        )
+        from cpv26.training.kbo_runner import KBOTrainingConfig
+
+        with (baseline / "matched_retraining_report.json").open(encoding="utf-8") as handle:
+            baseline_report = json.load(handle)
+        seeds = baseline_report.get("seeds")
+        if not isinstance(seeds, list) or len(seeds) != 1:
+            raise ValueError("baseline suite must contain exactly one seed")
+        raw_config = baseline_report.get("base_training_config")
+        if not isinstance(raw_config, dict):
+            raise ValueError("baseline suite has no base training configuration")
+        base = KBOTrainingConfig.from_dict(raw_config)
+        config = replace(base, seed=int(seeds[0]), hidden_dim=128, layers=3)
+        report = train_kbo_capacity_comparison(
+            directory,
+            baseline,
+            target,
+            config=config,
+            progress=console.print,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]RelGNN capacity comparison failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    comparison = report["validation_selection_comparison"]
+    console.print(f"[green]Capacity comparison ready[/green]: {target}")
+    console.print(
+        "node_only-full validation gap: "
+        f"64x2={comparison['baseline_64x2']['node_only_minus_full']:+.6f}; "
+        f"128x3={comparison['expanded_128x3']['node_only_minus_full']:+.6f}"
+    )
+    console.print("Held-out test was not loaded; this is a one-seed comparison.")
+    if report.get("smoke_test_only"):
+        console.print("[yellow]Limited-date smoke comparison, not a full-split result.[/yellow]")
+
+
+@app.command("relgnn-pair-train")
+def relgnn_pair_train(
+    dataset: Annotated[
+        Path | None, typer.Option(help="Graph dataset, including graph-vNext v6.")
+    ] = None,
+    output: Annotated[
+        Path | None, typer.Option(help="Two-condition directory; reuse it to resume safely.")
+    ] = None,
+    device: Annotated[str, typer.Option()] = "cuda:0",
+    epochs: Annotated[int, typer.Option(min=1)] = 30,
+    train_start_year: Annotated[int, typer.Option(min=1, max=9999)] = 2023,
+    train_end_year: Annotated[int, typer.Option(min=1, max=9999)] = 2023,
+    validation_year: Annotated[int, typer.Option(min=1, max=9999)] = 2024,
+    test_year: Annotated[int, typer.Option(min=1, max=9999)] = 2025,
+    chronological: Annotated[bool, typer.Option()] = False,
+    batch_days: Annotated[int, typer.Option(min=1)] = 2,
+    hidden_dim: Annotated[int, typer.Option(min=4)] = 128,
+    layers: Annotated[int, typer.Option(min=1)] = 3,
+    heads: Annotated[int, typer.Option(min=1)] = 4,
+    dropout: Annotated[float, typer.Option(min=0.0, max=0.99)] = 0.1,
+    learning_rate: Annotated[float, typer.Option(min=1e-10)] = 0.0003,
+    weight_decay: Annotated[float, typer.Option(min=0.0)] = 0.0001,
+    amp: Annotated[str, typer.Option()] = "auto",
+    workers: Annotated[int, typer.Option(min=0)] = 2,
+    seed: Annotated[int | None, typer.Option(min=0)] = None,
+    accumulate_steps: Annotated[int, typer.Option(min=1)] = 1,
+    max_pa_per_day: Annotated[int, typer.Option(min=0)] = 0,
+    max_edges_per_route: Annotated[int, typer.Option(min=0)] = 0,
+    box_pa_weight: Annotated[float, typer.Option(min=0.0)] = 0.2,
+    box_pitch_weight: Annotated[float, typer.Option(min=0.0)] = 0.1,
+    selection_target: Annotated[str, typer.Option()] = "auto",
+    box_gradient_mode: Annotated[str, typer.Option()] = "auto",
+    max_days_per_split: Annotated[int | None, typer.Option(min=1)] = None,
+) -> None:
+    """Train exactly full and node_only once with matched initialization."""
+
+    if train_start_year > train_end_year:
+        raise typer.BadParameter("--train-start-year must not exceed --train-end-year")
+    settings = _settings()
+    directory = (dataset or settings.home / "datasets" / "kbo_graph_vnext").expanduser().resolve()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    target = (
+        output or settings.home / "runs" / "relgnn_pairs" / f"{stamp}-{uuid4().hex[:8]}"
+    ).expanduser().resolve()
+    try:
+        from cpv26.training.kbo_capacity_comparison import (
+            train_kbo_full_node_comparison,
+        )
+        from cpv26.training.kbo_runner import KBOTrainingConfig
+
+        config = KBOTrainingConfig(
+            device=device,
+            epochs=epochs,
+            batch_days=batch_days,
+            hidden_dim=hidden_dim,
+            layers=layers,
+            heads=heads,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            amp=amp,
+            workers=workers,
+            accumulate_steps=accumulate_steps,
+            max_pa_per_day=max_pa_per_day,
+            max_edges_per_route_per_day=max_edges_per_route,
+            box_pa_weight=box_pa_weight,
+            box_pitch_weight=box_pitch_weight,
+            selection_target=selection_target,
+            box_gradient_mode=box_gradient_mode,
+            patience=0,
+            seed=settings.random_seed if seed is None else seed,
+            max_days_per_split=max_days_per_split,
+            train_seasons=tuple(range(train_start_year, train_end_year + 1)),
+            validation_season=validation_year,
+            test_season=test_year,
+            chronological=chronological,
+            route_message_normalization="none",
+            route_schedule="full",
+            graph_control="intact",
+        )
+        report = train_kbo_full_node_comparison(
+            directory, target, config=config, progress=console.print
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]RelGNN pair comparison failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    comparison = report["validation_selection_comparison"]
+    console.print(f"[green]Full/node-only comparison ready[/green]: {target}")
+    console.print(
+        f"node_only-full validation gap: {comparison['node_only_minus_full']:+.6f}"
+    )
+    console.print("Exactly two runs were trained; held-out test was not loaded.")
+    if report.get("smoke_test_only"):
+        console.print("[yellow]Limited-date smoke comparison, not a full-split result.[/yellow]")
 
 
 @app.command("relgnn-ablation-report")
