@@ -411,6 +411,22 @@ selection loss, Match/LiveHit/PA의 log loss·accuracy·ECE·Brier mean/std를
 `matched_retraining_report.json`에 저장합니다. 이 명령은 2026 test graph나 label을 로드하거나
 평가하지 않습니다. 구조를 선택한 뒤 선택한 run의 `best.pt`만 6절에서 test 평가합니다.
 
+이미 끝난 suite에서 어떤 task가 차이를 만들었는지 확인할 때는 재학습하지 않고 아래 명령을
+실행합니다.
+
+~~~bash
+cpv26 relgnn-ablation-report \
+  --suite-dir var/runs/relgnn_ablations/kbo_2001_2024_v5
+~~~
+
+이 명령은 저장된 suite/학습/validation JSON만 읽으며 checkpoint, graph, test를 로드하지
+않습니다. 여섯 task의 weighted contribution과 Match/LiveHit/PA 지표, best epoch, 마지막 epoch,
+마지막 5 epoch 평균을 함께 표시합니다. route 효과는 `core-full`처럼 normalization까지 섞인
+차이가 아니라 `core-normalized`, normalization 효과는 `normalized-full`, message 제거와 endpoint
+재배선은 각각 `node_only-full`, `rewired-full` contrast로 확인합니다. task별 validation sample 수,
+history의 best epoch와 저장된 best epoch, selection-loss 구성이나 test 봉인 정보가 맞지 않으면
+수치를 출력하지 않고 중단합니다.
+
 중단되면 같은 `--suite-dir`과 동일 옵션으로 다시 실행합니다. 완료 조건은 건너뛰고
 `last.pt`가 있는 조건만 재개합니다. `--epochs`는 늘릴 수 있지만 device, batch, AMP,
 worker, accumulation, 분할, 모델, sampling, loss와 graph-control 설정은 바꿀 수 없습니다.

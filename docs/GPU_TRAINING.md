@@ -491,6 +491,21 @@ validation에서 합니다. 각 `best.pt`를 validation으로 다시 평가한 �
 Match/LiveHit/PA log loss·accuracy·ECE·Brier의 seed mean, population std, 같은 seed의
 `full` 대비 paired delta를 `matched_retraining_report.json`에 저장합니다.
 
+완료된 suite의 원인을 task별로 분해할 때는 학습을 다시 실행하지 않습니다.
+
+~~~bash
+cpv26 relgnn-ablation-report \
+  --suite-dir var/runs/relgnn_ablations/kbo_2001_2024_v5
+~~~
+
+보고서는 저장된 suite/학습/validation JSON만 읽습니다. 여섯 task의 raw loss와 weighted
+contribution, Match/LiveHit/PA 지표, best/final/last-five epoch 차이를 출력합니다. 미리 정의한
+contrast의 기준은 `normalized-full`, `staged-normalized`, `core-normalized`, `node_only-full`,
+`rewired-full`입니다. 따라서 normalization 설정이 다른 `core-full`을 route pruning 효과로
+해석하지 않습니다. task sample 수나 checkpoint-selection lineage가 variant 사이에서 맞지 않거나
+test 봉인을 증명하지 못하면 fail-closed로 중단합니다. seed가 하나일 때 표시되는 population
+standard deviation 0은 안정성 증거가 아니라 산술값이라는 경고도 함께 출력합니다.
+
 이 명령은 test 날짜의 graph나 label을 **로드하지도 평가하지도 않습니다**. test 연도는
 sealed split metadata로만 checkpoint에 남습니다. 선택한 조건의 독립 test 평가는 suite가
 끝난 뒤 해당 `best.pt`에 `relgnn-evaluate --split test`를 명시해 한 번 실행합니다.

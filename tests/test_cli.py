@@ -51,6 +51,7 @@ def test_kbo_commands_are_available_without_loading_catboost() -> None:
         "kbo-graph-build",
         "relgnn-train",
         "relgnn-ablation-train",
+        "relgnn-ablation-report",
         "relgnn-evaluate",
         "relgnn-graph-diagnose",
     ):
@@ -246,6 +247,199 @@ def test_relgnn_season_help_describes_checkpoint_splits_and_epoch_date_order(
         assert option in ablation_text
     assert "validation only" in ablation_text
     assert "never loads or evaluates" in ablation_text
+
+    ablation_report = runner.invoke(
+        app, ["relgnn-ablation-report", "--help"], terminal_width=200
+    )
+    assert ablation_report.exit_code == 0, ablation_report.output
+    report_text = Text.from_ansi(ablation_report.output).plain
+    assert "--suite-dir" in report_text
+    assert "saved suite/training JSON only" in report_text
+
+
+def test_relgnn_ablation_report_decomposes_saved_validation_without_training(
+    tmp_path: Path,
+) -> None:
+    from cpv26.training import kbo_matched_ablation
+
+    suite = tmp_path / "suite"
+    runs: dict[str, dict[str, Any]] = {"2026": {}}
+    for index, variant in enumerate(kbo_matched_ablation.MATCHED_GRAPH_VARIANTS):
+        offset = index / 100
+        policy = kbo_matched_ablation._VARIANT_POLICIES[variant]
+        run = suite / "seed-2026" / variant
+        run.mkdir(parents=True)
+        best_epoch = 10 + index
+        history = []
+        for epoch in range(1, 31):
+            epoch_loss = (
+                4.0 + offset
+                if epoch == best_epoch
+                else 4.5 + offset + abs(epoch - best_epoch) / 1000
+            )
+            epoch_contributions = {
+                task: epoch_loss / 6
+                for task in ("match", "live_hit", "pa", "run", "box_pa", "box_pitch")
+            }
+            history.append(
+                {
+                    "epoch": epoch,
+                    "validation": {
+                        "selection_loss": epoch_loss,
+                        "losses": epoch_contributions,
+                        "weighted_loss_contributions": epoch_contributions,
+                        "weighted_multitask_loss": epoch_loss,
+                        "selection_target": "weighted",
+                    },
+                }
+            )
+        (run / "training_report.json").write_text(
+            json.dumps(
+                {
+                    "status": "completed",
+                    "completed_epochs": 30,
+                    "best_epoch": best_epoch,
+                    "best_validation_loss": 4.0 + offset,
+                    "test_used_during_training": False,
+                    "configuration": {
+                        "route_message_normalization": policy[
+                            "route_message_normalization"
+                        ],
+                        "route_schedule": policy["route_schedule"],
+                        "graph_control": policy["graph_control"],
+                    },
+                    "graph_control": {"mode": policy["graph_control"]},
+                    "history": history,
+                }
+            ),
+            encoding="utf-8",
+        )
+        metrics = {
+            "selection_loss": 4.0 + offset,
+            "losses": {
+                "match": 0.8 + offset,
+                "live_hit": 2.4 + offset,
+                "pa": 1.5 + offset,
+                "run": 5.0 + offset,
+                "box_pa": 1.4 + offset,
+                "box_pitch": 3.0 + offset,
+            },
+            "weighted_loss_contributions": {
+                "match": 0.8 + offset / 6,
+                "live_hit": 2.0 + offset / 6,
+                "pa": 0.3 + offset / 6,
+                "run": 0.4 + offset / 6,
+                "box_pa": 0.2 + offset / 6,
+                "box_pitch": 0.3 + offset / 6,
+            },
+            "loss_sample_counts": {
+                "match": 470,
+                "live_hit": 10717,
+                "pa": 37102,
+                "run": 470,
+                "box_pa": 10717,
+                "box_pitch": 940,
+            },
+            "weighted_multitask_loss": 4.0 + offset,
+            "selection_target": "weighted",
+            "match": {
+                "log_loss": 0.8 + offset,
+                "accuracy": 0.5,
+                "expected_calibration_error": 0.05,
+                "brier_score": 0.5,
+            },
+            "live_hit": {
+                "log_loss": 0.66 + offset,
+                "accuracy": 0.6,
+                "expected_calibration_error": 0.02,
+                "brier_score": 0.47,
+                "joint_nll": 2.4 + offset,
+                "observed_nll": 2.4 + offset,
+                "expected_hits_lower_bound_mae": 0.7,
+                "expected_pa_lower_bound_mae": 0.9,
+            },
+            "pa": {
+                "log_loss": 1.5 + offset,
+                "accuracy": 0.44,
+                "expected_calibration_error": 0.02,
+                "brier_score": 0.72,
+            },
+        }
+        runs["2026"][variant] = {
+            "run_directory": str(tmp_path / "old-machine-suite" / variant),
+            "best_epoch": best_epoch,
+            "completed_epochs": 30,
+            "parameter_count": 1234,
+            "validation_selection_loss": metrics["selection_loss"],
+            "selection_loss_delta_vs_full": offset,
+            "validation_metrics": metrics,
+            "test_used_during_training": False,
+            "route_message_normalization": policy["route_message_normalization"],
+            "route_schedule_preset": policy["route_schedule"],
+            "graph_control": {"mode": policy["graph_control"]},
+            "variant_policy": dict(policy),
+        }
+    report = {
+        "status": "completed",
+        "protocol": "matched_from_scratch_validation_graph_ablation",
+        "protocol_version": 1,
+        "selection_split": "validation",
+        "held_out_test_season": 2026,
+        "test_used_for_training_selection_or_comparison": False,
+        "runs": runs,
+    }
+    report_path = suite / "matched_retraining_report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    before = report_path.read_bytes()
+
+    result = CliRunner().invoke(
+        app,
+        ["relgnn-ablation-report", "--suite-dir", str(suite)],
+        terminal_width=240,
+    )
+
+    assert result.exit_code == 0, result.output
+    plain = Text.from_ansi(result.output).plain
+    assert "Matched validation checkpoint selection" in plain
+    assert "Predefined matched contrasts" in plain
+    assert "Weighted task contribution deltas" in plain
+    assert "Raw task-loss deltas by matched contrast" in plain
+    assert "Core-normalized weighted task attribution by checkpoint view" in plain
+    assert "last_five:" in plain
+    assert "Validation prediction metrics" in plain
+    assert "core-normalized" in plain
+    assert "+0.020000" in plain
+    assert "box_pitch" in plain
+    assert "joint_NLL" in plain
+    assert "observed_NLL" in plain
+    assert "not evidence of stability" in plain
+    assert "test was not loaded or evaluated" in plain
+    assert report_path.read_bytes() == before
+
+    corrupted = json.loads(before)
+    corrupted["runs"]["2026"]["full"]["validation_metrics"][
+        "weighted_loss_contributions"
+    ]["match"] += 1
+    report_path.write_text(json.dumps(corrupted), encoding="utf-8")
+    invalid_total = CliRunner().invoke(
+        app,
+        ["relgnn-ablation-report", "--suite-dir", str(suite)],
+    )
+    assert invalid_total.exit_code == 1
+    invalid_text = Text.from_ansi(invalid_total.output).plain
+    assert "weighted task contributions" in invalid_text
+    assert "total" in invalid_text
+
+    report_path.write_bytes(before)
+    corrupted = json.loads(before)
+    corrupted["runs"]["2026"]["core"]["route_schedule_preset"] = "full"
+    report_path.write_text(json.dumps(corrupted), encoding="utf-8")
+    mislabeled = CliRunner().invoke(
+        app,
+        ["relgnn-ablation-report", "--suite-dir", str(suite)],
+    )
+    assert mislabeled.exit_code == 1
+    assert "route_schedule is mislabeled" in Text.from_ansi(mislabeled.output).plain
 
 
 def test_relgnn_graph_diagnose_forwards_options_and_prints_compact_deltas(

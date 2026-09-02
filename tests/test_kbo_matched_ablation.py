@@ -385,12 +385,37 @@ def test_aggregate_reports_seed_paired_deltas_against_full() -> None:
             per_seed[variant] = {
                 "validation_selection_loss": full_loss + offset,
                 "selection_loss_delta_vs_full": offset,
+                "best_epoch": 10 + variant_index,
+                "final_validation_selection_loss": full_loss + offset + 0.25,
+                "final_minus_best_selection_loss": 0.25,
                 "validation_metrics": {
-                    task: _metric_block(0.8 + seed_index, offset)
-                    for task in ("match", "live_hit", "pa")
+                    **{
+                        task: _metric_block(0.8 + seed_index, offset)
+                        for task in ("match", "live_hit", "pa")
+                    },
+                    "losses": {
+                        "match": 0.8 + seed_index + offset,
+                        "live_hit": 2.0 + seed_index + offset,
+                        "pa": 1.5 + seed_index + offset,
+                        "run": 4.0 + seed_index + offset,
+                        "box_pa": 1.2 + seed_index + offset,
+                        "box_pitch": 3.0 + seed_index + offset,
+                    },
+                    "weighted_loss_contributions": {
+                        "match": 0.8 + seed_index + offset,
+                        "live_hit": 2.0 + seed_index + offset,
+                        "pa": 0.3 + offset / 5,
+                        "run": 0.4 + offset / 10,
+                        "box_pa": 0.24 + offset / 5,
+                        "box_pitch": 0.3 + offset / 10,
+                    },
                 },
                 "parameter_count": 1234,
             }
+            per_seed[variant]["validation_metrics"]["live_hit"].update(
+                joint_nll=2.0 + seed_index + offset,
+                expected_hits_lower_bound_mae=0.6 + offset,
+            )
         runs[seed] = per_seed
 
     report = matched._aggregate_runs(runs)
@@ -402,9 +427,76 @@ def test_aggregate_reports_seed_paired_deltas_against_full() -> None:
     assert normalized["population_std"] == pytest.approx(0.5)
     assert normalized["paired_delta_vs_full_mean"] == pytest.approx(0.1)
     assert normalized["paired_delta_vs_full_population_std"] == pytest.approx(0.0)
+    assert normalized["paired_delta_vs_core_mean"] == pytest.approx(-0.2)
     assert report["core"]["validation_metrics"]["match"]["accuracy"][
         "paired_delta_vs_full_mean"
     ] == pytest.approx(0.3)
+    assert report["normalized"]["validation_losses"]["run"]["mean"] == pytest.approx(4.6)
+    assert report["normalized"]["validation_losses"]["run"][
+        "paired_delta_vs_core_mean"
+    ] == pytest.approx(-0.2)
+    assert report["normalized"]["validation_weighted_loss_contributions"]["pa"][
+        "mean"
+    ] == pytest.approx(0.32)
+    assert report["normalized"]["validation_metrics"]["live_hit"]["joint_nll"][
+        "paired_delta_vs_full_mean"
+    ] == pytest.approx(0.1)
+    assert report["normalized"]["checkpoint_selection"]["best_epoch"][
+        "mean"
+    ] == pytest.approx(11.0)
+    assert report["normalized"]["checkpoint_selection"][
+        "final_minus_best_selection_loss"
+    ]["mean"] == pytest.approx(0.25)
+    contrasts = matched._aggregate_named_contrasts(runs)
+    assert contrasts["normalization"]["validation_selection_loss"][
+        "delta_mean"
+    ] == pytest.approx(0.1)
+    assert contrasts["core_pruning"]["validation_selection_loss"][
+        "delta_mean"
+    ] == pytest.approx(0.2)
+    assert contrasts["remove_messages"]["validation_selection_loss"][
+        "delta_mean"
+    ] == pytest.approx(0.4)
+    assert contrasts["core_pruning"]["validation_selection_loss"][
+        "population_std"
+    ] == pytest.approx(0.0)
+    one_seed = matched._aggregate_named_contrasts({"11": runs["11"]})
+    assert one_seed["core_pruning"]["validation_selection_loss"][
+        "population_std"
+    ] is None
+
+
+@pytest.mark.parametrize(
+    ("selection_split", "test_sealed", "message"),
+    [
+        ("test", False, "did not use validation"),
+        ("validation", True, "does not prove"),
+    ],
+)
+def test_saved_ablation_analysis_fails_closed_before_reporting_test_policy(
+    tmp_path: Path,
+    selection_split: str,
+    test_sealed: bool,
+    message: str,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "matched_retraining_report.json").write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "protocol": "matched_from_scratch_validation_graph_ablation",
+                "protocol_version": matched.MATCHED_ABLATION_PROTOCOL_VERSION,
+                "selection_split": selection_split,
+                "test_used_for_training_selection_or_comparison": test_sealed,
+                "runs": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        matched.analyze_matched_graph_ablations(suite)
 
 
 def test_validation_reevaluation_commits_only_a_complete_hash_directory(

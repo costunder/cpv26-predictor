@@ -898,6 +898,195 @@ def relgnn_ablation_train(
     )
 
 
+@app.command("relgnn-ablation-report")
+def relgnn_ablation_report(
+    suite_dir: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            help="Completed matched-suite directory; reads saved suite/training JSON only.",
+        ),
+    ],
+) -> None:
+    """Explain validation-loss changes by task without training or evaluating test."""
+
+    try:
+        from cpv26.training.kbo_matched_ablation import analyze_matched_graph_ablations
+
+        analysis = analyze_matched_graph_ablations(suite_dir)
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]Matched RelGNN report failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    aggregate = analysis["aggregate"]
+    contrasts = analysis["named_contrasts"]
+    selection_target = str(analysis["selection_target"])
+
+    def mean(block: object) -> str:
+        if not isinstance(block, dict) or not isinstance(block.get("mean"), (int, float)):
+            return "-"
+        return f"{float(block['mean']):.6f}"
+
+    def signed(block: object, key: str) -> str:
+        if not isinstance(block, dict) or not isinstance(block.get(key), (int, float)):
+            return "-"
+        return f"{float(block[key]):+.6f}"
+
+    console.print(
+        f"Selection target: [bold]{selection_target}[/bold]; "
+        f"training seeds in this saved suite: {len(analysis['seeds'])}"
+    )
+
+    selection_table = Table(title="Matched validation checkpoint selection")
+    selection_table.add_column("variant")
+    selection_table.add_column("selection loss", justify="right")
+    selection_table.add_column("delta vs full", justify="right")
+    selection_table.add_column("delta vs core", justify="right")
+    selection_table.add_column("best epoch", justify="right")
+    selection_table.add_column("final - best", justify="right")
+    for variant, values in aggregate.items():
+        selection = values["validation_selection_loss"]
+        checkpoint = values.get("checkpoint_selection", {})
+        selection_table.add_row(
+            variant,
+            mean(selection),
+            signed(selection, "paired_delta_vs_full_mean"),
+            signed(selection, "paired_delta_vs_core_mean"),
+            mean(checkpoint.get("best_epoch")),
+            mean(checkpoint.get("final_minus_best_selection_loss")),
+        )
+    console.print(selection_table)
+
+    contrast_table = Table(
+        title="Predefined matched contrasts (candidate - reference; loss lower is better)"
+    )
+    contrast_table.add_column("candidate-reference", no_wrap=True)
+    contrast_table.add_column("best delta", justify="right")
+    contrast_table.add_column("final delta", justify="right")
+    contrast_table.add_column("last-5 delta", justify="right")
+    for values in contrasts.values():
+        selection = values["validation_selection_loss"]
+        checkpoint = values.get("checkpoint_selection", {})
+        contrast_table.add_row(
+            f"{values['candidate']}-{values['reference']}",
+            signed(selection, "delta_mean"),
+            signed(
+                checkpoint.get("final_validation_selection_loss"),
+                "delta_mean",
+            ),
+            signed(
+                checkpoint.get("last_five_validation_selection_loss_mean"),
+                "delta_mean",
+            ),
+        )
+    console.print(contrast_table)
+
+    contribution_label = (
+        "Weighted task contribution deltas"
+        if selection_target == "weighted"
+        else "Weighted task deltas (diagnostic only; checkpoint selection uses match)"
+    )
+    console.print(f"[bold]{contribution_label}[/bold] (candidate-reference; lower is better)")
+    task_labels = {
+        "match": "match",
+        "live_hit": "hit",
+        "pa": "pa",
+        "run": "run",
+        "box_pa": "box_pa",
+        "box_pitch": "box_pitch",
+    }
+    for values in contrasts.values():
+        deltas = values.get("weighted_contribution_deltas", {})
+        pair = f"{values['candidate']}-{values['reference']}"
+        console.print(
+            f"{pair}: "
+            + " ".join(
+                f"{label}={signed(deltas.get(task), 'delta_mean')}"
+                for task, label in task_labels.items()
+            )
+        )
+
+    console.print(
+        "[bold]Raw task-loss deltas by matched contrast[/bold] "
+        "(candidate-reference; lower is better)"
+    )
+    for values in contrasts.values():
+        deltas = values.get("validation_loss_deltas", {})
+        pair = f"{values['candidate']}-{values['reference']}"
+        console.print(
+            f"{pair}: "
+            + " ".join(
+                f"{label}={signed(deltas.get(task), 'delta_mean')}"
+                for task, label in task_labels.items()
+            )
+        )
+
+    core_contrast = contrasts.get("core_pruning", {})
+    checkpoint_tasks = core_contrast.get("checkpoint_task_deltas", {})
+    if isinstance(checkpoint_tasks, dict) and checkpoint_tasks:
+        console.print(
+            "[bold]Core-normalized weighted task attribution by checkpoint view[/bold]"
+        )
+        views = {
+            "best": core_contrast.get("weighted_contribution_deltas", {}),
+            "final": checkpoint_tasks.get("final", {}).get(
+                "weighted_contribution_deltas", {}
+            ),
+            "last_five": checkpoint_tasks.get("last_five", {}).get(
+                "weighted_contribution_deltas", {}
+            ),
+        }
+        for view, deltas in views.items():
+            console.print(
+                f"{view}: "
+                + " ".join(
+                    f"{label}={signed(deltas.get(task), 'delta_mean')}"
+                    for task, label in task_labels.items()
+                )
+            )
+
+    metric_table = Table(title="Validation prediction metrics")
+    metric_table.add_column("variant")
+    for label in (
+        "match LL",
+        "match acc",
+        "PA LL",
+        "PA acc",
+    ):
+        metric_table.add_column(label, justify="right", no_wrap=True)
+    for variant, values in aggregate.items():
+        metrics = values.get("validation_metrics", {})
+        match = metrics.get("match", {})
+        pa = metrics.get("pa", {})
+        metric_table.add_row(
+            variant,
+            mean(match.get("log_loss")),
+            mean(match.get("accuracy")),
+            mean(pa.get("log_loss")),
+            mean(pa.get("accuracy")),
+        )
+    console.print(metric_table)
+
+    console.print("[bold]Validation LiveHit metrics[/bold]")
+    for variant, values in aggregate.items():
+        live_hit = values.get("validation_metrics", {}).get("live_hit", {})
+        console.print(
+            f"{variant}: marginal_LL={mean(live_hit.get('log_loss'))} "
+            f"joint_NLL={mean(live_hit.get('joint_nll'))} "
+            f"observed_NLL={mean(live_hit.get('observed_nll'))} "
+            f"hits_MAE={mean(live_hit.get('expected_hits_lower_bound_mae'))} "
+            f"pa_MAE={mean(live_hit.get('expected_pa_lower_bound_mae'))}"
+        )
+    for warning in analysis["warnings"]:
+        console.print(f"[yellow]Warning:[/yellow] {warning}")
+    console.print(f"Report: {analysis['report_path']}")
+    console.print(
+        f"{analysis['held_out_test_season']} test was not loaded or evaluated; "
+        "this command only audited saved validation and training JSON."
+    )
+
+
 @app.command("relgnn-evaluate")
 def relgnn_evaluate(
     checkpoint: Annotated[Path, typer.Option(exists=True, dir_okay=False)],
