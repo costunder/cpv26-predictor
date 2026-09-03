@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from cpv26.data.kbo_graph_dataset import KBOGraphDataset
 from cpv26.data.kbo_playbyplay import sha256_file
@@ -26,6 +27,7 @@ from cpv26.training import kbo_runner as runner
 CAPACITY_COMPARISON_PROTOCOL = "single_seed_validation_capacity_comparison"
 CAPACITY_COMPARISON_PROTOCOL_VERSION = 1
 CAPACITY_COMPARISON_VARIANTS = ("full", "node_only")
+RECOVERY_PREDICTION_TASKS = ("match", "live_hit", "pa", "box_pa", "box_pitch")
 BASELINE_CAPACITY = {"hidden_dim": 64, "layers": 2}
 EXPANDED_CAPACITY = {"hidden_dim": 128, "layers": 3}
 CAPACITY_COMPARISON_REPORT = "capacity_comparison_report.json"
@@ -100,12 +102,56 @@ def _select_baseline_seed(
         seed = requested_seed
     if seed not in report_seeds:
         raise ValueError(
-            f"selected baseline seed {seed} is not declared by the report and manifest"
+            f"selected baseline seed {seed} is not declared by the report and manifest; "
+            f"declared seeds: {list(report_seeds)}"
         )
-    runs = report.get("runs")
-    if not isinstance(runs, Mapping) or str(seed) not in runs:
-        raise ValueError(f"baseline suite has no saved run record for selected seed {seed}")
     return seed, report_seeds
+
+
+def _child_artifact_state(suite_directory: Path, seed: int, variant: str) -> str:
+    run_directory = suite_directory / f"seed-{seed}" / variant
+    required = ("training_report.json", "best.pt")
+    present = [name for name in required if (run_directory / name).is_file()]
+    missing = [name for name in required if name not in present]
+    has_last = (run_directory / "last.pt").is_file()
+    if not present and not has_last:
+        return "absent"
+    if missing:
+        return (
+            "partial(missing="
+            + ",".join(missing)
+            + ",last="
+            + ("yes" if has_last else "no")
+            + ")"
+        )
+    checkpoint = sha256_file(run_directory / "best.pt")
+    cached = run_directory / "matched_validation" / checkpoint[:16] / "metrics.json"
+    return (
+        "complete(last="
+        + ("yes" if has_last else "no")
+        + ",cached_validation="
+        + ("yes" if cached.is_file() else "no")
+        + ")"
+    )
+
+
+def _orphan_recovery_error(
+    *,
+    suite_directory: Path,
+    seed: int,
+    raw_runs: Mapping[str, Any],
+    reason: str,
+) -> ValueError:
+    saved_seeds = sorted(str(value) for value in raw_runs)
+    child_states = ", ".join(
+        f"{variant}={_child_artifact_state(suite_directory, seed, variant)}"
+        for variant in CAPACITY_COMPARISON_VARIANTS
+    )
+    return ValueError(
+        f"selected baseline seed {seed} cannot be recovered: {reason}; "
+        f"top-level saved run seeds: {saved_seeds or ['none']}; "
+        f"selected child artifacts: {child_states}"
+    )
 
 
 def _baseline_run_directory(
@@ -135,6 +181,367 @@ def _require_number(value: Any, *, context: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{context} must be finite")
     return result
+
+
+def _validate_recovery_checkpoint(
+    path: Path,
+    *,
+    dataset: KBOGraphDataset,
+    expected_config: runner.KBOTrainingConfig,
+    training: Mapping[str, Any],
+    expected_initialization: Mapping[str, Any],
+    expected_epoch: int,
+    context: str,
+) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"{context} checkpoint is unavailable: {path}")
+    actual_hash = sha256_file(path)
+    report_hash = training.get(f"{path.stem}_checkpoint_sha256")
+    if report_hash != actual_hash:
+        raise ValueError(f"{context} checkpoint hash differs from training report")
+    state = runner._read_checkpoint(path)
+    matched._validate_child_checkpoint(
+        state,
+        dataset=dataset,
+        expected=expected_config,
+        initialization=expected_initialization,
+    )
+    if int(state.get("epoch", -1)) != expected_epoch:
+        raise ValueError(f"{context} checkpoint epoch lineage differs")
+    if int(state.get("best_epoch", -1)) != int(training.get("best_epoch", -2)):
+        raise ValueError(f"{context} checkpoint best-epoch lineage differs")
+    checkpoint_best = _require_number(
+        state.get("best_score"), context=f"{context} checkpoint best score"
+    )
+    training_best = _require_number(
+        training.get("best_validation_loss"),
+        context=f"{context} training best validation loss",
+    )
+    if not math.isclose(checkpoint_best, training_best, rel_tol=1e-9, abs_tol=1e-9):
+        raise ValueError(f"{context} checkpoint best-score lineage differs")
+    training_history = training.get("history")
+    state_history = state.get("history")
+    if (
+        not isinstance(training_history, list)
+        or not isinstance(state_history, list)
+        or _plain(state_history) != _plain(training_history[:expected_epoch])
+    ):
+        raise ValueError(f"{context} checkpoint history lineage differs")
+    return actual_hash
+
+
+def _validated_recovery_evaluation(
+    metrics_path: Path,
+    *,
+    report: Mapping[str, Any],
+    checkpoint_hash: str,
+    dataset_fingerprint: str,
+    config: runner.KBOTrainingConfig,
+    context: str,
+) -> dict[str, Any]:
+    if report.get("split") != "validation":
+        raise ValueError(f"{context} cached evaluation is not validation-only")
+    if report.get("checkpoint_sha256") != checkpoint_hash:
+        raise ValueError(f"{context} cached validation checkpoint lineage differs")
+    if report.get("dataset_fingerprint") != dataset_fingerprint:
+        raise ValueError(f"{context} cached validation dataset lineage differs")
+    if report.get("training_seasons") != list(config.train_seasons):
+        raise ValueError(f"{context} cached validation training seasons differ")
+    if report.get("validation_season") != config.validation_season:
+        raise ValueError(f"{context} cached validation season differs")
+    if report.get("held_out_test_season") != config.test_season:
+        raise ValueError(f"{context} cached validation test-seal lineage differs")
+    graph_control = report.get("graph_control")
+    if not isinstance(graph_control, Mapping) or graph_control.get("mode") != config.graph_control:
+        raise ValueError(f"{context} cached validation graph-control lineage differs")
+    metrics = report.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError(f"{context} cached validation metrics are unavailable")
+    _require_number(
+        metrics.get("selection_loss"),
+        context=f"{context} cached validation selection loss",
+    )
+    artifacts = report.get("prediction_artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise ValueError(f"{context} cached validation artifact lineage is unavailable")
+    actual_artifact_tasks = set(artifacts)
+    unknown_artifact_tasks = actual_artifact_tasks - set(RECOVERY_PREDICTION_TASKS)
+    required_artifact_tasks = {
+        task for task in ("match", "live_hit", "pa") if metrics.get(task) is not None
+    }
+    if "match" not in actual_artifact_tasks or not required_artifact_tasks.issubset(
+        actual_artifact_tasks
+    ):
+        raise ValueError(
+            f"{context} cached validation is missing required prediction artifacts: "
+            f"required={sorted(required_artifact_tasks | {'match'})}, "
+            f"actual={sorted(actual_artifact_tasks)}"
+        )
+    if unknown_artifact_tasks:
+        raise ValueError(
+            f"{context} cached validation has unknown prediction artifacts: "
+            f"{sorted(unknown_artifact_tasks)}"
+        )
+    for task, raw_artifact in artifacts.items():
+        if not isinstance(raw_artifact, Mapping):
+            raise ValueError(f"{context} cached {task} artifact lineage is malformed")
+        saved_path = raw_artifact.get("path")
+        saved_hash = raw_artifact.get("sha256")
+        rows = raw_artifact.get("rows")
+        if (
+            not isinstance(saved_path, str)
+            or not isinstance(saved_hash, str)
+            or isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or rows <= 0
+        ):
+            raise ValueError(f"{context} cached {task} artifact lineage is malformed")
+        artifact_path = metrics_path.parent / f"{task}_predictions.parquet"
+        if Path(saved_path).expanduser().resolve() != artifact_path.resolve():
+            raise ValueError(f"{context} cached {task} artifact path is not canonical")
+        if not artifact_path.is_file() or sha256_file(artifact_path) != saved_hash:
+            raise ValueError(f"{context} cached {task} artifact hash differs")
+        sample_field = (
+            "samples" if task in {"match", "live_hit", "pa"} else "player_game_queries"
+        )
+        task_metrics = metrics.get(task)
+        metric_rows = task_metrics.get(sample_field) if isinstance(task_metrics, Mapping) else None
+        if metric_rows is not None and (
+            isinstance(metric_rows, bool)
+            or not isinstance(metric_rows, int)
+            or metric_rows != rows
+        ):
+            raise ValueError(f"{context} cached {task} artifact row count differs")
+    normalized: dict[str, Any] = dict(_plain(report))
+    normalized["output_directory"] = str(metrics_path.parent)
+    return normalized
+
+
+def _orphan_validation_report(
+    *,
+    run_directory: Path,
+    dataset_directory: Path,
+    recovery_directory: Path,
+    seed: int,
+    variant: str,
+    config: runner.KBOTrainingConfig,
+    dataset_fingerprint: str,
+    allow_validation_recovery_write: bool,
+) -> tuple[dict[str, Any], Path]:
+    context = f"baseline {seed}/{variant}"
+    checkpoint = run_directory / "best.pt"
+    checkpoint_hash = sha256_file(checkpoint)
+    cached_path = (
+        run_directory / "matched_validation" / checkpoint_hash[:16] / "metrics.json"
+    )
+    if cached_path.is_file():
+        return (
+            _validated_recovery_evaluation(
+                cached_path,
+                report=_load_json(cached_path),
+                checkpoint_hash=checkpoint_hash,
+                dataset_fingerprint=dataset_fingerprint,
+                config=config,
+                context=context,
+            ),
+            cached_path,
+        )
+
+    final = recovery_directory / f"seed-{seed}" / variant / checkpoint_hash[:16]
+    metrics_path = final / "metrics.json"
+    if metrics_path.is_file():
+        return (
+            _validated_recovery_evaluation(
+                metrics_path,
+                report=_load_json(metrics_path),
+                checkpoint_hash=checkpoint_hash,
+                dataset_fingerprint=dataset_fingerprint,
+                config=config,
+                context=context,
+            ),
+            metrics_path,
+        )
+    if final.exists():
+        raise FileExistsError(f"partial recovered validation output is not reusable: {final}")
+    if not allow_validation_recovery_write:
+        raise FileNotFoundError(
+            "recovered validation output is missing for an existing capacity manifest; "
+            "refusing to modify the output before manifest validation"
+        )
+
+    temporary = final.with_name(f".tmp-{uuid4().hex[:8]}")
+    evaluation = runner.evaluate_kbo_relgnn(
+        checkpoint,
+        dataset_directory=dataset_directory,
+        split="validation",
+        device=config.device,
+        amp=config.amp,
+        batch_days=config.batch_days,
+        workers=config.workers,
+        output_directory=temporary,
+    )
+    evaluation["output_directory"] = str(final)
+    for artifact in evaluation.get("prediction_artifacts", {}).values():
+        artifact["path"] = str(final / Path(artifact["path"]).name)
+    runner._atomic_json(temporary / "metrics.json", evaluation)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    temporary.replace(final)
+    return (
+        _validated_recovery_evaluation(
+            metrics_path,
+            report=evaluation,
+            checkpoint_hash=checkpoint_hash,
+            dataset_fingerprint=dataset_fingerprint,
+            config=config,
+            context=context,
+        ),
+        metrics_path,
+    )
+
+
+def _recover_baseline_child(
+    *,
+    dataset: KBOGraphDataset,
+    dataset_directory: Path,
+    suite_directory: Path,
+    recovery_directory: Path,
+    seed: int,
+    variant: str,
+    expected_config: runner.KBOTrainingConfig,
+    expected_initialization: Mapping[str, Any],
+    allow_validation_recovery_write: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    context = f"baseline {seed}/{variant}"
+    run_directory = suite_directory / f"seed-{seed}" / variant
+    training_path = run_directory / "training_report.json"
+    if not training_path.is_file():
+        raise FileNotFoundError(f"{context} training report is unavailable")
+    training = _load_json(training_path)
+    matched._validate_child_report(training, expected_config)
+    history_summary = matched._training_history_summary(training, context=context)
+    if training.get("status") != "completed":
+        raise ValueError(f"{context} is not completed")
+    fingerprint = dataset.manifest["fingerprint"]
+    if training.get("dataset_fingerprint") != fingerprint:
+        raise ValueError(f"{context} uses a different dataset fingerprint")
+    if int(training.get("completed_epochs", -1)) != expected_config.epochs:
+        raise ValueError(f"{context} did not receive the complete fixed epoch budget")
+    if training.get("test_used_during_training") is not False:
+        raise ValueError(f"{context} does not prove that held-out test stayed sealed")
+    if _plain(training.get("graph_control")) != _plain(
+        runner._graph_control_report(expected_config)
+    ):
+        raise ValueError(f"{context} training graph-control lineage differs")
+    if (
+        training.get("initial_model_state_sha256")
+        != expected_initialization.get("initial_model_state_sha256")
+        or int(training.get("parameter_count", -1))
+        != int(expected_initialization.get("parameter_count", -2))
+    ):
+        raise ValueError(f"{context} does not match the independently reproduced initialization")
+
+    best_checkpoint = run_directory / "best.pt"
+    best_hash = _validate_recovery_checkpoint(
+        best_checkpoint,
+        dataset=dataset,
+        expected_config=expected_config,
+        training=training,
+        expected_initialization=expected_initialization,
+        expected_epoch=int(training.get("best_epoch", -1)),
+        context=f"{context} best",
+    )
+    optimizer_steps = int(training.get("optimizer_steps", -1))
+    skipped_steps = int(training.get("skipped_optimizer_steps", -1))
+    attempted_steps = int(training.get("attempted_optimizer_steps", -1))
+    history = training.get("history")
+    final_history = history[-1] if isinstance(history, list) and history else None
+    if (
+        optimizer_steps < 0
+        or skipped_steps < 0
+        or attempted_steps != optimizer_steps + skipped_steps
+        or not isinstance(final_history, Mapping)
+        or int(final_history.get("global_step", -1)) != optimizer_steps
+        or int(final_history.get("skipped_optimizer_steps", -1)) != skipped_steps
+    ):
+        raise ValueError(f"{context} optimizer-attempt budget lineage differs")
+
+    last_checkpoint = run_directory / "last.pt"
+    last_hash: str | None = None
+    if last_checkpoint.is_file():
+        last_hash = _validate_recovery_checkpoint(
+            last_checkpoint,
+            dataset=dataset,
+            expected_config=expected_config,
+            training=training,
+            expected_initialization=expected_initialization,
+            expected_epoch=int(training.get("completed_epochs", -1)),
+            context=f"{context} last",
+        )
+        last_state = runner._read_checkpoint(last_checkpoint)
+        if (
+            int(last_state.get("global_step", -1)) != optimizer_steps
+            or int(last_state.get("skipped_optimizer_steps", -1)) != skipped_steps
+        ):
+            raise ValueError(f"{context} last checkpoint attempt budget lineage differs")
+
+    validation, validation_path = _orphan_validation_report(
+        run_directory=run_directory,
+        dataset_directory=dataset_directory,
+        recovery_directory=recovery_directory,
+        seed=seed,
+        variant=variant,
+        config=expected_config,
+        dataset_fingerprint=fingerprint,
+        allow_validation_recovery_write=allow_validation_recovery_write,
+    )
+    metrics = validation["metrics"]
+    assert isinstance(metrics, Mapping)
+    selection_loss = _require_number(
+        metrics.get("selection_loss"),
+        context=f"{context} validation selection loss",
+    )
+    protocol = _variant_protocols(expected_config)[variant]
+    child = {
+        "run_directory": str(run_directory),
+        "best_checkpoint": str(best_checkpoint),
+        "best_checkpoint_sha256": best_hash,
+        "best_epoch": int(training["best_epoch"]),
+        "completed_epochs": int(training["completed_epochs"]),
+        "optimizer_steps": optimizer_steps,
+        "skipped_optimizer_steps": skipped_steps,
+        "attempted_optimizer_steps": attempted_steps,
+        "parameter_count": int(training["parameter_count"]),
+        "initial_model_state_sha256": str(training["initial_model_state_sha256"]),
+        "graph_control": runner._graph_control_report(expected_config),
+        "route_message_normalization": expected_config.route_message_normalization,
+        "route_schedule_preset": expected_config.route_schedule,
+        "resolved_route_schedule": protocol["resolved_route_schedule"],
+        "variant_policy": protocol,
+        "validation_selection_loss": selection_loss,
+        **history_summary,
+        "final_minus_best_selection_loss": (
+            float(history_summary["final_validation_selection_loss"]) - selection_loss
+        ),
+        "validation_metrics": _plain(metrics),
+        "validation_output_directory": str(validation_path.parent),
+        "test_used_during_training": False,
+        "baseline_record_source": "recovered_from_complete_local_child_artifacts",
+    }
+    lineage = {
+        "recovered": True,
+        "training_report": str(training_path),
+        "training_report_sha256": sha256_file(training_path),
+        "best_checkpoint": str(best_checkpoint),
+        "best_checkpoint_sha256": best_hash,
+        "validation_report": str(validation_path),
+        "validation_report_sha256": sha256_file(validation_path),
+    }
+    if last_hash is not None:
+        child["last_checkpoint"] = str(last_checkpoint)
+        child["last_checkpoint_sha256"] = last_hash
+        lineage["last_checkpoint"] = str(last_checkpoint)
+        lineage["last_checkpoint_sha256"] = last_hash
+    return child, lineage
 
 
 def _validate_baseline_child(
@@ -229,6 +636,8 @@ def _validate_baseline_suite(
     suite_directory: Path,
     *,
     requested_seed: int | None,
+    recovery_directory: Path,
+    allow_validation_recovery_write: bool,
 ) -> _BaselineSuite:
     report_path = suite_directory / "matched_retraining_report.json"
     manifest_path = suite_directory / "suite_config.json"
@@ -330,24 +739,128 @@ def _validate_baseline_suite(
     raw_runs = report.get("runs")
     if not isinstance(raw_runs, Mapping):
         raise ValueError("baseline matched suite has no saved runs")
-    per_seed = raw_runs[str(seed)]
-    if not isinstance(per_seed, Mapping):
-        raise ValueError("baseline single-seed run record is malformed")
     runs: dict[str, dict[str, Any]] = {}
     child_lineage: dict[str, Any] = {}
-    for variant in CAPACITY_COMPARISON_VARIANTS:
-        child = per_seed.get(variant)
-        if not isinstance(child, Mapping):
-            raise ValueError(f"baseline suite has no completed {variant} child")
-        expected_child = matched._variant_config(config, variant, seed)
-        runs[variant], child_lineage[variant] = _validate_baseline_child(
-            suite_directory=suite_directory,
-            seed=seed,
-            variant=variant,
-            child=child,
-            dataset_fingerprint=fingerprint,
-            expected_config=expected_child,
+    seed_key = str(seed)
+    if seed_key in raw_runs:
+        raw_per_seed = raw_runs[seed_key]
+        if not isinstance(raw_per_seed, Mapping):
+            raise ValueError("baseline selected-seed run record is malformed")
+        for variant in CAPACITY_COMPARISON_VARIANTS:
+            child = raw_per_seed.get(variant)
+            if not isinstance(child, Mapping):
+                raise ValueError(
+                    f"baseline selected-seed record has no completed {variant} child; "
+                    "existing malformed or partial records are not replaced by artifact recovery"
+                )
+            expected_child = matched._variant_config(config, variant, seed)
+            runs[variant], child_lineage[variant] = _validate_baseline_child(
+                suite_directory=suite_directory,
+                seed=seed,
+                variant=variant,
+                child=child,
+                dataset_fingerprint=fingerprint,
+                expected_config=expected_child,
+            )
+    else:
+        if suite_status != "failed":
+            raise _orphan_recovery_error(
+                suite_directory=suite_directory,
+                seed=seed,
+                raw_runs=raw_runs,
+                reason=(
+                    "top-level run record is absent but artifact recovery is allowed only "
+                    "for a failed suite snapshot"
+                ),
+            )
+        missing_artifacts = [
+            f"{variant}/{name}"
+            for variant in CAPACITY_COMPARISON_VARIANTS
+            for name in ("training_report.json", "best.pt")
+            if not (suite_directory / f"seed-{seed}" / variant / name).is_file()
+        ]
+        if missing_artifacts:
+            raise _orphan_recovery_error(
+                suite_directory=suite_directory,
+                seed=seed,
+                raw_runs=raw_runs,
+                reason="required child artifacts are missing: " + ", ".join(missing_artifacts),
+            )
+        raw_initializations = report.get("initialization_audit")
+        raw_initialization = (
+            raw_initializations.get(str(seed))
+            if isinstance(raw_initializations, Mapping)
+            else None
         )
+        if not isinstance(raw_initialization, Mapping):
+            raise _orphan_recovery_error(
+                suite_directory=suite_directory,
+                seed=seed,
+                raw_runs=raw_runs,
+                reason="top-level initialization audit for the selected seed is unavailable",
+            )
+        reproduced_initialization = _two_variant_initialization_audit(dataset, config)
+        for field in (
+            "seed",
+            "all_variants_equal",
+            "initial_model_state_sha256",
+            "parameter_count",
+        ):
+            if raw_initialization.get(field) != reproduced_initialization.get(field):
+                raise _orphan_recovery_error(
+                    suite_directory=suite_directory,
+                    seed=seed,
+                    raw_runs=raw_runs,
+                    reason=f"top-level initialization audit differs at {field}",
+                )
+        raw_variant_initializations = raw_initialization.get("variants")
+        if not isinstance(raw_variant_initializations, Mapping):
+            raise _orphan_recovery_error(
+                suite_directory=suite_directory,
+                seed=seed,
+                raw_runs=raw_runs,
+                reason="top-level per-variant initialization audit is unavailable",
+            )
+        for variant in CAPACITY_COMPARISON_VARIANTS:
+            if raw_variant_initializations.get(variant) != reproduced_initialization[
+                "variants"
+            ][variant]:
+                raise _orphan_recovery_error(
+                    suite_directory=suite_directory,
+                    seed=seed,
+                    raw_runs=raw_runs,
+                    reason=f"top-level {variant} initialization audit differs",
+                )
+        try:
+            for variant in CAPACITY_COMPARISON_VARIANTS:
+                expected_child = matched._variant_config(config, variant, seed)
+                recovered, recovery_lineage = _recover_baseline_child(
+                    dataset=dataset,
+                    dataset_directory=dataset_directory,
+                    suite_directory=suite_directory,
+                    recovery_directory=recovery_directory,
+                    seed=seed,
+                    variant=variant,
+                    expected_config=expected_child,
+                    expected_initialization=reproduced_initialization,
+                    allow_validation_recovery_write=allow_validation_recovery_write,
+                )
+                runs[variant], validated_lineage = _validate_baseline_child(
+                    suite_directory=suite_directory,
+                    seed=seed,
+                    variant=variant,
+                    child=recovered,
+                    dataset_fingerprint=fingerprint,
+                    expected_config=expected_child,
+                )
+                child_lineage[variant] = {**validated_lineage, **recovery_lineage}
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+            raise _orphan_recovery_error(
+                suite_directory=suite_directory,
+                seed=seed,
+                raw_runs=raw_runs,
+                reason=str(exc),
+            ) from exc
 
     completed = {int(run["completed_epochs"]) for run in runs.values()}
     attempts = {int(run["attempted_optimizer_steps"]) for run in runs.values()}
@@ -945,14 +1458,27 @@ def train_kbo_capacity_comparison(
     directory = Path(dataset_directory).expanduser().resolve()
     baseline_directory = Path(baseline_suite_directory).expanduser().resolve()
     output = Path(output_directory).expanduser().resolve()
-    if output == baseline_directory:
-        raise ValueError("capacity output directory must differ from the baseline suite")
+    if output == baseline_directory or baseline_directory in output.parents:
+        raise ValueError(
+            "capacity output directory must differ from and be outside the baseline suite"
+        )
+    manifest_path = output / CAPACITY_COMPARISON_MANIFEST
+    manifest_preexists = manifest_path.is_file()
+    recovery_directory = output / "baseline-validation-recovery"
+    if output.exists() and any(output.iterdir()) and not manifest_path.is_file():
+        unexpected = [path for path in output.iterdir() if path != recovery_directory]
+        if unexpected:
+            raise FileExistsError(
+                "capacity output directory is non-empty and has no comparison manifest"
+            )
     dataset = KBOGraphDataset(directory)
     baseline = _validate_baseline_suite(
         dataset,
         directory,
         baseline_directory,
         requested_seed=baseline_seed,
+        recovery_directory=recovery_directory,
+        allow_validation_recovery_write=not manifest_preexists,
     )
     _validate_candidate_config(config, baseline.config)
     split_fingerprint, split_days = matched._split_day_fingerprint(dataset, config)
@@ -973,11 +1499,12 @@ def train_kbo_capacity_comparison(
         runtime_signature=runtime_signature,
         variant_protocols=variant_protocols,
     )
-    manifest_path = output / CAPACITY_COMPARISON_MANIFEST
     if output.exists() and any(output.iterdir()) and not manifest_path.is_file():
-        raise FileExistsError(
-            "capacity output directory is non-empty and has no comparison manifest"
-        )
+        unexpected = [path for path in output.iterdir() if path != recovery_directory]
+        if unexpected:
+            raise FileExistsError(
+                "capacity output directory is non-empty and has no comparison manifest"
+            )
     output.mkdir(parents=True, exist_ok=True)
     _validate_or_write_manifest(manifest_path, manifest)
 

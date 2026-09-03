@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import shutil
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -49,13 +50,24 @@ def _training_report(
     initial_hash: str = "baseline-initial",
 ) -> dict[str, Any]:
     history = [
-        {"epoch": 1, "validation": {"selection_loss": loss + 0.1}},
-        {"epoch": 2, "validation": {"selection_loss": loss}},
+        {
+            "epoch": 1,
+            "global_step": 5,
+            "skipped_optimizer_steps": 0,
+            "validation": {"selection_loss": loss + 0.1},
+        },
+        {
+            "epoch": 2,
+            "global_step": 10,
+            "skipped_optimizer_steps": 0,
+            "validation": {"selection_loss": loss},
+        },
     ]
     return {
         "status": "completed",
         "configuration": asdict(config),
         "dataset_fingerprint": DATASET_FINGERPRINT,
+        "graph_control": runner._graph_control_report(config),
         "test_used_during_training": False,
         "completed_epochs": 2,
         "best_epoch": 2,
@@ -66,7 +78,7 @@ def _training_report(
         "parameter_count": parameter_count,
         "initial_model_state_sha256": initial_hash,
         "best_checkpoint_sha256": sha256_file(checkpoint),
-        "last_checkpoint_sha256": "unused-in-this-fixture",
+        "last_checkpoint_sha256": sha256_file(checkpoint.with_name("last.pt")),
         "history": history,
     }
 
@@ -83,6 +95,7 @@ def _write_baseline(tmp_path: Path) -> tuple[Path, Path, runner.KBOTrainingConfi
         run.mkdir(parents=True)
         checkpoint = run / "best.pt"
         checkpoint.write_bytes(f"baseline-{variant}".encode("ascii"))
+        (run / "last.pt").write_bytes(f"baseline-{variant}-last".encode("ascii"))
         config = matched._variant_config(base, variant, SEED)
         training = _training_report(config, checkpoint, loss=loss)
         (run / "training_report.json").write_text(
@@ -173,20 +186,132 @@ def _patch_protocol_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         capacity,
         "_two_variant_initialization_audit",
-        lambda dataset, config: {
-            "seed": config.seed,
-            "all_variants_equal": True,
-            "initial_model_state_sha256": "expanded-initial",
-            "parameter_count": 400,
-            "variants": {
-                variant: {
-                    "initial_model_state_sha256": "expanded-initial",
-                    "parameter_count": 400,
-                }
-                for variant in capacity.CAPACITY_COMPARISON_VARIANTS
-            },
-        },
+        lambda dataset, config: _initialization_fixture(config),
     )
+
+
+def _initialization_fixture(config: runner.KBOTrainingConfig) -> dict[str, Any]:
+    initial_hash = "baseline-initial" if config.hidden_dim == 64 else "expanded-initial"
+    parameter_count = 100 if config.hidden_dim == 64 else 400
+    return {
+        "seed": config.seed,
+        "all_variants_equal": True,
+        "initial_model_state_sha256": initial_hash,
+        "parameter_count": parameter_count,
+        "variants": {
+            variant: {
+                "initial_model_state_sha256": initial_hash,
+                "parameter_count": parameter_count,
+            }
+            for variant in capacity.CAPACITY_COMPARISON_VARIANTS
+        },
+    }
+
+
+def _orphan_selected_seed(suite: Path, base: runner.KBOTrainingConfig) -> None:
+    report_path = suite / "matched_retraining_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["status"] = "failed"
+    report["runs"] = {}
+    report["initialization_audit"] = {str(SEED): _initialization_fixture(base)}
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    for variant, loss in (("full", 1.0), ("node_only", 1.2)):
+        run = suite / f"seed-{SEED}" / variant
+        checkpoint_hash = sha256_file(run / "best.pt")
+        output = run / "matched_validation" / checkpoint_hash[:16]
+        evaluation = _validation_report_fixture(
+            output,
+            checkpoint_hash=checkpoint_hash,
+            config=matched._variant_config(base, variant, SEED),
+            loss=loss,
+        )
+        (output / "metrics.json").write_text(json.dumps(evaluation), encoding="utf-8")
+
+
+def _prediction_fixture(
+    output: Path,
+    *,
+    loss: float,
+    null_tasks: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    metrics: dict[str, Any] = {"selection_loss": loss}
+    artifacts: dict[str, Any] = {}
+    for task in capacity.RECOVERY_PREDICTION_TASKS:
+        if task in null_tasks:
+            metrics[task] = None
+            continue
+        count_field = (
+            "samples" if task in {"match", "live_hit", "pa"} else "player_game_queries"
+        )
+        metrics[task] = {"fixture_metric": loss, count_field: 1}
+        target = output / f"{task}_predictions.parquet"
+        target.write_bytes(f"{task}-predictions".encode("ascii"))
+        artifacts[task] = {
+            "path": str(target),
+            "sha256": sha256_file(target),
+            "rows": 1,
+        }
+    return metrics, artifacts
+
+
+def _validation_report_fixture(
+    output: Path,
+    *,
+    checkpoint_hash: str,
+    config: runner.KBOTrainingConfig,
+    loss: float,
+    null_tasks: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    output.mkdir(parents=True, exist_ok=True)
+    metrics, prediction_artifacts = _prediction_fixture(
+        output,
+        loss=loss,
+        null_tasks=null_tasks,
+    )
+    return {
+        "split": "validation",
+        "checkpoint_sha256": checkpoint_hash,
+        "dataset_fingerprint": DATASET_FINGERPRINT,
+        "training_seasons": list(config.train_seasons),
+        "validation_season": config.validation_season,
+        "held_out_test_season": config.test_season,
+        "graph_control": runner._graph_control_report(config),
+        "metrics": metrics,
+        "prediction_artifacts": prediction_artifacts,
+        "output_directory": str(output),
+    }
+
+
+def _patch_orphan_checkpoint_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    def checkpoint_state(path: Path) -> dict[str, Any]:
+        training = json.loads(
+            (path.parent / "training_report.json").read_text(encoding="utf-8")
+        )
+        epoch = (
+            int(training["best_epoch"])
+            if path.name == "best.pt"
+            else int(training["completed_epochs"])
+        )
+        return {
+            "epoch": epoch,
+            "best_epoch": training["best_epoch"],
+            "best_score": training["best_validation_loss"],
+            "global_step": training["optimizer_steps"],
+            "skipped_optimizer_steps": training["skipped_optimizer_steps"],
+            "history": training["history"][:epoch],
+        }
+
+    monkeypatch.setattr(
+        capacity.runner,
+        "_read_checkpoint",
+        checkpoint_state,
+    )
+    monkeypatch.setattr(matched, "_validate_child_checkpoint", lambda *a, **k: None)
+
+
+def _remove_orphan_validation_cache(suite: Path) -> None:
+    for variant in capacity.CAPACITY_COMPARISON_VARIANTS:
+        shutil.rmtree(suite / f"seed-{SEED}" / variant / "matched_validation")
 
 
 def _patch_candidate_runs(
@@ -336,6 +461,387 @@ def test_failed_partial_suite_requires_both_selected_seed_children(
             graph,
             suite,
             tmp_path / "output",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_failed_suite_recovers_complete_orphan_children_without_baseline_training(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    original_report = sha256_file(suite / "matched_retraining_report.json")
+    original_manifest = sha256_file(suite / "suite_config.json")
+    _patch_orphan_checkpoint_validation(monkeypatch)
+    trained, evaluated = _patch_candidate_runs(monkeypatch)
+
+    report = capacity.train_kbo_capacity_comparison(
+        graph,
+        suite,
+        tmp_path / "capacity",
+        config=replace(base, hidden_dim=128, layers=3),
+        baseline_seed=SEED,
+        progress=lambda _: None,
+    )
+
+    assert report["status"] == "completed"
+    assert trained == evaluated == ["full", "node_only"]
+    baseline_runs = report["runs"]["baseline_64x2"]
+    assert {
+        run["baseline_record_source"] for run in baseline_runs.values()
+    } == {"recovered_from_complete_local_child_artifacts"}
+    assert all(
+        child["recovered"]
+        for child in report["baseline_suite_lineage"]["children"].values()
+    )
+    assert sha256_file(suite / "matched_retraining_report.json") == original_report
+    assert sha256_file(suite / "suite_config.json") == original_manifest
+    assert not (tmp_path / "capacity" / "baseline-validation-recovery").exists()
+
+
+def test_orphan_recovery_reports_child_availability_without_fallback_from_partial_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    (suite / f"seed-{SEED}" / "node_only" / "training_report.json").unlink()
+
+    with pytest.raises(
+        ValueError,
+        match=r"cannot be recovered: .*node_only/training_report.json.*node_only=partial",
+    ):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "capacity",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_orphan_recovery_allows_missing_last_but_rejects_present_bad_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    last_checkpoint = suite / f"seed-{SEED}" / "node_only" / "last.pt"
+    last_checkpoint.unlink()
+    _patch_orphan_checkpoint_validation(monkeypatch)
+    _patch_candidate_runs(monkeypatch)
+    report = capacity.train_kbo_capacity_comparison(
+        graph,
+        suite,
+        tmp_path / "missing-last",
+        config=replace(base, hidden_dim=128, layers=3),
+        baseline_seed=SEED,
+        progress=lambda _: None,
+    )
+    assert report["status"] == "completed"
+    assert (
+        report["baseline_suite_lineage"]["children"]["node_only"]["recovered"]
+        is True
+    )
+    assert "last_checkpoint" not in report["runs"]["baseline_64x2"]["node_only"]
+
+    last_checkpoint.write_bytes(b"restored-but-different")
+    with pytest.raises(ValueError, match="last checkpoint hash differs"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "wrong-last-hash",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_recovered_validation_accepts_null_tasks_only_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = matched._variant_config(_baseline_config(), "full", SEED)
+    checkpoint_hash = "c" * 64
+    output = tmp_path / "validation"
+    report = _validation_report_fixture(
+        output,
+        checkpoint_hash=checkpoint_hash,
+        config=config,
+        loss=1.0,
+        null_tasks=("live_hit",),
+    )
+    report["metrics"]["box_pa"] = None
+
+    validated = capacity._validated_recovery_evaluation(
+        output / "metrics.json",
+        report=report,
+        checkpoint_hash=checkpoint_hash,
+        dataset_fingerprint=DATASET_FINGERPRINT,
+        config=config,
+        context="fixture",
+    )
+
+    assert set(validated["prediction_artifacts"]) == {
+        "match",
+        "pa",
+        "box_pa",
+        "box_pitch",
+    }
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    (
+        ("missing", "missing required prediction artifacts"),
+        ("zero_rows", "match artifact lineage is malformed"),
+        ("row_mismatch", "match artifact row count differs"),
+        ("external_path", "match artifact path is not canonical"),
+        ("bad_sha", "match artifact hash differs"),
+    ),
+)
+def test_recovered_validation_rejects_incomplete_prediction_artifact_lineage(
+    tmp_path: Path,
+    corruption: str,
+    message: str,
+) -> None:
+    config = matched._variant_config(_baseline_config(), "full", SEED)
+    checkpoint_hash = "c" * 64
+    output = tmp_path / corruption
+    report = _validation_report_fixture(
+        output,
+        checkpoint_hash=checkpoint_hash,
+        config=config,
+        loss=1.0,
+    )
+    artifacts = report["prediction_artifacts"]
+    if corruption == "missing":
+        artifacts.pop("match")
+    elif corruption == "zero_rows":
+        artifacts["match"]["rows"] = 0
+    elif corruption == "row_mismatch":
+        artifacts["match"]["rows"] = 2
+    elif corruption == "external_path":
+        external = tmp_path / "external.parquet"
+        external.write_bytes(b"match-predictions")
+        artifacts["match"]["path"] = str(external)
+    else:
+        artifacts["match"]["sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match=message):
+        capacity._validated_recovery_evaluation(
+            output / "metrics.json",
+            report=report,
+            checkpoint_hash=checkpoint_hash,
+            dataset_fingerprint=DATASET_FINGERPRINT,
+            config=config,
+            context="fixture",
+        )
+
+
+def test_existing_manifest_never_writes_missing_orphan_validation_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    _remove_orphan_validation_cache(suite)
+    _patch_orphan_checkpoint_validation(monkeypatch)
+    output = tmp_path / "capacity"
+    output.mkdir()
+    manifest = output / capacity.CAPACITY_COMPARISON_MANIFEST
+    manifest.write_text(json.dumps({"stale": True}), encoding="utf-8")
+    original_manifest_hash = sha256_file(manifest)
+    evaluations: list[Path] = []
+
+    def forbidden_evaluation(checkpoint: Path, **kwargs: Any) -> dict[str, Any]:
+        evaluations.append(checkpoint)
+        raise AssertionError("existing-manifest recovery must be read-only")
+
+    monkeypatch.setattr(capacity.runner, "evaluate_kbo_relgnn", forbidden_evaluation)
+
+    with pytest.raises(ValueError, match="refusing to modify"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            output,
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+    assert evaluations == []
+    assert sha256_file(manifest) == original_manifest_hash
+    assert not (output / "baseline-validation-recovery").exists()
+
+
+def test_fresh_output_may_create_missing_orphan_validation_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    _remove_orphan_validation_cache(suite)
+    _patch_orphan_checkpoint_validation(monkeypatch)
+    trained, candidate_evaluated = _patch_candidate_runs(monkeypatch)
+    baseline_evaluated: list[str] = []
+
+    def fake_baseline_evaluation(
+        checkpoint: Path,
+        *,
+        split: str,
+        output_directory: Path,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        assert split == "validation"
+        variant = checkpoint.parent.name
+        baseline_evaluated.append(variant)
+        loss = 1.0 if variant == "full" else 1.2
+        return _validation_report_fixture(
+            output_directory,
+            checkpoint_hash=sha256_file(checkpoint),
+            config=matched._variant_config(base, variant, SEED),
+            loss=loss,
+        )
+
+    monkeypatch.setattr(capacity.runner, "evaluate_kbo_relgnn", fake_baseline_evaluation)
+    output = tmp_path / "capacity"
+
+    report = capacity.train_kbo_capacity_comparison(
+        graph,
+        suite,
+        output,
+        config=replace(base, hidden_dim=128, layers=3),
+        baseline_seed=SEED,
+        progress=lambda _: None,
+    )
+
+    assert report["status"] == "completed"
+    assert baseline_evaluated == ["full", "node_only"]
+    assert trained == candidate_evaluated == ["full", "node_only"]
+    assert (output / capacity.CAPACITY_COMPARISON_MANIFEST).is_file()
+    assert (output / "baseline-validation-recovery").is_dir()
+
+
+def test_selected_orphan_seed_recovers_when_another_seed_record_survives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    other_seed = SEED + 1
+    report_path = suite / "matched_retraining_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["seeds"] = [other_seed, SEED]
+    report["runs"] = {str(other_seed): {"full": {"survived": True}}}
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    manifest_path = suite / "suite_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seeds"] = [other_seed, SEED]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _patch_orphan_checkpoint_validation(monkeypatch)
+    trained, evaluated = _patch_candidate_runs(monkeypatch)
+
+    result = capacity.train_kbo_capacity_comparison(
+        graph,
+        suite,
+        tmp_path / "capacity",
+        config=replace(base, hidden_dim=128, layers=3),
+        baseline_seed=SEED,
+        progress=lambda _: None,
+    )
+
+    assert result["seed"] == SEED
+    assert trained == evaluated == ["full", "node_only"]
+    assert all(
+        child["recovered"]
+        for child in result["baseline_suite_lineage"]["children"].values()
+    )
+
+
+def test_null_selected_seed_record_is_malformed_and_never_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    report_path = suite / "matched_retraining_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["runs"] = {str(SEED): None}
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="selected-seed run record is malformed"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "capacity",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_orphan_recovery_rejects_changed_initialization_and_test_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    report_path = suite / "matched_retraining_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["initialization_audit"][str(SEED)]["initial_model_state_sha256"] = "changed"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(ValueError, match="top-level initialization audit differs"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "changed-init",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+    _orphan_selected_seed(suite, base)
+    checkpoint = suite / f"seed-{SEED}" / "full" / "best.pt"
+    metrics_path = (
+        checkpoint.parent
+        / "matched_validation"
+        / sha256_file(checkpoint)[:16]
+        / "metrics.json"
+    )
+    evaluation = json.loads(metrics_path.read_text(encoding="utf-8"))
+    evaluation["split"] = "test"
+    metrics_path.write_text(json.dumps(evaluation), encoding="utf-8")
+    _patch_orphan_checkpoint_validation(monkeypatch)
+    with pytest.raises(ValueError, match="not validation-only"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "test-evaluation",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_capacity_output_cannot_be_inside_baseline_suite(tmp_path: Path) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    with pytest.raises(ValueError, match="outside the baseline suite"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            suite / "child-output",
             config=replace(base, hidden_dim=128, layers=3),
             baseline_seed=SEED,
             progress=lambda _: None,

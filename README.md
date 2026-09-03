@@ -369,6 +369,12 @@ suite는 거부합니다. 이 명령은 그 안의 64×2 모델을 재학습하�
 각 용량 안의 `full`/`node_only` 초기화, 학습 예산과 split lineage가 맞지 않거나 test 봉인을
 증명하지 못하면 중단합니다.
 
+실패한 suite가 최상위 `runs` 기록을 쓰기 전에 중단됐더라도 로컬
+`seed-<seed>/{full,node_only}`의 완료된 training report와 `best.pt`를 검증해 복구합니다.
+`last.pt`가 남아 있으면 그 checkpoint와 hash도 엄격히 검증하지만, 정리되어 없어도 복구할 수 있습니다.
+기존 validation artifact가 없을 때만 비교 출력 디렉터리에서 `best.pt`를 validation으로 다시
+평가하며, 원본 suite는 수정하지 않고 test split은 로드하지 않습니다.
+
 4. 관계를 한 쌍의 90일 집계 edge에만 압축하는 한계를 확인하기 위해 graph-vNext를 별도
    디렉터리에 만듭니다. DB schema는 5를 유지하고 graph cache version만 6이 됩니다.
 
