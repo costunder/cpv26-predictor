@@ -399,6 +399,104 @@ def _orphan_validation_report(
     )
 
 
+def _orphan_initialization_consensus(
+    suite_directory: Path,
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    """Recover the historical initialization from both completed child reports."""
+    hashes: set[str] = set()
+    counts: set[int] = set()
+    for variant in CAPACITY_COMPARISON_VARIANTS:
+        path = suite_directory / f"seed-{seed}" / variant / "training_report.json"
+        training = _load_json(path)
+        if training.get("status") != "completed":
+            raise ValueError(f"baseline {seed}/{variant} is not completed")
+        initial_hash = training.get("initial_model_state_sha256")
+        parameter_count = training.get("parameter_count")
+        if not isinstance(initial_hash, str) or not initial_hash:
+            raise ValueError(
+                f"baseline {seed}/{variant} has no historical initialization hash"
+            )
+        if (
+            isinstance(parameter_count, bool)
+            or not isinstance(parameter_count, int)
+            or parameter_count <= 0
+        ):
+            raise ValueError(
+                f"baseline {seed}/{variant} has no positive historical parameter count"
+            )
+        hashes.add(initial_hash)
+        counts.add(parameter_count)
+    if len(hashes) != 1 or len(counts) != 1:
+        raise ValueError(
+            "baseline full and node_only child reports do not share historical "
+            "initialization consensus"
+        )
+    return {
+        "initial_model_state_sha256": next(iter(hashes)),
+        "parameter_count": next(iter(counts)),
+    }
+
+
+def _initialization_diagnostic(
+    value: Any,
+    *,
+    consensus: Mapping[str, Any],
+    current: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {
+            "available": False,
+            "hash_matches_child_consensus": None,
+            "parameter_count_matches_child_consensus": None,
+            "hash_matches_current_reproduction": None,
+            "parameter_count_matches_current_reproduction": None,
+        }
+    initial_hash = value.get("initial_model_state_sha256")
+    parameter_count = value.get("parameter_count")
+    variants = value.get("variants")
+    variant_diagnostics: dict[str, Any] = {}
+    for variant in CAPACITY_COMPARISON_VARIANTS:
+        item = variants.get(variant) if isinstance(variants, Mapping) else None
+        variant_diagnostics[variant] = {
+            "available": isinstance(item, Mapping),
+            "hash_matches_child_consensus": (
+                item.get("initial_model_state_sha256")
+                == consensus["initial_model_state_sha256"]
+                if isinstance(item, Mapping)
+                else None
+            ),
+            "parameter_count_matches_child_consensus": (
+                item.get("parameter_count") == consensus["parameter_count"]
+                if isinstance(item, Mapping)
+                else None
+            ),
+        }
+    return {
+        "available": True,
+        "initial_model_state_sha256": initial_hash,
+        "parameter_count": parameter_count,
+        "hash_matches_child_consensus": (
+            initial_hash == consensus["initial_model_state_sha256"]
+        ),
+        "parameter_count_matches_child_consensus": (
+            parameter_count == consensus["parameter_count"]
+        ),
+        "hash_matches_current_reproduction": (
+            initial_hash == current.get("initial_model_state_sha256")
+            if current is not None
+            else None
+        ),
+        "parameter_count_matches_current_reproduction": (
+            parameter_count == current.get("parameter_count")
+            if current is not None
+            else None
+        ),
+        "variants": variant_diagnostics,
+    }
+
+
 def _recover_baseline_child(
     *,
     dataset: KBOGraphDataset,
@@ -438,7 +536,9 @@ def _recover_baseline_child(
         or int(training.get("parameter_count", -1))
         != int(expected_initialization.get("parameter_count", -2))
     ):
-        raise ValueError(f"{context} does not match the independently reproduced initialization")
+        raise ValueError(
+            f"{context} does not match the historical child initialization consensus"
+        )
 
     best_checkpoint = run_directory / "best.pt"
     best_hash = _validate_recovery_checkpoint(
@@ -741,6 +841,7 @@ def _validate_baseline_suite(
         raise ValueError("baseline matched suite has no saved runs")
     runs: dict[str, dict[str, Any]] = {}
     child_lineage: dict[str, Any] = {}
+    orphan_initialization_audit: dict[str, Any] | None = None
     seed_key = str(seed)
     if seed_key in raw_runs:
         raw_per_seed = raw_runs[seed_key]
@@ -786,52 +887,50 @@ def _validate_baseline_suite(
                 raw_runs=raw_runs,
                 reason="required child artifacts are missing: " + ", ".join(missing_artifacts),
             )
-        raw_initializations = report.get("initialization_audit")
-        raw_initialization = (
-            raw_initializations.get(str(seed))
-            if isinstance(raw_initializations, Mapping)
-            else None
-        )
-        if not isinstance(raw_initialization, Mapping):
-            raise _orphan_recovery_error(
-                suite_directory=suite_directory,
-                seed=seed,
-                raw_runs=raw_runs,
-                reason="top-level initialization audit for the selected seed is unavailable",
-            )
-        reproduced_initialization = _two_variant_initialization_audit(dataset, config)
-        for field in (
-            "seed",
-            "all_variants_equal",
-            "initial_model_state_sha256",
-            "parameter_count",
-        ):
-            if raw_initialization.get(field) != reproduced_initialization.get(field):
-                raise _orphan_recovery_error(
-                    suite_directory=suite_directory,
-                    seed=seed,
-                    raw_runs=raw_runs,
-                    reason=f"top-level initialization audit differs at {field}",
-                )
-        raw_variant_initializations = raw_initialization.get("variants")
-        if not isinstance(raw_variant_initializations, Mapping):
-            raise _orphan_recovery_error(
-                suite_directory=suite_directory,
-                seed=seed,
-                raw_runs=raw_runs,
-                reason="top-level per-variant initialization audit is unavailable",
-            )
-        for variant in CAPACITY_COMPARISON_VARIANTS:
-            if raw_variant_initializations.get(variant) != reproduced_initialization[
-                "variants"
-            ][variant]:
-                raise _orphan_recovery_error(
-                    suite_directory=suite_directory,
-                    seed=seed,
-                    raw_runs=raw_runs,
-                    reason=f"top-level {variant} initialization audit differs",
-                )
         try:
+            historical_initialization = _orphan_initialization_consensus(
+                suite_directory,
+                seed=seed,
+            )
+            reproduced_initialization = _two_variant_initialization_audit(dataset, config)
+            if (
+                reproduced_initialization.get("parameter_count")
+                != historical_initialization["parameter_count"]
+            ):
+                raise ValueError(
+                    "historical baseline parameter count is incompatible with the current model"
+                )
+            reproduced_variants = reproduced_initialization.get("variants")
+            if not isinstance(reproduced_variants, Mapping) or any(
+                not isinstance(reproduced_variants.get(variant), Mapping)
+                or reproduced_variants[variant].get("parameter_count")
+                != historical_initialization["parameter_count"]
+                for variant in CAPACITY_COMPARISON_VARIANTS
+            ):
+                raise ValueError(
+                    "historical baseline parameter count differs from a current variant"
+                )
+            raw_initializations = report.get("initialization_audit")
+            raw_initialization = (
+                raw_initializations.get(seed_key)
+                if isinstance(raw_initializations, Mapping)
+                else None
+            )
+            orphan_initialization_audit = {
+                "authority": "completed_full_and_node_only_child_consensus",
+                "historical_child_consensus": _plain(historical_initialization),
+                "current_reproduction": _initialization_diagnostic(
+                    reproduced_initialization,
+                    consensus=historical_initialization,
+                ),
+                "top_level_snapshot": _initialization_diagnostic(
+                    raw_initialization,
+                    consensus=historical_initialization,
+                    current=reproduced_initialization,
+                ),
+                "current_hash_match_required": False,
+                "current_parameter_count_match_required": True,
+            }
             for variant in CAPACITY_COMPARISON_VARIANTS:
                 expected_child = matched._variant_config(config, variant, seed)
                 recovered, recovery_lineage = _recover_baseline_child(
@@ -842,7 +941,7 @@ def _validate_baseline_suite(
                     seed=seed,
                     variant=variant,
                     expected_config=expected_child,
-                    expected_initialization=reproduced_initialization,
+                    expected_initialization=historical_initialization,
                     allow_validation_recovery_write=allow_validation_recovery_write,
                 )
                 runs[variant], validated_lineage = _validate_baseline_child(
@@ -881,6 +980,8 @@ def _validate_baseline_suite(
         "seed": seed,
         "children": child_lineage,
     }
+    if orphan_initialization_audit is not None:
+        lineage["orphan_initialization_audit"] = orphan_initialization_audit
     return _BaselineSuite(
         seed=seed,
         config=config,

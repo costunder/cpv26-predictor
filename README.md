@@ -372,6 +372,8 @@ suite는 거부합니다. 이 명령은 그 안의 64×2 모델을 재학습하�
 실패한 suite가 최상위 `runs` 기록을 쓰기 전에 중단됐더라도 로컬
 `seed-<seed>/{full,node_only}`의 완료된 training report와 `best.pt`를 검증해 복구합니다.
 `last.pt`가 남아 있으면 그 checkpoint와 hash도 엄격히 검증하지만, 정리되어 없어도 복구할 수 있습니다.
+과거 코드와 현재 코드의 초기화 hash가 달라도 두 child report와 checkpoint의 저장 계보가 서로
+일치하고 현재 모델의 parameter count가 같으면 과거 hash를 기준으로 복구하며 차이는 보고서에 남깁니다.
 기존 validation artifact가 없을 때만 비교 출력 디렉터리에서 `best.pt`를 validation으로 다시
 평가하며, 원본 suite는 수정하지 않고 test split은 로드하지 않습니다.
 

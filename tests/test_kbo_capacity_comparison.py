@@ -791,7 +791,7 @@ def test_null_selected_seed_record_is_malformed_and_never_recovered(
         )
 
 
-def test_orphan_recovery_rejects_changed_initialization_and_test_evaluation(
+def test_orphan_recovery_records_top_level_drift_and_rejects_test_evaluation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -802,15 +802,23 @@ def test_orphan_recovery_rejects_changed_initialization_and_test_evaluation(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     report["initialization_audit"][str(SEED)]["initial_model_state_sha256"] = "changed"
     report_path.write_text(json.dumps(report), encoding="utf-8")
-    with pytest.raises(ValueError, match="top-level initialization audit differs"):
-        capacity.train_kbo_capacity_comparison(
-            graph,
-            suite,
-            tmp_path / "changed-init",
-            config=replace(base, hidden_dim=128, layers=3),
-            baseline_seed=SEED,
-            progress=lambda _: None,
-        )
+    _patch_orphan_checkpoint_validation(monkeypatch)
+    _patch_candidate_runs(monkeypatch)
+    recovered = capacity.train_kbo_capacity_comparison(
+        graph,
+        suite,
+        tmp_path / "changed-init",
+        config=replace(base, hidden_dim=128, layers=3),
+        baseline_seed=SEED,
+        progress=lambda _: None,
+    )
+    initialization = recovered["baseline_suite_lineage"][
+        "orphan_initialization_audit"
+    ]
+    assert (
+        initialization["top_level_snapshot"]["hash_matches_child_consensus"]
+        is False
+    )
 
     _orphan_selected_seed(suite, base)
     checkpoint = suite / f"seed-{SEED}" / "full" / "best.pt"
@@ -823,12 +831,112 @@ def test_orphan_recovery_rejects_changed_initialization_and_test_evaluation(
     evaluation = json.loads(metrics_path.read_text(encoding="utf-8"))
     evaluation["split"] = "test"
     metrics_path.write_text(json.dumps(evaluation), encoding="utf-8")
-    _patch_orphan_checkpoint_validation(monkeypatch)
     with pytest.raises(ValueError, match="not validation-only"):
         capacity.train_kbo_capacity_comparison(
             graph,
             suite,
             tmp_path / "test-evaluation",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_orphan_recovery_allows_current_initialization_hash_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+
+    def drifted_initialization(dataset: Any, config: runner.KBOTrainingConfig) -> dict[str, Any]:
+        value = _initialization_fixture(config)
+        if config.hidden_dim == 64:
+            value["initial_model_state_sha256"] = "current-code-initial"
+            for variant in capacity.CAPACITY_COMPARISON_VARIANTS:
+                value["variants"][variant][
+                    "initial_model_state_sha256"
+                ] = "current-code-initial"
+        return value
+
+    monkeypatch.setattr(
+        capacity,
+        "_two_variant_initialization_audit",
+        drifted_initialization,
+    )
+    _patch_orphan_checkpoint_validation(monkeypatch)
+    trained, evaluated = _patch_candidate_runs(monkeypatch)
+
+    report = capacity.train_kbo_capacity_comparison(
+        graph,
+        suite,
+        tmp_path / "capacity",
+        config=replace(base, hidden_dim=128, layers=3),
+        baseline_seed=SEED,
+        progress=lambda _: None,
+    )
+
+    audit = report["baseline_suite_lineage"]["orphan_initialization_audit"]
+    assert audit["authority"] == "completed_full_and_node_only_child_consensus"
+    assert audit["current_reproduction"]["hash_matches_child_consensus"] is False
+    assert audit["current_reproduction"][
+        "parameter_count_matches_child_consensus"
+    ] is True
+    assert trained == evaluated == ["full", "node_only"]
+
+
+def test_orphan_recovery_rejects_child_initialization_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+    training_path = suite / f"seed-{SEED}" / "node_only" / "training_report.json"
+    training = json.loads(training_path.read_text(encoding="utf-8"))
+    training["initial_model_state_sha256"] = "different-child-initial"
+    training_path.write_text(json.dumps(training), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="do not share historical initialization consensus"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "capacity",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_orphan_recovery_rejects_current_parameter_count_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    _orphan_selected_seed(suite, base)
+
+    def incompatible_initialization(
+        dataset: Any, config: runner.KBOTrainingConfig
+    ) -> dict[str, Any]:
+        value = _initialization_fixture(config)
+        if config.hidden_dim == 64:
+            value["parameter_count"] = 101
+            for variant in capacity.CAPACITY_COMPARISON_VARIANTS:
+                value["variants"][variant]["parameter_count"] = 101
+        return value
+
+    monkeypatch.setattr(
+        capacity,
+        "_two_variant_initialization_audit",
+        incompatible_initialization,
+    )
+    with pytest.raises(ValueError, match="parameter count is incompatible"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "capacity",
             config=replace(base, hidden_dim=128, layers=3),
             baseline_seed=SEED,
             progress=lambda _: None,
