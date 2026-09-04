@@ -103,10 +103,11 @@ def _validate_completed_baseline(
         expected={"hidden_dim": 128, "layers": 3, "heads": 4},
     )
     capacity._validate_full_node_config(base)
-    if base.compact_kbo_channels:
+    if not base.compact_kbo_channels:
         raise ValueError(
-            "baseline capacity uses compact_kbo_channels; the controlled dense-channel "
-            "scale workflow requires compact_kbo_channels=False"
+            "baseline capacity uses the legacy dense-channel architecture with "
+            "inactive trainable parameters; rerun the compliant baseline with "
+            "compact_kbo_channels=True"
         )
     expected_train_seasons = tuple(range(2001, 2025))
     if (
@@ -224,7 +225,7 @@ def prepare_kbo_scale_training(
         layers=SCALE_CANDIDATE_CAPACITY["layers"],
         heads=SCALE_CANDIDATE_CAPACITY["heads"],
         activation_checkpointing=True,
-        compact_kbo_channels=False,
+        compact_kbo_channels=True,
     )
     # This also rejects a source that did not use the fixed-budget two-condition
     # contract (patience=0, intact graph, full base schedule).

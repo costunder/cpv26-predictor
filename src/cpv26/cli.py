@@ -857,7 +857,7 @@ def relgnn_train(
     compact_kbo_channels: Annotated[
         bool,
         typer.Option(help="Allocate updates only for KBO route-active player roles."),
-    ] = False,
+    ] = True,
 ) -> None:
     """Train role-aware RelGNN on selected seasons with later validation and held-out test."""
     if train_start_year > train_end_year:
@@ -1229,7 +1229,7 @@ def relgnn_pair_train(
     compact_kbo_channels: Annotated[
         bool,
         typer.Option(help="Allocate updates only for KBO route-active player roles."),
-    ] = False,
+    ] = True,
 ) -> None:
     """Train exactly full and node_only once with matched initialization."""
 
@@ -1331,7 +1331,7 @@ def relgnn_scale_preflight(
     compact_kbo_channels: Annotated[
         bool,
         typer.Option(help="Use the separately fingerprinted active-channel architecture."),
-    ] = False,
+    ] = True,
 ) -> None:
     """Scan real batches and run forward/backward/AdamW before a larger training run."""
 

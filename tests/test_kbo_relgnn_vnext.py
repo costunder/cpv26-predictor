@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,7 @@ torch = pytest.importorskip("torch")
 
 from cpv26.models.kbo_relgnn import (  # noqa: E402
     KBO_ROUTE_NAMES,
+    KBO_TEMPORAL_ROUTE_NAMES,
     KBO_VNEXT_ROUTE_NAMES,
     KBORelGNNConfig,
     KBORelGNNModel,
@@ -140,6 +142,117 @@ def _parameter_count(model: KBORelGNNModel) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
 
 
+def _temporal_day(seed: int = 19) -> dict[str, Any]:
+    day = _vnext_day("2024-04-03", seed)
+    rng = np.random.default_rng(seed + 1)
+    day["routes"] = {
+        "batter_game_event": _route(rng, [0, 0], [0, 1], 6),
+        "pitcher_game_event": _route(rng, [1, 1], [0, 1], 6),
+        "team_game_event": _route(rng, [0, 1], [0, 1], 6),
+        "batter_pa_pitcher_event": _route(rng, [0, 0], [1, 1], 6),
+    }
+    return day
+
+
+def _temporal_config(*, chunk_size: int) -> KBORelGNNConfig:
+    return KBORelGNNConfig(
+        node_feature_dims={"player": 4, "team": 8, "game": 4},
+        role_feature_dims={"batting": 8, "pitching": 8},
+        route_feature_dims=dict.fromkeys(KBO_TEMPORAL_ROUTE_NAMES, 6),
+        hidden_dim=16,
+        num_layers=2,
+        num_attention_heads=4,
+        dropout=0.0,
+        include_boxscore_heads=True,
+        route_edge_chunk_size=chunk_size,
+        compact_kbo_channels=True,
+    )
+
+
+def test_temporal_route_family_chunking_and_empty_routes_are_lossless() -> None:
+    unchunked = KBORelGNNModel(_temporal_config(chunk_size=100_000))
+    chunked = KBORelGNNModel(_temporal_config(chunk_size=1))
+    chunked.load_state_dict(unchunked.state_dict())
+    batch = collate_kbo_day_graphs([_temporal_day()])
+    first = unchunked(batch)
+    second = chunked(batch)
+    for name in first:
+        if torch.is_tensor(first[name]):
+            torch.testing.assert_close(
+                first[name], second[name], rtol=3e-5, atol=3e-6, equal_nan=True
+            )
+        else:
+            for key in first[name]:
+                torch.testing.assert_close(
+                    first[name][key], second[name][key], rtol=3e-5, atol=3e-6
+                )
+    first_loss = kbo_multitask_loss(first, batch)["loss"]
+    second_loss = kbo_multitask_loss(second, batch)["loss"]
+    first_loss.backward()
+    second_loss.backward()
+    for (first_name, first_parameter), (second_name, second_parameter) in zip(
+        unchunked.named_parameters(), chunked.named_parameters(), strict=True
+    ):
+        assert first_name == second_name
+        torch.testing.assert_close(
+            first_parameter.grad,
+            second_parameter.grad,
+            rtol=4e-5,
+            atol=4e-6,
+        )
+
+    empty = _temporal_day(23)
+    for route in empty["routes"].values():
+        route["source_index"] = route["source_index"][:0]
+        route["destination_index"] = route["destination_index"][:0]
+        route["event_features"] = route["event_features"][:0]
+        route["event_age_seconds"] = route["event_age_seconds"][:0]
+        route["publication_delay_seconds"] = route[
+            "publication_delay_seconds"
+        ][:0]
+        route["weights"] = route["weights"][:0]
+    empty_output = chunked(collate_kbo_day_graphs([empty]))
+    assert all(
+        not torch.isnan(value).any()
+        for value in empty_output.values()
+        if torch.is_tensor(value)
+    )
+
+
+def test_vnext_route_family_chunking_preserves_outputs_and_gradients() -> None:
+    base = _config(vnext=True)
+    unchunked = KBORelGNNModel(replace(base, route_edge_chunk_size=100_000))
+    chunked = KBORelGNNModel(replace(base, route_edge_chunk_size=1))
+    chunked.load_state_dict(unchunked.state_dict())
+    batch = collate_kbo_day_graphs(
+        [_vnext_day("2024-04-01", 31), _vnext_day("2024-04-02", 37)]
+    )
+    first = unchunked(batch)
+    second = chunked(batch)
+    for name in first:
+        if torch.is_tensor(first[name]):
+            torch.testing.assert_close(
+                first[name], second[name], rtol=4e-5, atol=4e-6, equal_nan=True
+            )
+        else:
+            for key in first[name]:
+                torch.testing.assert_close(
+                    first[name][key], second[name][key], rtol=4e-5, atol=4e-6
+                )
+    kbo_multitask_loss(first, batch)["loss"].backward()
+    kbo_multitask_loss(second, batch)["loss"].backward()
+    for (first_name, first_parameter), (second_name, second_parameter) in zip(
+        unchunked.named_parameters(), chunked.named_parameters(), strict=True
+    ):
+        assert first_name == second_name
+        torch.testing.assert_close(
+            first_parameter.grad,
+            second_parameter.grad,
+            rtol=5e-5,
+            atol=5e-6,
+        )
+
+
 def test_legacy_route_contract_and_v5_state_shapes_are_unchanged() -> None:
     assert KBO_ROUTE_NAMES == (
         "batter_pa_pitcher",
@@ -172,16 +285,22 @@ def test_vnext_collator_offsets_game_queries_and_model_forward_is_finite() -> No
     assert route.destination_index.tolist() == [1, 1, 3, 3]
 
     torch.manual_seed(7)
-    full_model = KBORelGNNModel(_config(vnext=True))
-    node_only_model = KBORelGNNModel(_config(vnext=True))
-    node_only_model.load_state_dict(full_model.state_dict())
+    full_config = _config(vnext=True)
+    full_model = KBORelGNNModel(full_config)
+    torch.manual_seed(7)
+    node_only_model = KBORelGNNModel(
+        replace(full_config, route_schedule=((),) * full_config.num_layers)
+    )
     assert full_model.uses_game_nodes
     assert full_model.match_head.network[0].weight.shape == (16, 16 * 5)
     assert full_model.run_head.network[0].weight.shape == (32, 16 * 5)
-    assert _parameter_count(full_model) == _parameter_count(node_only_model)
+    assert _parameter_count(full_model) > _parameter_count(node_only_model)
+    assert len(node_only_model.backbone.layers) == 0
+    for name, parameter in node_only_model.named_parameters():
+        torch.testing.assert_close(parameter, dict(full_model.named_parameters())[name])
 
     output = full_model(batch)
-    node_only_output = node_only_model({**batch, "routes": ()})
+    node_only_output = node_only_model(batch)
     for name in (
         "match_logits",
         "live_hit_joint_probabilities",

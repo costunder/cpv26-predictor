@@ -3,8 +3,8 @@
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   echo "This script must be sourced so it can update the current shell." >&2
   echo "Run: source scripts/activate.sh" >&2
-  exit 1
-fi
+  false
+else
 
 cpv26_project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
 if ! source "${cpv26_project_root}/scripts/conda_guard.sh"; then
@@ -53,3 +53,4 @@ done
 unset cpv26_env_entries cpv26_env_line
 
 echo "CPV26 configuration loaded in Conda environment ${CONDA_DEFAULT_ENV}: ${cpv26_project_root}"
+fi

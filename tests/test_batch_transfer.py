@@ -55,6 +55,7 @@ def test_cuda_prefetch_preserves_order_waits_and_records_consumer_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
+    observations: list[tuple[str, Any]] = []
     active_stream: list[str | None] = [None]
 
     class FakeDevice:
@@ -94,6 +95,7 @@ def test_cuda_prefetch_preserves_order_waits_and_records_consumer_stream(
             Stream=lambda **_: copy,
             stream=lambda value: FakeStreamContext(value),
             current_stream=lambda _: compute,
+            Event=lambda **_: SimpleNamespace(record=lambda *_: None),
         ),
     )
     monkeypatch.setattr(batch_transfer, "require_torch", lambda: (fake_torch, None))
@@ -107,7 +109,12 @@ def test_cuda_prefetch_preserves_order_waits_and_records_consumer_stream(
         events.append(f"move:{name}:{active_stream[0]}")
         return {"tensor": FakeTensor(name)}
 
-    prefetched = batch_transfer.prefetch_batches(source(), "cuda:0", mover=move)
+    prefetched = batch_transfer.prefetch_batches(
+        source(),
+        "cuda:0",
+        mover=move,
+        observer=lambda name, value: observations.append((name, value)),
+    )
     first = next(prefetched)
     assert first["tensor"].name == "first"
     assert events == [
@@ -128,6 +135,9 @@ def test_cuda_prefetch_preserves_order_waits_and_records_consumer_stream(
     ]
     with pytest.raises(StopIteration):
         next(prefetched)
+    assert sum(name == "source_wait_seconds" for name, _ in observations) == 2
+    assert sum(name == "h2d_host_dispatch_seconds" for name, _ in observations) == 2
+    assert sum(name == "h2d_cuda_event" for name, _ in observations) == 2
 
 
 @pytest.mark.parametrize(("names", "expected"), [

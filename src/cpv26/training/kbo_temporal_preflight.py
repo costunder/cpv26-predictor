@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import random
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict
@@ -21,20 +22,28 @@ from pathlib import Path
 from typing import Any
 
 from cpv26.data.kbo_dataset_loader import KBOGraphDatasetLike, open_kbo_graph_dataset
-from cpv26.data.kbo_temporal_archive import _sample_fingerprint
 from cpv26.models._torch import require_torch
-from cpv26.models.kbo_relgnn import KBORelGNNModel, collate_kbo_day_graphs
+from cpv26.models.kbo_relgnn import KBORelGNNModel
 from cpv26.training import kbo_runner as runner
-from cpv26.training.batch_transfer import prefetch_batches
 from cpv26.training.kbo_temporal_batching import (
     TemporalSampleSize,
     load_temporal_sample_sizes,
 )
 from cpv26.training.optimizer_state import make_adamw
+from cpv26.training.resource_telemetry import (
+    allowed_cpu_ids,
+    host_resource_inventory,
+    numeric_distribution,
+    resource_snapshot,
+    resource_snapshot_with_children,
+    summarize_resource_interval,
+    tensor_shape_manifest,
+)
 
 TEMPORAL_PREFLIGHT_PROTOCOL = "temporal_v7_cuda_budget_plan"
-TEMPORAL_PREFLIGHT_PROTOCOL_VERSION = 1
+TEMPORAL_PREFLIGHT_PROTOCOL_VERSION = 2
 DEFAULT_MAX_RESERVED_FRACTION = 0.85
+DEFAULT_MAX_HOST_MEMORY_USED_FRACTION = 0.85
 TEMPORAL_VARIANTS = ("full", "node_only")
 
 
@@ -56,6 +65,29 @@ def _reserved_limit(value: float) -> float:
     if not math.isfinite(result) or not 0 < result <= 1:
         raise ValueError("max_reserved_fraction must be finite and in (0, 1]")
     return result
+
+
+def _open_preflight_dataset(
+    dataset: KBOGraphDatasetLike | str | Path,
+    config: runner.KBOTrainingConfig,
+) -> KBOGraphDatasetLike:
+    selected = (
+        dataset
+        if not isinstance(dataset, (str, Path))
+        else open_kbo_graph_dataset(
+            dataset, label_year_ceiling=config.validation_season
+        )
+    )
+    label_year_ceiling = getattr(selected, "label_year_ceiling", None)
+    if (
+        selected.manifest.get("graph_schema") == "temporal_v7"
+        and hasattr(selected, "label_year_ceiling")
+        and label_year_ceiling != config.validation_season
+    ):
+        raise ValueError(
+            "temporal preflight dataset must seal labels after the validation season"
+        )
+    return selected
 
 
 def _pack_split(
@@ -117,14 +149,12 @@ def build_temporal_execution_plan(
     *,
     max_nodes: int | None = None,
     max_edges: int | None = None,
+    loader_workers: int | None = None,
+    loader_prefetch_factor: int | None = None,
 ) -> dict[str, Any]:
     """Build an explicit, variant-shared train/validation batch plan."""
 
-    selected = (
-        dataset
-        if not isinstance(dataset, (str, Path))
-        else open_kbo_graph_dataset(dataset)
-    )
+    selected = _open_preflight_dataset(dataset, config)
     manifest = selected.manifest
     if manifest.get("dataset_version") != 7 or manifest.get("graph_schema") != "temporal_v7":
         raise ValueError("temporal execution planning requires dataset_version=7 temporal_v7")
@@ -142,6 +172,17 @@ def build_temporal_execution_plan(
     edge_budget = _positive_int(
         max_edges if max_edges is not None else batching.get("max_edges_per_batch"),
         "max_edges",
+    )
+    workers = config.workers if loader_workers is None else loader_workers
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
+        raise ValueError("loader_workers must be a non-negative integer")
+    prefetch_factor = (
+        None
+        if workers == 0
+        else _positive_int(
+            2 if loader_prefetch_factor is None else loader_prefetch_factor,
+            "loader_prefetch_factor",
+        )
     )
     dataset_fingerprint = str(manifest.get("fingerprint"))
     policy_fingerprint = str(manifest.get("sampling_policy_fingerprint"))
@@ -173,6 +214,29 @@ def build_temporal_execution_plan(
             and not row["oversize_single_day"]
             and not next_row["oversize_single_day"]
         )
+    graph_days = [len(row["dates"]) for row in batches]
+    effective: list[int] = []
+    for split in ("train", "validation"):
+        split_rows = [row for row in batches if row["split"] == split]
+        for start in range(0, len(split_rows), config.accumulate_steps):
+            effective.append(
+                sum(
+                    len(row["dates"])
+                    for row in split_rows[start : start + config.accumulate_steps]
+                )
+            )
+    physical_batching = {
+        "unit": "graph_days",
+        "physical_graph_days": numeric_distribution(graph_days),
+        "effective_graph_days_per_optimizer_step": numeric_distribution(effective),
+        "gradient_accumulation_steps": config.accumulate_steps,
+        "data_parallel_workers": 1,
+        "formula": (
+            "effective graph-days = sum(dynamic physical graph-days in accumulation "
+            "group) * data-parallel workers"
+        ),
+        "no_graph_or_event_dropped_by_batching": True,
+    }
     plan_core = {
         "dataset_fingerprint": dataset_fingerprint,
         "sampling_policy_fingerprint": policy_fingerprint,
@@ -180,6 +244,17 @@ def build_temporal_execution_plan(
         "batching_basis": "node_and_edge_totals_only",
         "fixed_day_count_cap": False,
         "prefetch_depth": 1,
+        "loader_runtime": {
+            "workers": workers,
+            "prefetch_factor": prefetch_factor,
+            "persistent_workers": workers > 0,
+            "loader_instances": 2,
+            "simultaneous_worker_pools": 2 if workers > 0 else 0,
+            "total_worker_processes": workers * 2,
+            "packed_transfers": True,
+            "pin_memory": False,
+        },
+        "physical_batching": physical_batching,
         "ordered_batches": batches,
     }
     fingerprint = _sha256_json(plan_core)
@@ -197,6 +272,409 @@ def build_temporal_execution_plan(
             "graph_days_loaded": False,
             "labels_loaded": False,
             "sealed": True,
+        },
+    }
+
+
+def _loader_calibration_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], ...]:
+    """Select a topology/time-stratified profiling window, not a training subset."""
+
+    total = len(rows)
+    if total < 1:
+        raise ValueError("loader calibration requires at least one planned batch")
+    target = min(total, max(8, math.ceil(math.sqrt(total))))
+    if target == total:
+        return tuple(rows)
+    chronological = {
+        round(index * (total - 1) / max(1, target // 2 - 1))
+        for index in range(target // 2)
+    }
+    largest = sorted(
+        range(total),
+        key=lambda index: (int(rows[index]["nodes"]) + int(rows[index]["edges"]), index),
+        reverse=True,
+    )
+    selected = set(chronological)
+    for index in largest:
+        if len(selected) >= target:
+            break
+        selected.add(index)
+    return tuple(rows[index] for index in sorted(selected))
+
+
+def _worker_candidates(allowed_cpus: int, calibration_batches: int) -> tuple[int, ...]:
+    maximum = max(1, min(allowed_cpus, calibration_batches))
+    candidates = {0, 1, maximum}
+    value = 2
+    while value < maximum:
+        candidates.add(value)
+        value *= 2
+    return tuple(sorted(candidates))
+
+
+def _loader_worker_pids(iterator: Any) -> tuple[int, ...]:
+    return tuple(
+        int(worker.pid)
+        for worker in getattr(iterator, "_workers", ())
+        if getattr(worker, "pid", None) is not None
+    )
+
+
+def _shutdown_loader_iterator(iterator: Any) -> None:
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        with suppress(Exception):
+            shutdown()
+
+
+def _host_memory_safety(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    inventory: Mapping[str, Any],
+) -> dict[str, Any]:
+    physical = inventory.get("physical_ram_bytes")
+    cgroup_limit = inventory.get("cgroup_memory_limit_bytes")
+    limits = [
+        int(value)
+        for value in (physical, cgroup_limit)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    ]
+    effective_limit = min(limits) if limits else None
+    cgroup_current = after.get("cgroup_memory_current_bytes")
+    available = after.get("available_ram_bytes")
+    cgroup_is_effective = (
+        isinstance(cgroup_limit, int)
+        and not isinstance(cgroup_limit, bool)
+        and effective_limit == cgroup_limit
+    )
+    if cgroup_is_effective:
+        if isinstance(cgroup_current, int):
+            used = cgroup_current
+            source = "cgroup_current_over_effective_limit"
+        else:
+            # MemAvailable is host-wide and cannot prove safety inside a tighter
+            # cgroup.  Fail closed when the authoritative current usage is absent.
+            used = None
+            source = "cgroup_current_unavailable"
+    elif isinstance(effective_limit, int) and isinstance(available, int):
+        used = max(0, effective_limit - min(effective_limit, available))
+        source = "system_memavailable_over_effective_limit"
+    else:
+        used = None
+        source = "unavailable"
+    fraction = (
+        float(used) / float(effective_limit)
+        if isinstance(used, int) and isinstance(effective_limit, int)
+        else None
+    )
+    safe = fraction is not None and fraction <= DEFAULT_MAX_HOST_MEMORY_USED_FRACTION
+    return {
+        "status": "passed" if safe else "rejected",
+        "safe_for_selection": safe,
+        "measurement_source": source,
+        "max_used_fraction": DEFAULT_MAX_HOST_MEMORY_USED_FRACTION,
+        "effective_limit_bytes": effective_limit,
+        "used_bytes_after_simultaneous_residency": used,
+        "used_fraction_after_simultaneous_residency": fraction,
+        "available_ram_bytes_before": before.get("available_ram_bytes"),
+        "available_ram_bytes_after": available,
+        "main_process_current_rss_bytes_before": before.get(
+            "process_current_rss_bytes"
+        ),
+        "main_process_current_rss_bytes": after.get("process_current_rss_bytes"),
+        "loader_child_process_count": after.get("child_process_count"),
+        "loader_child_rss_bytes": after.get("child_process_rss_bytes"),
+        "loader_child_rss_by_pid": after.get("child_process_rss_by_pid"),
+    }
+
+
+def _measure_loader_candidate(
+    dataset: KBOGraphDatasetLike,
+    config: runner.KBOTrainingConfig,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    workers: int,
+    prefetch_factor: int | None,
+) -> dict[str, Any]:
+    torch, _ = require_torch()
+    cpu = torch.device("cpu")
+    before = resource_snapshot(torch, cpu)
+    inventory = host_resource_inventory(torch, cpu, dataset_directory=dataset.directory)
+    loaders: list[Any] = []
+    iterators: list[Any] = []
+    waits: list[float] = []
+    steady_indices: list[int] = []
+    first_shapes: dict[str, Any] | None = None
+    measured_graph_days = measured_nodes = measured_edges = 0
+    try:
+        split_rows = {
+            split: tuple(row for row in rows if row["split"] == split)
+            for split in ("train", "validation")
+        }
+        if any(not selected_rows for selected_rows in split_rows.values()):
+            raise RuntimeError(
+                "loader autotune calibration must include train and validation batches"
+            )
+        for split, selected_rows in split_rows.items():
+            days = [
+                date.fromisoformat(str(value))
+                for row in selected_rows
+                for value in row["dates"]
+            ]
+            loader = runner._loader(
+                dataset.directory,
+                days,
+                config,
+                epoch=0,
+                training=split == "train",
+                planned_rows=selected_rows,
+                workers_override=workers,
+                prefetch_factor_override=prefetch_factor,
+                persistent_workers_override=workers > 0,
+            )
+            loaders.append(loader)
+            iterators.append(iter(loader))
+
+        flat_index = 0
+        for selected_rows, iterator in zip(split_rows.values(), iterators, strict=True):
+            for split_index, row in enumerate(selected_rows):
+                started = time.perf_counter()
+                batch = next(iterator)
+                waits.append(time.perf_counter() - started)
+                observed_nodes, observed_edges = _observed_batch_counts(batch)
+                if (observed_nodes, observed_edges) != (
+                    int(row["nodes"]),
+                    int(row["edges"]),
+                ):
+                    raise RuntimeError(
+                        "loader autotune batch differs from its execution plan"
+                    )
+                if first_shapes is None:
+                    first_shapes = tensor_shape_manifest(batch, torch)
+                if split_index > 0:
+                    steady_indices.append(flat_index)
+                    measured_graph_days += len(row["dates"])
+                    measured_nodes += observed_nodes
+                    measured_edges += observed_edges
+                flat_index += 1
+                del batch
+            try:
+                next(iterator)
+            except StopIteration:
+                pass
+            else:
+                raise RuntimeError("loader autotune produced more batches than planned")
+        if not steady_indices:
+            steady_indices = list(range(len(waits)))
+            measured_graph_days = sum(len(row["dates"]) for row in rows)
+            measured_nodes = sum(int(row["nodes"]) for row in rows)
+            measured_edges = sum(int(row["edges"]) for row in rows)
+        worker_pids = tuple(
+            pid for iterator in iterators for pid in _loader_worker_pids(iterator)
+        )
+        after = resource_snapshot_with_children(
+            torch, cpu, child_pids=worker_pids
+        )
+        memory_safety = _host_memory_safety(before, after, inventory)
+        steady_wait = sum(waits[index] for index in steady_indices)
+        if steady_wait <= 0:
+            raise RuntimeError("loader autotune observed a non-positive measured duration")
+        return {
+            "status": "measured",
+            "eligible_for_selection": memory_safety["safe_for_selection"],
+            "host_memory_safe": memory_safety["safe_for_selection"],
+            "host_memory_safety": memory_safety,
+            "workers": workers,
+            "prefetch_factor": prefetch_factor,
+            "persistent_workers_during_measurement": workers > 0,
+            "production_persistent_workers": workers > 0,
+            "loader_instances": 2,
+            "simultaneous_worker_pools": 2 if workers > 0 else 0,
+            "expected_worker_processes": workers * 2,
+            "observed_worker_processes": len(worker_pids),
+            "calibration_batch_count": len(rows),
+            "startup_first_batch_seconds": waits[0],
+            "startup_batch_seconds_by_split": [
+                waits[0], waits[len(split_rows["train"])]
+            ],
+            "steady_state_wait_seconds": steady_wait,
+            "steady_state_graph_days": measured_graph_days,
+            "steady_state_nodes": measured_nodes,
+            "steady_state_edges": measured_edges,
+            "graph_days_per_second": measured_graph_days / steady_wait,
+            "nodes_per_second": measured_nodes / steady_wait,
+            "edges_per_second": measured_edges / steady_wait,
+            "input_tensor_shapes": first_shapes,
+            "resources": summarize_resource_interval(
+                before,
+                after,
+                allowed_cpu_count=len(allowed_cpu_ids()),
+            ),
+        }
+    finally:
+        for iterator in iterators:
+            _shutdown_loader_iterator(iterator)
+        iterators.clear()
+        loaders.clear()
+        gc.collect()
+
+
+def autotune_temporal_loader(
+    dataset: KBOGraphDatasetLike,
+    config: runner.KBOTrainingConfig,
+    plan: Mapping[str, Any],
+    *,
+    progress: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    """Measure worker/prefetch candidates and select actual loader throughput."""
+
+    rows = plan.get("ordered_batches")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("loader autotune requires a non-empty execution plan")
+    calibration = _loader_calibration_rows(rows)
+    cpu_count = len(allowed_cpu_ids())
+    settings = [
+        (workers, prefetch)
+        for workers in _worker_candidates(cpu_count, len(calibration))
+        for prefetch in ((None,) if workers == 0 else (1, 2, 4))
+    ]
+    measurements: list[dict[str, Any]] = []
+    per_worker_rss_estimates: list[float] = []
+    non_loader_used_bytes: int | None = None
+    effective_memory_limit: int | None = None
+    for workers, prefetch in settings:
+        projected_fraction = None
+        if (
+            workers > 0
+            and per_worker_rss_estimates
+            and non_loader_used_bytes is not None
+            and effective_memory_limit is not None
+        ):
+            projected_used = non_loader_used_bytes + math.ceil(
+                max(per_worker_rss_estimates) * workers * 2
+            )
+            projected_fraction = projected_used / effective_memory_limit
+        if (
+            projected_fraction is not None
+            and projected_fraction > DEFAULT_MAX_HOST_MEMORY_USED_FRACTION
+        ):
+            result = {
+                "status": "skipped_projected_host_memory",
+                "workers": workers,
+                "prefetch_factor": prefetch,
+                "eligible_for_selection": False,
+                "host_memory_safe": False,
+                "projected_used_fraction": projected_fraction,
+                "max_used_fraction": DEFAULT_MAX_HOST_MEMORY_USED_FRACTION,
+                "projection_basis": (
+                    "largest measured per-worker RSS times both production loader pools"
+                ),
+            }
+        else:
+            try:
+                result = _measure_loader_candidate(
+                    dataset,
+                    config,
+                    calibration,
+                    workers=workers,
+                    prefetch_factor=prefetch,
+                )
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "workers": workers,
+                    "prefetch_factor": prefetch,
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
+        memory = result.get("host_memory_safety")
+        if isinstance(memory, Mapping):
+            limit = memory.get("effective_limit_bytes")
+            used = memory.get("used_bytes_after_simultaneous_residency")
+            child_rss = memory.get("loader_child_rss_bytes")
+            main_before = memory.get("main_process_current_rss_bytes_before")
+            main_after = memory.get("main_process_current_rss_bytes")
+            if isinstance(limit, int) and limit > 0:
+                effective_memory_limit = limit
+            if workers > 0 and isinstance(child_rss, int) and child_rss > 0:
+                per_worker_rss_estimates.append(child_rss / (workers * 2))
+                if isinstance(used, int):
+                    non_loader_used_bytes = max(0, used - child_rss)
+            elif (
+                workers == 0
+                and isinstance(main_before, int)
+                and isinstance(main_after, int)
+                and main_after > main_before
+            ):
+                loader_rss = main_after - main_before
+                per_worker_rss_estimates.append(loader_rss / 2)
+                if isinstance(used, int):
+                    non_loader_used_bytes = max(0, used - loader_rss)
+        measurements.append(result)
+        throughput = result.get("graph_days_per_second")
+        progress(
+            "loader autotune "
+            f"workers={workers}, prefetch={prefetch}: "
+            f"{throughput:.2f} graph-days/s"
+            if isinstance(throughput, (int, float))
+            else f"loader autotune workers={workers}, prefetch={prefetch}: failed"
+        )
+    passed = [
+        row
+        for row in measurements
+        if row["status"] == "measured" and row.get("host_memory_safe") is not False
+    ]
+    if not passed:
+        raise RuntimeError(
+            "every measured DataLoader candidate failed or exceeded host-memory safety"
+        )
+    selected = max(
+        passed,
+        key=lambda row: (
+            float(row["graph_days_per_second"]),
+            -int(row["workers"]),
+            -int(row["prefetch_factor"] or 0),
+        ),
+    )
+    torch, _ = require_torch()
+    device, _, _ = runner._device_and_precision(config.device, config.amp)
+    return {
+        "status": "measured",
+        "selection_metric": "maximum steady-state graph-days per second",
+        "host_memory_gate": {
+            "required": True,
+            "max_used_fraction": DEFAULT_MAX_HOST_MEMORY_USED_FRACTION,
+            "selected_status": selected.get("host_memory_safety", {}).get("status"),
+        },
+        "selection_changes_transport_only": True,
+        "training_plan_coverage_unchanged": True,
+        "held_out_test_loaded": False,
+        "calibration_policy": (
+            "sqrt(batch_count), minimum eight where available; half time-stratified "
+            "and remainder largest topology; first batch excluded as worker startup"
+        ),
+        "calibration_batch_count": len(calibration),
+        "total_planned_batch_count": len(rows),
+        "calibration_plan_indices": [rows.index(row) for row in calibration],
+        "host_resources": host_resource_inventory(
+            torch, device, dataset_directory=dataset.directory
+        ),
+        "candidates": measurements,
+        "selected": {
+            "workers": int(selected["workers"]),
+            "prefetch_factor": selected["prefetch_factor"],
+            "persistent_workers": int(selected["workers"]) > 0,
+            "loader_instances": 2,
+            "simultaneous_worker_pools": (
+                2 if int(selected["workers"]) > 0 else 0
+            ),
+            "total_worker_processes": int(selected["workers"]) * 2,
+            "packed_transfers": True,
+            "pin_memory": False,
+            "graph_days_per_second": selected["graph_days_per_second"],
+            "host_memory_safe": selected.get("host_memory_safe", True),
+            "host_memory_safety": selected.get("host_memory_safety"),
         },
     }
 
@@ -234,6 +712,8 @@ def validate_temporal_execution_plan(
             "batching_basis",
             "fixed_day_count_cap",
             "prefetch_depth",
+            "loader_runtime",
+            "physical_batching",
             "ordered_batches",
         )
     }
@@ -248,47 +728,51 @@ def validate_temporal_execution_plan(
     )
 
 
-def _cpu_batches(
-    dataset: KBOGraphDatasetLike,
-    rows: Sequence[Mapping[str, Any]],
-    config: runner.KBOTrainingConfig,
-) -> Iterator[Mapping[str, Any]]:
-    for row in rows:
-        days = [dataset.load_day(value) for value in row["dates"]]
-        observed_fingerprints = [_sample_fingerprint(graph) for graph in days]
-        if observed_fingerprints != list(row["sample_fingerprints"]):
-            raise RuntimeError(
-                "materialized temporal sample differs from its validation-bounded index"
-            )
-        batch = collate_kbo_day_graphs(
-            days,
-            device="cpu",
-            max_pa_per_day=None,
-            max_edges_per_route_per_day=None,
-            seed=config.seed,
-        )
-        yield runner._prepare_graph_batch(batch, config)
-
-
 def _planned_device_batches(
     dataset: KBOGraphDatasetLike,
     plan: Mapping[str, Any],
     config: runner.KBOTrainingConfig,
     device: Any,
+    *,
+    observer: Callable[[str, Any], None] | None = None,
 ) -> Iterator[Mapping[str, Any]]:
-    """Honor prefetch barriers at split boundaries and oversize singletons."""
+    """Use the two simultaneously resident production loader pools."""
 
     rows = plan["ordered_batches"]
-    start = 0
-    while start < len(rows):
-        end = start
-        while end + 1 < len(rows) and rows[end]["prefetch_next"]:
-            end += 1
-        segment = rows[start : end + 1]
-        yield from prefetch_batches(
-            _cpu_batches(dataset, segment, config), device, mover=runner._move
-        )
-        start = end + 1
+    loader_runtime = plan["loader_runtime"]
+    loaders: list[Any] = []
+    iterators: list[Any] = []
+    try:
+        for split in ("train", "validation"):
+            selected_rows = tuple(row for row in rows if row["split"] == split)
+            days = [
+                date.fromisoformat(str(value))
+                for row in selected_rows
+                for value in row["dates"]
+            ]
+            loader = runner._loader(
+                dataset.directory,
+                days,
+                config,
+                epoch=0,
+                training=split == "train",
+                planned_rows=selected_rows,
+                workers_override=int(loader_runtime["workers"]),
+                prefetch_factor_override=loader_runtime["prefetch_factor"],
+                persistent_workers_override=bool(loader_runtime["persistent_workers"]),
+            )
+            loaders.append(loader)
+            iterators.append(iter(loader))
+        for split, iterator in zip(("train", "validation"), iterators, strict=True):
+            selected_rows = tuple(row for row in rows if row["split"] == split)
+            yield from runner._planned_device_batches(
+                iterator, selected_rows, device, observer=observer
+            )
+    finally:
+        for iterator in iterators:
+            _shutdown_loader_iterator(iterator)
+        iterators.clear()
+        loaders.clear()
 
 
 def _observed_batch_counts(batch: Mapping[str, Any]) -> tuple[int, int]:
@@ -331,6 +815,7 @@ def run_temporal_cuda_preflight(
     max_nodes: int | None = None,
     max_edges: int | None = None,
     max_reserved_fraction: float = DEFAULT_MAX_RESERVED_FRACTION,
+    loader_autotune: Mapping[str, Any] | None = None,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Measure every planned batch with full RelGNN and production prefetch."""
@@ -340,14 +825,35 @@ def run_temporal_cuda_preflight(
         raise ValueError(
             "temporal production preflight cannot exceed the 85% CUDA reservation limit"
         )
-    selected = (
-        dataset
-        if not isinstance(dataset, (str, Path))
-        else open_kbo_graph_dataset(dataset)
-    )
-    plan = build_temporal_execution_plan(
+    selected = _open_preflight_dataset(dataset, config)
+    base_plan = build_temporal_execution_plan(
         selected, config, max_nodes=max_nodes, max_edges=max_edges
     )
+    tuning = (
+        autotune_temporal_loader(selected, config, base_plan, progress=progress)
+        if loader_autotune is None
+        else dict(loader_autotune)
+    )
+    selected_loader = tuning.get("selected")
+    if (
+        tuning.get("status") != "measured"
+        or not isinstance(selected_loader, Mapping)
+        or isinstance(selected_loader.get("workers"), bool)
+        or not isinstance(selected_loader.get("workers"), int)
+        or selected_loader.get("host_memory_safe") is not True
+    ):
+        raise ValueError(
+            "temporal preflight requires a measured host-memory-safe loader autotune result"
+        )
+    plan = build_temporal_execution_plan(
+        selected,
+        config,
+        max_nodes=max_nodes,
+        max_edges=max_edges,
+        loader_workers=int(selected_loader["workers"]),
+        loader_prefetch_factor=selected_loader.get("prefetch_factor"),
+    )
+    dataset_label_year_ceiling = getattr(selected, "label_year_ceiling", None)
     report: dict[str, Any] = {
         "protocol": TEMPORAL_PREFLIGHT_PROTOCOL,
         "protocol_version": TEMPORAL_PREFLIGHT_PROTOCOL_VERSION,
@@ -357,6 +863,18 @@ def run_temporal_cuda_preflight(
         "max_reserved_fraction": limit,
         "configuration": asdict(config),
         "execution_plan": plan,
+        "loader_autotune": tuning,
+        "held_out_test_access": {
+            "season": config.test_season,
+            "label_year_ceiling": dataset_label_year_ceiling,
+            "runtime_ceiling_verified": (
+                dataset_label_year_ceiling == config.validation_season
+                if hasattr(selected, "label_year_ceiling")
+                else None
+            ),
+            "graph_samples_loaded": False,
+            "labels_loaded": False,
+        },
         "measurements": [],
         "measurement_policy": {
             "variant": "full",
@@ -377,6 +895,21 @@ def run_temporal_cuda_preflight(
     batch: Any = None
     losses: Any = None
     norms: Any = None
+    resource_start: Mapping[str, Any] | None = None
+    first_input_shapes: dict[str, Any] | None = None
+    transfer_host_seconds = {
+        "source_wait_seconds": 0.0,
+        "h2d_host_dispatch_seconds": 0.0,
+    }
+    transfer_cuda_events: list[tuple[Any, Any]] = []
+
+    def observe_transfer(name: str, value: Any) -> None:
+        if name in transfer_host_seconds:
+            transfer_host_seconds[name] += float(value)
+        elif name == "h2d_cuda_event":
+            start_event, end_event = value
+            transfer_cuda_events.append((start_event, end_event))
+
     try:
         device, dtype, runtime = runner._device_and_precision(config.device, config.amp)
         if device.type != "cuda":
@@ -388,9 +921,18 @@ def run_temporal_cuda_preflight(
         torch.cuda.manual_seed_all(config.seed)
         gc.collect()
         torch.cuda.empty_cache()
-        model = KBORelGNNModel(runner._model_config(selected, config))
+        model_config = runner._model_config(selected, config)
+        model = KBORelGNNModel(model_config)
         model.to(device)
         model.train()
+        report["model_execution"] = {
+            "configuration": model_config.to_dict(),
+            "architecture_contract": model.architecture_contract(),
+            "route_edge_chunk_size_configured": config.route_edge_chunk_size,
+            "route_edge_chunking_is_lossless": True,
+            "nodes_edges_events_dropped": 0,
+        }
+        runner._atomic_json(destination, report)
         optimizer = make_adamw(
             model,
             learning_rate=config.learning_rate,
@@ -400,11 +942,19 @@ def run_temporal_cuda_preflight(
             "cuda", enabled=device.type == "cuda" and dtype == torch.float16
         )
         optimizer.zero_grad(set_to_none=True)
+        resource_start = resource_snapshot(torch, device)
         device_batches = iter(
-            _planned_device_batches(selected, plan, config, device)
+            _planned_device_batches(
+                selected,
+                plan,
+                config,
+                device,
+                observer=observe_transfer,
+            )
         )
         total_batches = int(plan["actual_batch_count"])
         for index, batch_spec in enumerate(plan["ordered_batches"]):
+            batch_wall_started = time.perf_counter()
             torch.cuda.reset_peak_memory_stats(device)
             prefetch_window = [batch_spec]
             if batch_spec["prefetch_next"]:
@@ -436,13 +986,26 @@ def run_temporal_cuda_preflight(
                     int(batch_spec["edges"]),
                 ):
                     raise RuntimeError("collated temporal batch differs from its indexed plan")
+                if first_input_shapes is None:
+                    first_input_shapes = tensor_shape_manifest(batch, torch)
+                stage_events: dict[str, tuple[Any, Any]] = {}
+                forward_start = torch.cuda.Event(enable_timing=True)
+                forward_end = torch.cuda.Event(enable_timing=True)
+                forward_start.record()
                 failure_stage = "forward"
                 with torch.autocast(device.type, enabled=dtype is not None, dtype=dtype):
                     losses = runner._losses(model(batch), batch, config)
+                forward_end.record()
+                stage_events["forward_and_loss"] = (forward_start, forward_end)
                 if not bool(torch.isfinite(losses["loss"])):
                     raise FloatingPointError("temporal preflight produced a non-finite loss")
                 failure_stage = "backward"
+                backward_start = torch.cuda.Event(enable_timing=True)
+                backward_end = torch.cuda.Event(enable_timing=True)
+                backward_start.record()
                 scaler.scale(losses["loss"]).backward()
+                backward_end.record()
+                stage_events["backward"] = (backward_start, backward_end)
                 scaler.unscale_(optimizer)
                 norms = runner._clip_gradient_norms(model, config.gradient_clip)
                 if not all(
@@ -450,10 +1013,15 @@ def run_temporal_cuda_preflight(
                 ):
                     raise FloatingPointError("temporal preflight produced non-finite gradients")
                 failure_stage = "optimizer_step"
+                optimizer_start = torch.cuda.Event(enable_timing=True)
+                optimizer_end = torch.cuda.Event(enable_timing=True)
+                optimizer_start.record()
                 previous_scale = float(scaler.get_scale())
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_end.record()
+                stage_events["optimizer_step"] = (optimizer_start, optimizer_end)
                 if scaler.is_enabled() and float(scaler.get_scale()) < previous_scale:
                     raise FloatingPointError("temporal preflight skipped an FP16 optimizer step")
                 failure_stage = "cuda_synchronize_and_measure"
@@ -462,6 +1030,10 @@ def run_temporal_cuda_preflight(
                 peak_reserved = int(torch.cuda.max_memory_reserved(device))
                 _, total_memory = torch.cuda.mem_get_info(device)
                 fraction = peak_reserved / int(total_memory)
+                stage_seconds = {
+                    name: float(start.elapsed_time(end)) / 1000.0
+                    for name, (start, end) in stage_events.items()
+                }
             except Exception as exc:
                 if _is_cuda_oom(exc):
                     window = _failure_window(prefetch_window, start_index=index)
@@ -488,6 +1060,15 @@ def run_temporal_cuda_preflight(
                 "peak_reserved_bytes": peak_reserved,
                 "total_memory_bytes": int(total_memory),
                 "peak_reserved_fraction": fraction,
+                "steady_allocated_bytes": int(torch.cuda.memory_allocated(device)),
+                "steady_reserved_bytes": int(torch.cuda.memory_reserved(device)),
+                "stage_seconds": stage_seconds,
+                "collate_seconds": float(
+                    batch.get("_runtime_telemetry", {}).get("collate_seconds", 0.0)
+                ),
+                "end_to_end_batch_wall_seconds": (
+                    time.perf_counter() - batch_wall_started
+                ),
                 "prefetch_depth": 1,
                 "prefetched_next_batch": (
                     {
@@ -538,6 +1119,65 @@ def run_temporal_cuda_preflight(
         else:
             raise RuntimeError("temporal preflight produced more batches than its plan")
         peak = max(row["peak_reserved_fraction"] for row in report["measurements"])
+        resource_end = resource_snapshot(torch, device)
+        interval = summarize_resource_interval(
+            resource_start,
+            resource_end,
+            allowed_cpu_count=len(allowed_cpu_ids()),
+        )
+        elapsed = float(interval["wall_seconds"])
+        graph_days = sum(len(row["dates"]) for row in plan["ordered_batches"])
+        total_nodes = sum(int(row["nodes"]) for row in plan["ordered_batches"])
+        total_edges = sum(int(row["edges"]) for row in plan["ordered_batches"])
+        h2d_seconds = sum(
+            float(start.elapsed_time(end)) / 1000.0
+            for start, end in transfer_cuda_events
+        )
+        report["resource_measurements"] = {
+            "host_inventory": host_resource_inventory(
+                torch, device, dataset_directory=selected.directory
+            ),
+            "interval": interval,
+            "input_tensor_shapes_first_actual_batch": first_input_shapes,
+            "stage_seconds": {
+                **transfer_host_seconds,
+                "h2d_cuda_seconds": h2d_seconds,
+                **{
+                    name: sum(
+                        float(row["stage_seconds"][name])
+                        for row in report["measurements"]
+                    )
+                    for name in ("forward_and_loss", "backward", "optimizer_step")
+                },
+                "collate_worker_seconds": sum(
+                    float(row["collate_seconds"]) for row in report["measurements"]
+                ),
+            },
+            "end_to_end_batch_wall_seconds": numeric_distribution(
+                [
+                    row["end_to_end_batch_wall_seconds"]
+                    for row in report["measurements"]
+                ]
+            ),
+            "throughput": {
+                "graph_days_per_second": graph_days / elapsed if elapsed else None,
+                "nodes_per_second": total_nodes / elapsed if elapsed else None,
+                "edges_per_second": total_edges / elapsed if elapsed else None,
+            },
+            "steady_cuda_allocated_bytes": numeric_distribution(
+                [row["steady_allocated_bytes"] for row in report["measurements"]]
+            ),
+            "steady_cuda_reserved_bytes": numeric_distribution(
+                [row["steady_reserved_bytes"] for row in report["measurements"]]
+            ),
+            "peak_cuda_allocated_bytes": max(
+                row["peak_allocated_bytes"] for row in report["measurements"]
+            ),
+            "peak_cuda_reserved_bytes": max(
+                row["peak_reserved_bytes"] for row in report["measurements"]
+            ),
+            "physical_batching": plan["physical_batching"],
+        }
         report.update(
             status="passed",
             selected_for_training=True,
@@ -651,11 +1291,7 @@ def run_adaptive_temporal_cuda_preflight(
         raise ValueError(
             "temporal production preflight cannot exceed the 85% CUDA reservation limit"
         )
-    selected = (
-        dataset
-        if not isinstance(dataset, (str, Path))
-        else open_kbo_graph_dataset(dataset)
-    )
+    selected = _open_preflight_dataset(dataset, config)
     initial = build_temporal_execution_plan(
         selected, config, max_nodes=max_nodes, max_edges=max_edges
     )

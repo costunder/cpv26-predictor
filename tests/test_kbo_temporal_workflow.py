@@ -40,10 +40,8 @@ def _archive(tmp_path: Path) -> tuple[Path, dict[str, Any], list[dict[str, Any]]
         "graph_schema": "temporal_v7",
         "fingerprint": "a" * 64,
         "sampling_policy": {
-            "lookback_days": 365,
-            "max_games_per_seed_team": 160,
-            "max_games_per_player": 48,
-            "max_historical_games_total": 160,
+            "history_scope": "all_prior_records",
+            "recency_reference_days": 365,
         },
         "sampling_policy_fingerprint": "b" * 64,
         "node_feature_dims": {"player": 4, "team": 8, "game": 4},
@@ -119,6 +117,54 @@ def _child_report(
             "runtime": runtime,
             "peak_cuda_allocated_bytes": 4 * 2**30,
             "peak_cuda_reserved_bytes": 6 * 2**30,
+            "all_epochs_trainable_parameters_received_gradient": True,
+            "resource_inventory": {
+                "logical_cpu_count": 16,
+                "allowed_cpu_count": 8,
+                "allowed_cpu_ids": list(range(8)),
+                "physical_ram_bytes": 64 * 2**30,
+                "available_ram_bytes_at_start": 48 * 2**30,
+                "cgroup_memory_limit_bytes": 64 * 2**30,
+                "visible_gpu_count": 1,
+                "selected_gpu_name": "test GPU",
+                "mig_partition_visible": True,
+            },
+            "loader_selection": {
+                "source": "measured_temporal_cuda_preflight",
+                "workers": 4,
+                "prefetch_factor": 2,
+                "persistent_workers": True,
+                "loader_instances": 2,
+                "simultaneous_worker_pools": 2,
+                "total_worker_processes": 8,
+                "autotune": {"status": "measured"},
+            },
+            "physical_execution": {
+                "route_edge_chunking_is_lossless": True,
+                "nodes_edges_events_dropped": 0,
+            },
+            "resource_measurements": {
+                "preflight": {"peak_cuda_reserved_bytes": 6 * 2**30},
+                "epochs": [
+                    {
+                        "epoch": 1,
+                        "input_tensor_shapes_first_batch": {"x": {"shape": [3, 4]}},
+                        "physical_batch_size_graph_days": {"count": 2},
+                        "effective_batch_size_graph_days": {"count": 2},
+                        "gradient_accumulation_steps": 1,
+                        "data_parallel_workers": 1,
+                        "stage_host_seconds": {},
+                        "stage_cuda_device_seconds": {},
+                        "step_timing": {},
+                        "resources": {},
+                        "steady_cuda_allocated_bytes": {"count": 2},
+                        "steady_cuda_reserved_bytes": {"count": 2},
+                        "peak_cuda_allocated_bytes": 4 * 2**30,
+                        "peak_cuda_reserved_bytes": 6 * 2**30,
+                        "throughput": {"graph_days_per_second": 2.0},
+                    }
+                ],
+            },
         }
         _write_json(run_directory / "training_report.json", training)
         runs[variant] = {
@@ -175,12 +221,23 @@ def _patch_preflight(
             "plan_fingerprint": "e" * 64,
             "budgets": {"max_nodes": 100_000, "max_edges": 200_000},
             "actual_batch_count": 25,
+            "loader_runtime": {
+                "workers": 4,
+                "prefetch_factor": 2,
+                "persistent_workers": True,
+            },
+            "physical_batching": {"unit": "graph_days"},
+        }
+        selected_attempt = {
+            "loader_autotune": {"status": "measured"},
+            "resource_measurements": {"peak_cuda_reserved_bytes": 6 * 2**30},
         }
         report = {
             "status": "passed",
             "selected_for_training": True,
             "max_reserved_fraction": 0.85,
             "selected_attempt": 1,
+            "attempts": [selected_attempt],
             "execution_plan": selected_plan,
             "peak_reserved_fraction": 0.72,
             "all_actual_batches_measured": True,
@@ -233,8 +290,13 @@ def test_workflow_validates_all_topologies_and_runs_one_matched_pair(
     dataset = _Dataset(directory, manifest)
     plan = workflow.KBOTemporalWorkflowPlan(directory, tmp_path / "workflow")
     calls: list[dict[str, Any]] = []
+    open_calls: list[dict[str, Any]] = []
 
-    monkeypatch.setattr(workflow, "open_kbo_graph_dataset", lambda _: dataset)
+    def open_dataset(_directory: Any, **kwargs: Any) -> _Dataset:
+        open_calls.append(kwargs)
+        return dataset
+
+    monkeypatch.setattr(workflow, "open_kbo_graph_dataset", open_dataset)
     _patch_preflight(monkeypatch, plan)
 
     def train(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -252,6 +314,7 @@ def test_workflow_validates_all_topologies_and_runs_one_matched_pair(
     report = workflow.run_kbo_temporal_workflow(plan, progress=lambda _: None)
 
     assert report["status"] == "completed"
+    assert open_calls == [{"label_year_ceiling": plan.config.validation_season}]
     assert len(calls) == 1
     assert calls[0]["kwargs"]["config"] == plan.config
     assert calls[0]["kwargs"]["temporal_preflight_report"] == plan.preflight_report_path
@@ -281,7 +344,9 @@ def test_workflow_rejects_missing_or_held_out_topology_before_training(
 ) -> None:
     directory, manifest, _ = _archive(tmp_path)
     dataset = _Dataset(directory, manifest)
-    monkeypatch.setattr(workflow, "open_kbo_graph_dataset", lambda _: dataset)
+    monkeypatch.setattr(
+        workflow, "open_kbo_graph_dataset", lambda _, **_kwargs: dataset
+    )
     monkeypatch.setattr(
         capacity,
         "train_kbo_full_node_comparison",
@@ -299,7 +364,9 @@ def test_workflow_rejects_missing_or_held_out_topology_before_training(
 
     directory, manifest, _ = _archive(tmp_path / "second")
     dataset = _Dataset(directory, manifest)
-    monkeypatch.setattr(workflow, "open_kbo_graph_dataset", lambda _: dataset)
+    monkeypatch.setattr(
+        workflow, "open_kbo_graph_dataset", lambda _, **_kwargs: dataset
+    )
     index_path = directory / "sample_index.json"
     sample_index = json.loads(index_path.read_text(encoding="utf-8"))
     test_entry = {
@@ -323,7 +390,9 @@ def test_workflow_marks_report_failed_when_child_exposes_test_labels(
     dataset = _Dataset(directory, manifest)
     plan = workflow.KBOTemporalWorkflowPlan(directory, tmp_path / "workflow")
     _patch_preflight(monkeypatch, plan)
-    monkeypatch.setattr(workflow, "open_kbo_graph_dataset", lambda _: dataset)
+    monkeypatch.setattr(
+        workflow, "open_kbo_graph_dataset", lambda _, **_kwargs: dataset
+    )
     monkeypatch.setattr(
         capacity,
         "train_kbo_full_node_comparison",
@@ -347,7 +416,9 @@ def test_workflow_resume_binds_requested_memory_limit_into_plan(
     directory, manifest, _ = _archive(tmp_path)
     dataset = _Dataset(directory, manifest)
     plan = workflow.KBOTemporalWorkflowPlan(directory, tmp_path / "workflow")
-    monkeypatch.setattr(workflow, "open_kbo_graph_dataset", lambda _: dataset)
+    monkeypatch.setattr(
+        workflow, "open_kbo_graph_dataset", lambda _, **_kwargs: dataset
+    )
     _patch_preflight(monkeypatch, plan)
     monkeypatch.setattr(
         capacity,
@@ -371,7 +442,9 @@ def test_workflow_rejects_reused_preflight_with_a_different_limit(
     directory, manifest, _ = _archive(tmp_path)
     dataset = _Dataset(directory, manifest)
     plan = workflow.KBOTemporalWorkflowPlan(directory, tmp_path / "workflow")
-    monkeypatch.setattr(workflow, "open_kbo_graph_dataset", lambda _: dataset)
+    monkeypatch.setattr(
+        workflow, "open_kbo_graph_dataset", lambda _, **_kwargs: dataset
+    )
     _patch_preflight(monkeypatch, plan)
     monkeypatch.setattr(
         capacity,

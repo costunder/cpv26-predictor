@@ -15,7 +15,10 @@ from cpv26.data.kbo_graph_dataset import GraphDay
 from cpv26.data.kbo_temporal_archive import _sample_fingerprint
 from cpv26.training import kbo_runner
 from cpv26.training.kbo_runner import KBOTrainingConfig
-from cpv26.training.kbo_temporal_preflight import build_temporal_execution_plan
+from cpv26.training.kbo_temporal_preflight import (
+    TEMPORAL_PREFLIGHT_PROTOCOL_VERSION,
+    build_temporal_execution_plan,
+)
 
 
 class _Dataset:
@@ -135,9 +138,30 @@ def _write_passed_report(path: Path, dataset: _Dataset, config: KBOTrainingConfi
             }
         )
     peak = max(row["peak_reserved_fraction"] for row in measurements)
+    loader_autotune = {
+        "status": "measured",
+        "selected": {
+            **plan["loader_runtime"],
+            "graph_days_per_second": 10.0,
+            "host_memory_safe": True,
+            "host_memory_safety": {"status": "passed"},
+        },
+    }
+    resources = {
+        "host_inventory": {},
+        "interval": {},
+        "input_tensor_shapes_first_actual_batch": {},
+        "stage_seconds": {},
+        "throughput": {},
+        "steady_cuda_allocated_bytes": {},
+        "steady_cuda_reserved_bytes": {},
+        "peak_cuda_allocated_bytes": 2 * 2**30,
+        "peak_cuda_reserved_bytes": 3 * 2**30,
+        "physical_batching": plan["physical_batching"],
+    }
     candidate = {
         "protocol": "temporal_v7_cuda_budget_plan",
-        "protocol_version": 1,
+        "protocol_version": TEMPORAL_PREFLIGHT_PROTOCOL_VERSION,
         "status": "passed",
         "selected_for_training": True,
         "max_reserved_fraction": 0.85,
@@ -148,12 +172,14 @@ def _write_passed_report(path: Path, dataset: _Dataset, config: KBOTrainingConfi
         "peak_reserved_fraction": peak,
         "measurements": measurements,
         "execution_plan": plan,
+        "loader_autotune": loader_autotune,
+        "resource_measurements": resources,
     }
     kbo_runner._atomic_json(
         path,
         {
             "protocol": "temporal_v7_cuda_budget_plan_adaptive",
-            "protocol_version": 1,
+            "protocol_version": TEMPORAL_PREFLIGHT_PROTOCOL_VERSION,
             "status": "passed",
             "selected_for_training": True,
             "max_reserved_fraction": 0.85,
@@ -223,6 +249,8 @@ def test_selected_plan_must_equal_the_measured_attempt(tmp_path: Path) -> None:
             "batching_basis",
             "fixed_day_count_cap",
             "prefetch_depth",
+            "loader_runtime",
+            "physical_batching",
             "ordered_batches",
         )
     }
@@ -357,14 +385,22 @@ def test_day_dataset_verifies_each_materialized_sample_before_collate(
         def load_day(_day: date | str) -> GraphDay:
             return graph
 
-    monkeypatch.setattr(kbo_runner, "open_kbo_graph_dataset", lambda _path: _Loaded())
+    open_calls: list[dict[str, Any]] = []
+
+    def open_dataset(_path: Any, **kwargs: Any) -> _Loaded:
+        open_calls.append(kwargs)
+        return _Loaded()
+
+    monkeypatch.setattr(kbo_runner, "open_kbo_graph_dataset", open_dataset)
     expected = _sample_fingerprint(graph)
     verified = kbo_runner._DayDataset(
         tmp_path,
         (selected_day,),
         expected_sample_fingerprints={selected_day: expected},
+        label_year_ceiling=2024,
     )
     assert verified[0] is graph
+    assert open_calls == [{"label_year_ceiling": 2024}]
 
     rejected = kbo_runner._DayDataset(
         tmp_path,

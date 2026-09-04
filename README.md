@@ -430,10 +430,16 @@ seed 추가와 multi-seed 결론이 없으며 test는 계속 봉인합니다.
 초반의 3.07GiB plateau는 GPU를 쓰지 않았다는 뜻이 아니라 날짜별 그래프 크기 편차가 뒤늦게
 드러난 것입니다. 같은 v5 명령은 동일한 배치 경계를 만들어 다시 실패하므로 재실행하지 않습니다.
 
-production 경로는 temporal-v7의 immutable season-sharded event archive를 만들고, 각 질의시점
-이전의 player/team/game 사건만 사용해 cutoff-safe historical subgraph를 materialize합니다. 한
-날짜의 질의 그래프가 포함할 수 있는 과거 game node는 전역 160개로 제한합니다. 원시 PA나 route edge를
-임의로 잘라내는 cap은 사용하지 않습니다. `full`은 네 temporal relation의 message를 사용하고,
+production 경로는 temporal-v7의 immutable columnar event archive를 만들고, 각 질의시점
+이전의 player/team/game 사건만 사용해 cutoff-safe full-history graph를 materialize합니다.
+365일 lookback, 팀·선수별 경기 수, 전체 game node, 원시 PA 또는 route edge를 자르는 의미적 cap은
+사용하지 않습니다. `365`는 recency feature의 정규화 기준일 뿐 사건의 보존 여부를 바꾸지 않습니다.
+원천 version은 archive 전체의 pickle-free numeric `.npy` column과 UTF-8 blob/offset column에
+정확히 한 번 저장됩니다. 각 worker는 이를 read-only mmap으로 다시 열어 OS page cache를 공유하고,
+decoded 원천 dict를 상주시지 않습니다. `(kind, entity)`별 rank index와
+`available_at/ingested_at/valid_from/valid_to`를 포함한 cutoff key-change prefix만 증분 적용합니다.
+epoch rewind도 compact change stream만 replay하며 per-day full-history cache나 원천 전체 decode가
+없습니다. `full`은 네 temporal relation의 message를 사용하고,
 `node_only`는 정확히 같은 topology와 질의를 받되 relation message만 건너뜁니다.
 
 아래 명령 하나가 archive 작성, 2025년까지의 sample index 작성, adaptive all-batch CUDA preflight,

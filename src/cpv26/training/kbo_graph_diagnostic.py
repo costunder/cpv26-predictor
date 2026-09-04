@@ -581,6 +581,34 @@ class _RunningMoments:
         self.minimum = min(self.minimum, float(tensor.min().item()))
         self.maximum = max(self.maximum, float(tensor.max().item()))
 
+    def merge(
+        self,
+        *,
+        count: int,
+        total: float,
+        square_total: float,
+        minimum: float | None,
+        maximum: float | None,
+    ) -> None:
+        """Merge exact sufficient statistics without materializing samples."""
+
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("diagnostic moment count must be a non-negative integer")
+        if count == 0:
+            return
+        if minimum is None or maximum is None:
+            raise ValueError("non-empty diagnostic moments require finite extrema")
+        values = (total, square_total, minimum, maximum)
+        if not all(math.isfinite(value) for value in values):
+            raise FloatingPointError("RelGNN diagnostic observer received non-finite moments")
+        if square_total < 0 or minimum > maximum:
+            raise ValueError("diagnostic moment summary is inconsistent")
+        self.count += count
+        self.total += total
+        self.square_total += square_total
+        self.minimum = min(self.minimum, minimum)
+        self.maximum = max(self.maximum, maximum)
+
     def report(self) -> dict[str, Any]:
         if not self.count:
             return {"count": 0, "mean": None, "std": None, "min": None, "max": None}
@@ -694,12 +722,15 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
                 "source_channel": str(event.get("source_channel", "")),
                 "destination_channel": str(event.get("destination_channel", "")),
                 "calls": 0,
+                "dense_calls": 0,
+                "chunked_summary_calls": 0,
                 "positive_edges": 0,
                 "forced_singleton_destinations": 0,
                 "competitive_destinations": 0,
             },
         )
         bucket["calls"] += 1
+        bucket["dense_calls"] += 1
         destination_index = event["destination_index"].detach().long()
         positive = event["positive_weight"].detach().bool()
         attention = event["attention"].detach().float()
@@ -753,6 +784,131 @@ class RelGNNDiagnosticsCollector(RelGNNDiagnosticsObserver):
         if bool(route_mask.any()):
             message_norm = event["message"].detach().float().norm(dim=-1)[route_mask]
             state_norm = event["destination_state"].detach().float().norm(dim=-1)[route_mask]
+            _moments(bucket, "message_norm").add(message_norm)
+            _moments(bucket, "message_to_destination_state_norm").add(
+                message_norm / state_norm.clamp_min(1e-12)
+            )
+
+    def observe_attention_summary(self, **event: Any) -> None:
+        """Merge exact node-bounded statistics from streaming edge attention."""
+
+        torch, _ = require_torch()
+        required = {
+            "layer_index",
+            "route_name",
+            "direction",
+            "destination_degree",
+            "attention_square_sum",
+            "attention_minimum",
+            "attention_maximum",
+            "competitive_normalized_entropy",
+            "message",
+            "route_mask",
+            "destination_state",
+        }
+        missing = required - event.keys()
+        if missing:
+            raise ValueError(f"attention summary event is missing {sorted(missing)}")
+        key = f"layer_{event['layer_index']}|{event['route_name']}|{event['direction']}"
+        bucket = self._attention.setdefault(
+            key,
+            {
+                "layer_index": int(event["layer_index"]),
+                "route_name": str(event["route_name"]),
+                "direction": str(event["direction"]),
+                "source_channel": str(event.get("source_channel", "")),
+                "destination_channel": str(event.get("destination_channel", "")),
+                "calls": 0,
+                "dense_calls": 0,
+                "chunked_summary_calls": 0,
+                "positive_edges": 0,
+                "forced_singleton_destinations": 0,
+                "competitive_destinations": 0,
+            },
+        )
+        bucket["calls"] += 1
+        bucket["chunked_summary_calls"] += 1
+        degree = event["destination_degree"].detach().long()
+        if degree.ndim != 1 or bool((degree < 0).any().item()):
+            raise ValueError("attention summary destination_degree must be non-negative [nodes]")
+        destination_count = int(degree.numel())
+        statistics = {
+            name: event[name].detach().float()
+            for name in (
+                "attention_square_sum",
+                "attention_minimum",
+                "attention_maximum",
+                "competitive_normalized_entropy",
+            )
+        }
+        shapes = {tuple(value.shape) for value in statistics.values()}
+        if len(shapes) != 1:
+            raise ValueError("attention summary statistics must share shape [nodes, heads]")
+        shape = next(iter(shapes))
+        if len(shape) != 2 or shape[0] != destination_count or shape[1] <= 0:
+            raise ValueError("attention summary statistics must have shape [nodes, heads]")
+        num_heads = shape[1]
+        forced_destinations = degree == 1
+        competitive_destinations = degree > 1
+        forced_count = int(forced_destinations.sum().item())
+        competitive_count = int(competitive_destinations.sum().item())
+        bucket["positive_edges"] += int(degree.sum().item())
+        bucket["forced_singleton_destinations"] += forced_count
+        bucket["competitive_destinations"] += competitive_count
+
+        forced_attention_count = forced_count * num_heads
+        _moments(bucket, "forced_singleton_attention").merge(
+            count=forced_attention_count,
+            total=float(forced_attention_count),
+            square_total=float(forced_attention_count),
+            minimum=1.0 if forced_attention_count else None,
+            maximum=1.0 if forced_attention_count else None,
+        )
+        if competitive_count:
+            square_sum = statistics["attention_square_sum"][competitive_destinations]
+            minimum = statistics["attention_minimum"][competitive_destinations]
+            maximum = statistics["attention_maximum"][competitive_destinations]
+            normalized_entropy = statistics[
+                "competitive_normalized_entropy"
+            ][competitive_destinations]
+            if not all(
+                bool(torch.isfinite(value).all().item())
+                for value in (square_sum, minimum, maximum, normalized_entropy)
+            ):
+                raise FloatingPointError(
+                    "RelGNN diagnostic observer received non-finite attention summaries"
+                )
+            competitive_attention_count = (
+                int(degree[competitive_destinations].sum().item()) * num_heads
+            )
+            destination_head_count = competitive_count * num_heads
+            _moments(bucket, "competitive_attention").merge(
+                count=competitive_attention_count,
+                total=float(destination_head_count),
+                square_total=float(square_sum.sum().item()),
+                minimum=float(minimum.min().item()),
+                maximum=float(maximum.max().item()),
+            )
+            _moments(bucket, "competitive_normalized_entropy").add(normalized_entropy)
+            _moments(bucket, "competitive_max_attention").add(maximum)
+
+        route_mask = event["route_mask"].detach().bool()
+        if route_mask.ndim != 1 or int(route_mask.numel()) != destination_count:
+            raise ValueError("attention summary route_mask must have shape [nodes]")
+        if bool(route_mask.any()):
+            message = event["message"].detach().float()
+            destination_state = event["destination_state"].detach().float()
+            if (
+                message.ndim != 2
+                or destination_state.ndim != 2
+                or int(message.shape[0]) != destination_count
+                or int(destination_state.shape[0]) != destination_count
+            ):
+                raise ValueError(
+                    "attention summary message and destination_state must have shape [nodes, dim]"
+                )
+            message_norm = message.norm(dim=-1)[route_mask]
+            state_norm = destination_state.norm(dim=-1)[route_mask]
             _moments(bucket, "message_norm").add(message_norm)
             _moments(bucket, "message_to_destination_state_norm").add(
                 message_norm / state_norm.clamp_min(1e-12)

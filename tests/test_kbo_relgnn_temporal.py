@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -119,6 +120,7 @@ def _temporal_config() -> KBORelGNNConfig:
         num_layers=3,
         num_attention_heads=4,
         dropout=0.0,
+        compact_kbo_channels=True,
     )
 
 
@@ -194,6 +196,11 @@ def test_temporal_v7_requires_its_complete_unmixed_route_family() -> None:
     malformed_day["routes"].pop("pitcher_game_event")
     with pytest.raises(ValueError, match="exact reviewed route set"):
         collate_kbo_day_graphs([malformed_day])
+
+
+def test_temporal_v7_rejects_legacy_dense_inactive_channels() -> None:
+    with pytest.raises(ValueError, match="compact_kbo_channels=True"):
+        replace(_temporal_config(), compact_kbo_channels=False)
 
 
 def test_temporal_extension_preserves_legacy_config_fingerprints() -> None:

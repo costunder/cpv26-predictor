@@ -8,6 +8,7 @@ Unsupported tensors retain the ordinary ``Tensor.to`` path and autograd behavior
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any
@@ -161,6 +162,7 @@ def prefetch_batches(
     device: Any,
     *,
     mover: Callable[[Any, Any], Any] | None = None,
+    observer: Callable[[str, Any], None] | None = None,
 ) -> Iterator[Any]:
     """Move one CUDA batch ahead on a dedicated copy stream.
 
@@ -179,11 +181,20 @@ def prefetch_batches(
     move = mover or (lambda value, target: move_batch(value, target, packed=True))
     iterator = iter(batches)
     if selected.type != "cuda":
-        for raw_batch in iterator:
+        while True:
+            started = time.perf_counter()
+            try:
+                raw_batch = next(iterator)
+            except StopIteration:
+                return
+            if observer is not None:
+                observer("source_wait_seconds", time.perf_counter() - started)
+            started = time.perf_counter()
             moved_batch = move(raw_batch, selected)
+            if observer is not None:
+                observer("h2d_host_dispatch_seconds", time.perf_counter() - started)
             yield moved_batch
             del moved_batch
-        return
 
     copy_stream = torch.cuda.Stream(device=selected)
     missing = object()
@@ -191,13 +202,29 @@ def prefetch_batches(
 
     def preload() -> None:
         nonlocal next_batch
+        started = time.perf_counter()
         try:
             raw_batch = next(iterator)
         except StopIteration:
             next_batch = missing
             return
+        if observer is not None:
+            observer("source_wait_seconds", time.perf_counter() - started)
+        start_event = end_event = None
         with torch.cuda.stream(copy_stream):
+            event_type = getattr(torch.cuda, "Event", None)
+            if observer is not None and callable(event_type):
+                start_event = event_type(enable_timing=True)
+                end_event = event_type(enable_timing=True)
+                start_event.record(copy_stream)
+            started = time.perf_counter()
             next_batch = move(raw_batch, selected)
+            if observer is not None:
+                observer("h2d_host_dispatch_seconds", time.perf_counter() - started)
+            if end_event is not None:
+                end_event.record(copy_stream)
+        if observer is not None and start_event is not None and end_event is not None:
+            observer("h2d_cuda_event", (start_event, end_event))
 
     preload()
     while next_batch is not missing:

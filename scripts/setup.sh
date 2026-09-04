@@ -6,6 +6,7 @@ if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
 fi
 set -euo pipefail
 
+cpv26_setup_main() {
 profile="${1:-base}"
 constraints="requirements/constraints.txt"
 
@@ -13,18 +14,18 @@ case "${profile}" in
   base|dev|tabular|ml-cpu|ml-cuda) ;;
   *)
     echo "Usage: bash scripts/setup.sh [base|dev|tabular|ml-cpu|ml-cuda]" >&2
-    exit 2
+    return 2
     ;;
 esac
 
 if [[ ! -f pyproject.toml || ! -f "${constraints}" ]]; then
   echo "Run this command from the cpv26-predictor repository root." >&2
-  exit 1
+  return 1
 fi
 
 cpv26_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${cpv26_script_dir}/conda_guard.sh"
-cpv26_require_conda || exit 1
+cpv26_require_conda || return 1
 
 "${cpv26_python}" -m pip install --upgrade pip wheel
 
@@ -77,13 +78,13 @@ case "${profile}" in
         echo "No CUDA wheel was selected or installed automatically." >&2
         echo "Choose the CUDA index for this server at https://pytorch.org/get-started/locally/" >&2
         echo "Then rerun with TORCH_INDEX_URL set to that command's --index-url value." >&2
-        exit 3
+        return 3
       fi
       if [[ ! "${torch_index_url}" =~ ^https://download[.]pytorch[.]org/whl/cu[0-9]+$ ]]; then
         echo "TORCH_INDEX_URL must be an official stable CUDA index:" >&2
         echo "  https://download.pytorch.org/whl/cu<version>" >&2
         echo "Copy the exact URL from the official PyTorch installation selector." >&2
-        exit 2
+        return 2
       fi
       # An explicit index authorizes replacing an unusable/CPU build, even when
       # that installed build has a newer public version than the CUDA index.
@@ -95,7 +96,7 @@ case "${profile}" in
       if ! cuda_torch_ready; then
         echo "CUDA PyTorch still cannot execute a forward/backward kernel on this GPU." >&2
         echo "Check the selected CUDA build, NVIDIA driver, and GPU visibility." >&2
-        exit 3
+        return 3
       fi
     fi
     ;;
@@ -104,3 +105,6 @@ esac
 "${cpv26_python}" -m pip check
 echo "Conda environment ready: ${CONDA_PREFIX}"
 echo "Create .env if needed, then run: source scripts/activate.sh"
+}
+
+cpv26_setup_main "$@"

@@ -198,21 +198,23 @@ def test_six_variant_policies_resolve_to_exact_direction_schedules() -> None:
     assert protocols["node_only"]["resolved_route_schedule"] == [[], [], []]
 
 
-def test_same_seed_audit_has_identical_initial_state_and_parameter_count(
+def test_same_seed_audit_matches_shared_initialization_and_reports_variant_capacity(
     graph_directory: Path,
 ) -> None:
     dataset = KBOGraphDataset(graph_directory)
     audit = matched._initialization_audit(dataset, _config(layers=2), 731)
     variants = audit["variants"]
 
-    assert audit["all_variants_equal"] is True
-    assert {item["initial_model_state_sha256"] for item in variants.values()} == {
-        audit["initial_model_state_sha256"]
-    }
-    assert {item["parameter_count"] for item in variants.values()} == {
-        audit["parameter_count"]
-    }
-    assert audit["parameter_count"] > 0
+    assert audit["all_shared_parameters_equal"] is True
+    assert {
+        item["shared_parameter_initialization_sha256"] for item in variants.values()
+    } == {audit["shared_parameter_initialization_sha256"]}
+    assert variants["full"]["parameter_count"] > variants["node_only"][
+        "parameter_count"
+    ]
+    assert variants["node_only"]["architecture"]["effective_relational_layers"] == 0
+    assert variants["node_only"]["architecture"]["relational_parameter_count"] == 0
+    assert variants["full"]["architecture"]["effective_relational_layers"] == 2
 
 
 def test_split_fingerprint_is_exact_and_excludes_held_out_test(
@@ -285,7 +287,8 @@ def test_suite_manifest_resume_allows_only_epoch_extension(
     tmp_path: Path,
 ) -> None:
     dataset = KBOGraphDataset(graph_directory)
-    base = _config()
+    # Missing compact_kbo_channels denotes the legacy dense architecture.
+    base = replace(_config(), compact_kbo_channels=False)
     split_fingerprint, _ = matched._split_day_fingerprint(dataset, base)
 
     def manifest(config: runner.KBOTrainingConfig) -> dict[str, Any]:
@@ -326,7 +329,9 @@ def test_suite_manifest_resume_allows_only_epoch_extension(
 
 
 def test_child_report_normalizes_legacy_missing_execution_fields() -> None:
-    expected = matched._variant_config(_config(epochs=2), "full", 37)
+    expected = matched._variant_config(
+        replace(_config(epochs=2), compact_kbo_channels=False), "full", 37
+    )
     configuration = asdict(expected)
     configuration.pop("activation_checkpointing")
     configuration.pop("compact_kbo_channels")
@@ -334,6 +339,12 @@ def test_child_report_normalizes_legacy_missing_execution_fields() -> None:
         "configuration": configuration,
         "completed_epochs": 2,
         "test_used_during_training": False,
+        "trainable_parameter_count": 123,
+        "parameter_contract": {
+            "trainable_parameter_count": 123,
+            "optimizer_covers_all_trainable": True,
+        },
+        "all_epochs_trainable_parameters_received_gradient": True,
     }
 
     matched._validate_child_report(report, expected)
@@ -349,7 +360,8 @@ def test_interrupted_child_checkpoint_rejects_fairness_and_control_mismatch(
 ) -> None:
     dataset = KBOGraphDataset(graph_directory)
     expected = matched._variant_config(_config(epochs=2), "rewired", 37)
-    initialization = matched._initialization_audit(dataset, expected, 37)
+    audit = matched._initialization_audit(dataset, expected, 37)
+    initialization = audit["variants"]["rewired"]
     state: dict[str, Any] = {
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "training_config": asdict(replace(expected, epochs=1)),
@@ -357,6 +369,7 @@ def test_interrupted_child_checkpoint_rejects_fairness_and_control_mismatch(
         "model_config": runner._model_config(dataset, expected).to_dict(),
         "initial_model_state_sha256": initialization["initial_model_state_sha256"],
         "parameter_count": initialization["parameter_count"],
+        "trainable_parameter_count": initialization["trainable_parameter_count"],
         "epoch": 1,
     }
     matched._validate_child_checkpoint(
@@ -612,8 +625,16 @@ def test_real_tiny_suite_is_matched_resumable_and_never_loads_or_evaluates_test(
     assert loaded_years and set(loaded_years) == {2023, 2024}
     runs = report["runs"]["17"]
     assert tuple(runs) == matched.MATCHED_GRAPH_VARIANTS
-    assert len({run["initial_model_state_sha256"] for run in runs.values()}) == 1
-    assert len({run["parameter_count"] for run in runs.values()}) == 1
+    # Pruned ablations intentionally have different complete state dictionaries;
+    # fairness is bit-identical initialization of the parameters shared by all.
+    assert len(
+        {
+            run["shared_parameter_initialization_sha256"]
+            for run in runs.values()
+        }
+    ) == 1
+    assert len({run["parameter_count"] for run in runs.values()}) > 1
+    assert runs["full"]["parameter_count"] > runs["node_only"]["parameter_count"]
     assert len({run["attempted_optimizer_steps"] for run in runs.values()}) == 1
     assert len({run["completed_epochs"] for run in runs.values()}) == 1
     assert all(run["test_used_during_training"] is False for run in runs.values())

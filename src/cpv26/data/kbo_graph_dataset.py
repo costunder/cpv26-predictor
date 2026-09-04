@@ -408,10 +408,12 @@ class _History:
     """Incremental rolling aggregates, including publication/validity revisions."""
 
     def __init__(
-        self, records: list[_Record], rolling_days: int, *, graph_schema: str = "v5"
+        self, records: list[_Record], rolling_days: int, *, graph_schema: str = "v5",
+        knowledge_cutoff_uses_ingested_at: bool = False,
     ) -> None:
         self.rolling_days = rolling_days
         self.graph_schema = graph_schema
+        self.knowledge_cutoff_uses_ingested_at = knowledge_cutoff_uses_ingested_at
         self.versions: dict[tuple[str, str], list[_Record]] = defaultdict(list)
         schedule: dict[date, set[tuple[str, str]]] = defaultdict(set)
         for record in records:
@@ -421,6 +423,11 @@ class _History:
                 record.day + timedelta(days=1),
                 _first_cutoff(record.available_at),
                 _first_cutoff(record.valid_from),
+                *(
+                    (_first_cutoff(record.ingested_at),)
+                    if knowledge_cutoff_uses_ingested_at
+                    else ()
+                ),
             )
             schedule[activation].add(key)
             schedule[record.day + timedelta(days=rolling_days + 1)].add(key)
@@ -462,6 +469,10 @@ class _History:
                 record
                 for record in self.versions[key]
                 if record.available_at <= cutoff and record.valid_from <= cutoff
+                and (
+                    not self.knowledge_cutoff_uses_ingested_at
+                    or record.ingested_at <= cutoff
+                )
             ]
             selected = max(eligible, key=lambda item: item.rank) if eligible else None
             if selected is not None and (

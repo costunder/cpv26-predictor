@@ -121,7 +121,7 @@ def test_activation_checkpointing_preserves_outputs_gradients_and_state_dict() -
             torch.testing.assert_close(other.grad, parameter.grad)
 
 
-def test_compact_kbo_channels_remove_only_route_inactive_capacity() -> None:
+def test_compact_kbo_channels_is_explicit_and_legacy_default_remains_loadable() -> None:
     legacy = KBORelGNNModel(_config())
     compact = KBORelGNNModel(replace(_config(), compact_kbo_channels=True))
 
@@ -160,14 +160,144 @@ def test_compact_kbo_channels_remove_only_route_inactive_capacity() -> None:
     )
 
     batch = collate_kbo_day_graphs([_day()])
-    output = compact(batch)
-    loss = kbo_multitask_loss(output, batch)["loss"]
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert all(
-        parameter.grad is None or torch.isfinite(parameter.grad).all()
-        for parameter in compact.parameters()
+    legacy_loss = kbo_multitask_loss(legacy(batch), batch)["loss"]
+    compact_loss = kbo_multitask_loss(compact(batch), batch)["loss"]
+    legacy_loss.backward()
+    compact_loss.backward()
+    assert torch.isfinite(legacy_loss) and torch.isfinite(compact_loss)
+    assert any(parameter.grad is None for parameter in legacy.parameters())
+    assert all(parameter.grad is not None for parameter in compact.parameters())
+
+
+def test_node_only_registers_no_relational_parameters_and_all_parameters_get_gradients() -> None:
+    full_config = replace(_config(), compact_kbo_channels=True)
+    node_config = replace(full_config, route_schedule=((),) * full_config.num_layers)
+    torch.manual_seed(818)
+    full = KBORelGNNModel(full_config)
+    torch.manual_seed(818)
+    node_only = KBORelGNNModel(node_config)
+
+    full_parameters = dict(full.named_parameters())
+    node_parameters = dict(node_only.named_parameters())
+    assert len(full.backbone.layers) == full_config.num_layers
+    assert len(node_only.backbone.layers) == 0
+    assert not any(name.startswith("backbone.layers.") for name in node_parameters)
+    assert sum(parameter.numel() for parameter in node_parameters.values()) < sum(
+        parameter.numel() for parameter in full_parameters.values()
     )
+    for name, parameter in node_parameters.items():
+        torch.testing.assert_close(parameter, full_parameters[name], rtol=0, atol=0)
+
+    batch = collate_kbo_day_graphs([_day()])
+    loss = kbo_multitask_loss(node_only(batch), batch, run_weight=0.1)["loss"]
+    loss.backward()
+    assert all(parameter.grad is not None for parameter in node_parameters.values())
+    assert all(
+        torch.isfinite(parameter.grad).all()
+        for parameter in node_parameters.values()
+        if parameter.grad is not None
+    )
+    contract = node_only.architecture_contract()
+    assert contract["variant"] == "node_only"
+    assert contract["effective_relational_layers"] == 0
+    assert contract["relational_parameter_count"] == 0
+
+
+def test_partial_schedule_prunes_inactive_route_direction_parameters_without_rng_drift() -> None:
+    full_config = replace(_config(), compact_kbo_channels=True)
+    scheduled_config = replace(
+        full_config,
+        route_schedule=(
+            (
+                "batter_pa_pitcher__forward",
+                "batter_participation_team__forward",
+            ),
+            ("batter_pa_pitcher__reverse",),
+        ),
+    )
+    torch.manual_seed(919)
+    full = KBORelGNNModel(full_config)
+    torch.manual_seed(919)
+    scheduled = KBORelGNNModel(scheduled_config)
+
+    first, second = scheduled.backbone.layers
+    assert set(first.messages) == {
+        "batter_pa_pitcher",
+        "batter_participation_team",
+    }
+    assert set(first.route_gates) == set(scheduled_config.route_schedule[0])
+    assert set(first.updaters) == {"player__pitching", "team"}
+    assert hasattr(first.messages["batter_pa_pitcher"], "forward_source")
+    assert not hasattr(first.messages["batter_pa_pitcher"], "reverse_source")
+    assert set(second.messages) == {"batter_pa_pitcher"}
+    assert set(second.route_gates) == set(scheduled_config.route_schedule[1])
+    assert set(second.updaters) == {"player__batting"}
+    assert not hasattr(second.messages["batter_pa_pitcher"], "forward_source")
+    assert hasattr(second.messages["batter_pa_pitcher"], "reverse_source")
+
+    full_parameters = dict(full.named_parameters())
+    scheduled_parameters = dict(scheduled.named_parameters())
+    assert set(scheduled_parameters) < set(full_parameters)
+    for name, parameter in scheduled_parameters.items():
+        torch.testing.assert_close(parameter, full_parameters[name], rtol=0, atol=0)
+
+    batch = collate_kbo_day_graphs([_day()])
+    loss = kbo_multitask_loss(scheduled(batch), batch, run_weight=0.1)["loss"]
+    loss.backward()
+    assert all(parameter.grad is not None for parameter in scheduled_parameters.values())
+
+
+def test_lossless_route_edge_chunks_preserve_outputs_inputs_and_parameter_gradients() -> None:
+    unchunked = KBORelGNNModel(replace(_config(), route_edge_chunk_size=100_000))
+    chunked = KBORelGNNModel(replace(_config(), route_edge_chunk_size=2))
+    chunked.load_state_dict(unchunked.state_dict())
+    first_batch = collate_kbo_day_graphs([_day(seed=91)])
+    second_batch = copy.deepcopy(first_batch)
+    for batch in (first_batch, second_batch):
+        for values in batch["node_features"].values():
+            values.requires_grad_(True)
+        for values in batch["role_features"].values():
+            values.requires_grad_(True)
+
+    first_output = unchunked(first_batch)
+    second_output = chunked(second_batch)
+    for name in first_output:
+        first = first_output[name]
+        second = second_output[name]
+        if torch.is_tensor(first):
+            torch.testing.assert_close(first, second, rtol=2e-5, atol=2e-6, equal_nan=True)
+        elif isinstance(first, dict):
+            for key in first:
+                torch.testing.assert_close(first[key], second[key], rtol=2e-5, atol=2e-6)
+
+    first_loss = kbo_multitask_loss(first_output, first_batch, run_weight=0.1)["loss"]
+    second_loss = kbo_multitask_loss(second_output, second_batch, run_weight=0.1)["loss"]
+    first_loss.backward()
+    second_loss.backward()
+    for kind in first_batch["node_features"]:
+        torch.testing.assert_close(
+            first_batch["node_features"][kind].grad,
+            second_batch["node_features"][kind].grad,
+            rtol=3e-5,
+            atol=3e-6,
+        )
+    for role in first_batch["role_features"]:
+        torch.testing.assert_close(
+            first_batch["role_features"][role].grad,
+            second_batch["role_features"][role].grad,
+            rtol=3e-5,
+            atol=3e-6,
+        )
+    for (first_name, first_parameter), (second_name, second_parameter) in zip(
+        unchunked.named_parameters(), chunked.named_parameters(), strict=True
+    ):
+        assert first_name == second_name
+        torch.testing.assert_close(
+            first_parameter.grad,
+            second_parameter.grad,
+            rtol=3e-5,
+            atol=3e-6,
+        )
 
 
 def _game_only_day(day_id: str = "2001-04-05", *, with_history: bool = True) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ import numpy as np
 import pytest
 
 import cpv26.data.kbo_temporal_archive as temporal_module
+import cpv26.data.kbo_temporal_columnar as columnar_module
+from cpv26.data.kbo_dataset_loader import open_kbo_graph_dataset
 from cpv26.data.kbo_temporal_archive import (
     TEMPORAL_ROUTE_FEATURE_NAMES,
     KBOTemporalGraphDataset,
@@ -39,14 +42,33 @@ def test_temporal_archive_derives_event_graph_and_three_hop_history(tmp_path: Pa
 
     assert archive.manifest["dataset_version"] == 7
     assert archive.manifest["graph_schema"] == "temporal_v7"
-    assert archive.manifest["materialization_contract_version"] == 3
+    assert archive.manifest["materialization_contract_version"] == 6
     assert archive.manifest["fingerprint"] != archive.manifest["build_fingerprint"]
     assert archive.manifest["day_summary_contract"] == "trainer_split_summary_v1"
     assert archive.manifest["sampling_policy"] == {
-        "lookback_days": 365,
-        "max_games_per_seed_team": 160,
-        "max_games_per_player": 48,
-        "max_historical_games_total": 160,
+        "history_scope": "all_prior_records",
+        "recency_reference_days": 365,
+    }
+    assert archive.manifest["history_coverage"] == {
+        "scope": "all_prior_records",
+        "eligible_source_records": archive.manifest["record_count"],
+        "stored_source_records": archive.manifest["record_count"],
+        "stored_fraction": 1.0,
+        "semantic_reduction": False,
+    }
+    assert archive.manifest["streaming_policy"] == {
+        "record_storage": "archive_global_columnar_numpy_npy",
+        "record_encoding": "pickle_free_utf8_blob_and_numeric_arrays",
+        "read_mode": "read_only_mmap_shared_page_cache",
+        "decode": "changed_records_only_without_persistent_source_dicts",
+        "history_cursor": "cutoff_prefix_key_change_stream",
+        "rewind": "replay_compact_key_changes_without_raw_history_decode",
+        "materialized_graph_lifetime": "physical_batch_scoped",
+        "raw_record_residency": "zero_decoded_source_records_per_worker",
+        "worker_memory_sharing": True,
+        "dense_graph_materialization": "once_per_sample_access",
+        "per_day_full_history_cache": False,
+        "production_ready": True,
     }
     assert archive.manifest["route_feature_dims"] == {
         name: len(features) for name, features in TEMPORAL_ROUTE_FEATURE_NAMES.items()
@@ -121,24 +143,189 @@ def test_temporal_archive_derives_event_graph_and_three_hop_history(tmp_path: Pa
     assert current_first == {first.game_ids.index("g1")}
 
 
-def test_temporal_archive_hard_caps_final_historical_game_union(tmp_path: Path) -> None:
+def test_temporal_archive_preserves_history_older_than_one_year_without_caps(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "canonical.duckdb"
     _database(database)
-    archive = build_kbo_temporal_archive(
-        database,
-        tmp_path / "temporal-capped",
-        policy=TemporalSamplingPolicy(max_historical_games_total=1),
-    )
+    with duckdb.connect(str(database)) as connection:
+        _game(connection, "old-game", 1, season=2021)
+        _pa(
+            connection,
+            "old-pa",
+            "old-game",
+            1,
+            "historic-batter",
+            "historic-pitcher",
+            "double",
+            season=2021,
+        )
+    archive = build_kbo_temporal_archive(database, tmp_path / "temporal-full-history")
 
     graph = archive.load_day("2023-04-03")
     current = {graph.game_ids[index] for index in graph.match_game_index.tolist()}
     historical = set(graph.game_ids) - current
-    assert historical == {"g2"}
-    for route_name in ("batter_game_event", "pitcher_game_event"):
-        assert {
-            graph.game_ids[index]
-            for index in graph.routes[route_name]["destination_index"].tolist()
-        } <= historical
+    assert historical == {"old-game", "g1", "g2"}
+    assert len(historical) == 3
+    assert len(graph.routes["team_game_event"]["source_index"]) == 8
+    assert len(graph.routes["batter_pa_pitcher_event"]["source_index"]) == 4
+    assert "historic-batter" in graph.player_ids
+    assert "historic-pitcher" in graph.player_ids
+    assert archive.manifest["record_count"] >= 9
+    for route_name, player_id in (
+        ("batter_game_event", "historic-batter"),
+        ("pitcher_game_event", "historic-pitcher"),
+    ):
+        route = graph.routes[route_name]
+        endpoints = {
+            (graph.player_ids[source], graph.game_ids[destination])
+            for source, destination in zip(
+                route["source_index"], route["destination_index"], strict=True
+            )
+        }
+        assert (player_id, "old-game") in endpoints
+
+
+def test_columnar_prefix_graphs_match_dense_history_reference_exactly(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database, include_pas=False)
+    with duckdb.connect(str(database)) as connection:
+        _game(connection, "old-game", 1, season=2021)
+        _pa(
+            connection,
+            "old-pa",
+            "old-game",
+            1,
+            "historic-batter",
+            "historic-pitcher",
+            "double",
+            season=2021,
+        )
+        _pa(connection, "pa1", "g1", 1, "batter", "pitcher", "single")
+        _pa(
+            connection,
+            "pa1",
+            "g1",
+            1,
+            "batter",
+            "pitcher",
+            "strikeout",
+            row_id="pa1-correction",
+            available_at=datetime(2023, 4, 2, 12, tzinfo=_KST),
+        )
+        connection.execute(
+            """
+            UPDATE observed_plate_appearance
+            SET valid_from=TIMESTAMPTZ '2023-04-02 12:00:00+09'
+            WHERE observed_pa_row_id='pa1-correction'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE observed_plate_appearance
+            SET valid_to=TIMESTAMPTZ '2023-04-02 12:00:00+09'
+            WHERE observed_pa_row_id='pa1'
+            """
+        )
+    snapshot = datetime(2025, 1, 1, tzinfo=_KST)
+    archive = build_kbo_temporal_archive(
+        database,
+        tmp_path / "temporal-differential",
+        knowledge_at=snapshot,
+    )
+    records, _, _ = temporal_module._read_records(database, snapshot)  # type: ignore[attr-defined]
+    labels = temporal_module._label_records(records, snapshot)  # type: ignore[attr-defined]
+    final_day = archive.days()[-1]
+    history_span = (final_day - min(record.day for record in records)).days + 1
+    reference_history = temporal_module._History(  # type: ignore[attr-defined]
+        list(records),
+        history_span,
+        graph_schema="vnext",
+        knowledge_cutoff_uses_ingested_at=True,
+    )
+
+    for day in archive.days():
+        reference_history.advance(day)
+        rows = labels[day]
+        descriptors = tuple(
+            temporal_module._QueryDescriptor(  # type: ignore[attr-defined]
+                day,
+                str(record.data["game_id"]),
+                str(record.data["home_team_id"]),
+                str(record.data["away_team_id"]),
+            )
+            for record in rows
+            if record.kind == "game"
+        )
+        topology = temporal_module._select_topology(reference_history)  # type: ignore[attr-defined]
+        reference = temporal_module._materialize_graph(  # type: ignore[attr-defined]
+            day,
+            reference_history,
+            topology,
+            descriptors,
+            rows,
+            archive.policy,
+        )
+        actual = archive.load_day(day)
+        assert actual.player_ids == reference.player_ids
+        assert actual.team_ids == reference.team_ids
+        assert actual.game_ids == reference.game_ids
+        assert actual.arrays.keys() == reference.arrays.keys()
+        for name in actual.arrays:
+            np.testing.assert_array_equal(actual.arrays[name], reference.arrays[name])
+
+
+def test_sample_materialization_has_no_per_day_or_raw_history_cache(tmp_path: Path) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    archive = build_kbo_temporal_archive(database, tmp_path / "temporal-bounded")
+
+    for day in archive.days():
+        graph = archive.load_day(day)
+        assert graph.day == day
+
+    history = archive._stream_history  # type: ignore[attr-defined]
+    assert history is not None
+    assert history.raw_python_record_residency == 0
+    assert history._active_record_by_key.shape == (  # type: ignore[attr-defined]
+        archive._record_store.key_count,  # type: ignore[attr-defined]
+    )
+    assert history._prefix_position <= len(  # type: ignore[attr-defined]
+        archive._record_store.arrays["schedule_day_ordinal"]  # type: ignore[attr-defined]
+    )
+    assert not hasattr(archive, "_graphs_cache")
+    assert not hasattr(archive, "_stream_records")
+    assert not (archive.directory / "days").exists()
+
+
+def test_dataset_worker_pickle_reopens_mmaps_without_serializing_record_columns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    archive = build_kbo_temporal_archive(database, tmp_path / "temporal-worker")
+    archive.load_day("2023-04-02")
+
+    payload = pickle.dumps(archive)
+    state = archive.__getstate__()
+    assert "_record_store" not in state
+    assert state["_record_store_attestation"]
+    assert state["_stream_history"] is None
+    assert len(payload) < 100_000
+
+    def unexpected_full_checksum(_path: Path) -> str:
+        raise AssertionError("spawned workers must reuse the parent file attestation")
+
+    monkeypatch.setattr(columnar_module, "_sha256_file", unexpected_full_checksum)
+    restored = pickle.loads(payload)
+    assert restored._record_store.mmap_backed  # type: ignore[attr-defined]
+    assert restored._stream_history is None  # type: ignore[attr-defined]
+    graph = restored.load_day("2023-04-02")
+    assert graph.day_id == "2023-04-02"
+    assert restored._stream_history.raw_python_record_residency == 0  # type: ignore[union-attr]
 
 
 def test_current_results_and_participants_cannot_select_topology(tmp_path: Path) -> None:
@@ -228,23 +415,53 @@ def test_publication_and_revision_cutoffs_select_one_raw_pa_version(tmp_path: Pa
     assert third_event[0, 5] == 1  # noon correction enters only the next cutoff
 
 
-def test_archive_shards_are_unique_pickle_free_and_labels_are_references(
+def test_late_ingestion_cannot_leak_through_backdated_availability(tmp_path: Path) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database, include_pas=False)
+    with duckdb.connect(str(database)) as connection:
+        _pa(connection, "pa1", "g1", 1, "batter", "pitcher", "single")
+        connection.execute(
+            """
+            UPDATE observed_plate_appearance
+            SET ingested_at=TIMESTAMPTZ '2023-04-02 12:00:00+09'
+            WHERE observed_pa_row_id='pa1'
+            """
+        )
+
+    archive = build_kbo_temporal_archive(database, tmp_path / "temporal")
+    before_ingestion = archive.load_day("2023-04-02")
+    after_ingestion = archive.load_day("2023-04-03")
+
+    assert not len(before_ingestion.routes["batter_pa_pitcher_event"]["source_index"])
+    assert len(after_ingestion.routes["batter_pa_pitcher_event"]["source_index"]) == 1
+
+
+def test_archive_columns_are_unique_pickle_free_mmaps_and_labels_are_indices(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "canonical.duckdb"
     _database(database)
     archive = build_kbo_temporal_archive(database, tmp_path / "temporal")
 
-    record_keys: list[str] = []
-    for entry in archive.manifest["record_shards"]:
-        with np.load(archive.directory / entry["file"], allow_pickle=False) as shard:
-            assert all(not shard[name].dtype.hasobject for name in shard.files)
-            record_keys.extend(str(value) for value in shard["record_key"].tolist())
-    assert len(record_keys) == archive.manifest["record_count"]
+    store = archive._record_store  # type: ignore[attr-defined]
+    assert store.mmap_backed
+    assert store.record_count == archive.manifest["record_count"]
+    assert store.allowed_record_count == store.record_count
+    record_keys = [store.record_key(index) for index in range(store.record_count)]
     assert len(record_keys) == len(set(record_keys))
+    for array in store.arrays.values():
+        assert isinstance(array, np.memmap)
+        assert not array.dtype.hasobject
+        assert array.flags.writeable is False
+    for column in store.strings.values():
+        assert isinstance(column.blob, np.memmap)
+        assert isinstance(column.offsets, np.memmap)
+        assert column.blob.flags.writeable is False
+        assert column.offsets.flags.writeable is False
     for entry in archive.manifest["label_shards"]:
         with np.load(archive.directory / entry["file"], allow_pickle=False) as shard:
-            assert set(shard.files) == {"day", "record_key"}
+            assert set(shard.files) == {"day", "record_index"}
+            assert shard["record_index"].dtype == np.int64
     for entry in archive.manifest["query_shards"]:
         with np.load(archive.directory / entry["file"], allow_pickle=False) as shard:
             assert set(shard.files) == {
@@ -276,7 +493,7 @@ def test_temporal_archive_artifact_fingerprint_binds_shard_entries(
     archive = build_kbo_temporal_archive(database, tmp_path / "temporal")
     manifest_path = archive.directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["record_shards"][0]["sha256"] = "0" * 64
+    manifest["record_store"]["columns"]["values"]["sha256"] = "0" * 64
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -305,7 +522,9 @@ def test_temporal_archive_requires_lowercase_manifest_fingerprints(
         KBOTemporalGraphDataset(archive.directory)
 
 
-def test_sample_index_and_label_ceiling_never_open_held_out_year(tmp_path: Path) -> None:
+def test_sample_index_and_label_ceiling_never_open_held_out_year(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "canonical.duckdb"
     _database(database)
     with duckdb.connect(str(database)) as connection:
@@ -313,6 +532,16 @@ def test_sample_index_and_label_ceiling_never_open_held_out_year(tmp_path: Path)
     archive = build_kbo_temporal_archive(database, tmp_path / "temporal")
     sealed = KBOTemporalGraphDataset(archive.directory, label_year_ceiling=2023)
     assert all(day.year == 2023 for day in sealed.days())
+    store = sealed._record_store  # type: ignore[attr-defined]
+    assert store.allowed_record_count < store.record_count
+    sealed.load_day("2023-04-02")
+    future_index = next(
+        index
+        for index, value in enumerate(store.arrays["day_ordinal"])
+        if date.fromordinal(int(value)).year == 2024
+    )
+    with pytest.raises(PermissionError, match="sealed"):
+        store.ref(future_index)
     with pytest.raises(PermissionError, match="sealed"):
         sealed.load_day("2024-04-01")
     with pytest.raises(ValueError, match="end_day or label_year_ceiling"):
@@ -334,28 +563,35 @@ def test_sample_index_and_label_ceiling_never_open_held_out_year(tmp_path: Path)
     assert (archive.directory / "sample_index.json").is_file()
 
 
-def test_sampling_is_deterministic_and_streaming_history_reuses_year_cursor(
+def test_full_history_is_deterministic_and_reuses_one_mmap_prefix_cursor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = tmp_path / "canonical.duckdb"
     _database(database)
+    with duckdb.connect(str(database)) as connection:
+        _game(connection, "next-season", 1, season=2024)
     archive = build_kbo_temporal_archive(database, tmp_path / "temporal")
-    original: Any = temporal_module._History  # type: ignore[attr-defined]
+    original: Any = temporal_module._MMapHistory  # type: ignore[attr-defined]
     constructions = 0
 
-    def counting_history(*args: Any, **kwargs: Any) -> Any:
-        nonlocal constructions
-        constructions += 1
-        return original(*args, **kwargs)
+    class CountingHistory(original):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            nonlocal constructions
+            constructions += 1
+            super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(temporal_module, "_History", counting_history)
+    monkeypatch.setattr(temporal_module, "_MMapHistory", CountingHistory)
     dataset = KBOTemporalGraphDataset(archive.directory)
     first = dataset.load_day(date(2023, 4, 1))
     second = dataset.load_day(date(2023, 4, 2))
     third = dataset.load_day(date(2023, 4, 3))
+    next_season = dataset.load_day(date(2024, 4, 1))
     assert constructions == 1
     repeat = dataset.load_day(date(2023, 4, 2))
-    assert constructions == 2  # rewind rebuilds once; forward iteration does not
+    assert constructions == 1  # rewind resets integer state; it never remaps or decodes history
+    assert dataset._stream_history.raw_python_record_residency == 0  # type: ignore[union-attr]
+    assert not hasattr(dataset, "_stream_records")
+    assert not hasattr(dataset, "_records_cache")
     for left, right in ((second, repeat),):
         assert left.player_ids == right.player_ids
         assert left.team_ids == right.team_ids
@@ -364,17 +600,74 @@ def test_sampling_is_deterministic_and_streaming_history_reuses_year_cursor(
             np.testing.assert_array_equal(left.arrays[name], right.arrays[name])
     assert first.day_id == "2023-04-01"
     assert third.day_id == "2023-04-03"
+    assert next_season.day_id == "2024-04-01"
 
 
 @pytest.mark.parametrize(
     "options",
     [
-        {"lookback_days": 0},
-        {"max_games_per_seed_team": 0},
-        {"max_games_per_player": 0},
-        {"max_historical_games_total": 0},
+        {"recency_reference_days": 0},
+        {"recency_reference_days": True},
     ],
 )
-def test_temporal_sampling_policy_is_fail_closed(options: dict[str, int]) -> None:
+def test_temporal_sampling_policy_is_fail_closed(options: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="positive integer"):
         TemporalSamplingPolicy(**options)
+
+
+def test_temporal_sampling_policy_rejects_any_partial_history_scope() -> None:
+    with pytest.raises(ValueError, match="all_prior_records"):
+        TemporalSamplingPolicy(history_scope="bounded")
+
+
+def test_archive_rejects_legacy_bounded_history_contract(tmp_path: Path) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    archive = build_kbo_temporal_archive(database, tmp_path / "temporal")
+    manifest_path = archive.directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sampling_policy"] = {
+        "lookback_days": 365,
+        "max_games_per_seed_team": 160,
+        "max_games_per_player": 48,
+        "max_historical_games_total": 160,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="lossless full-history policy"):
+        KBOTemporalGraphDataset(archive.directory)
+
+
+def test_validation_ceiling_does_not_decode_2026_raw_record_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database, season=2025)
+    with duckdb.connect(str(database)) as connection:
+        _game(connection, "held-out-2026", 1, season=2026)
+    archive = build_kbo_temporal_archive(database, tmp_path / "temporal")
+    original_mapping: Any = columnar_module._RecordDataView._mapping  # type: ignore[attr-defined]
+    decoded_years: list[int] = []
+
+    def counting_mapping(view: Any) -> dict[str, Any]:
+        year = date.fromordinal(
+            int(view._store.arrays["day_ordinal"][view._index])
+        ).year
+        decoded_years.append(year)
+        return original_mapping(view)
+
+    monkeypatch.setattr(columnar_module._RecordDataView, "_mapping", counting_mapping)
+    sealed = open_kbo_graph_dataset(
+        archive.directory,
+        label_year_ceiling=2025,
+    )
+    sealed.load_day("2025-04-03")
+
+    assert decoded_years
+    assert max(decoded_years) <= 2025
+    with pytest.raises(PermissionError, match="sealed"):
+        sealed.load_day("2026-04-01")

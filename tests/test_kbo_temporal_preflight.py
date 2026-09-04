@@ -17,6 +17,7 @@ from cpv26.training import kbo_runner
 from cpv26.training import kbo_temporal_preflight as preflight
 from cpv26.training.kbo_runner import KBOTrainingConfig
 from cpv26.training.kbo_temporal_preflight import (
+    autotune_temporal_loader,
     build_temporal_execution_plan,
     run_adaptive_temporal_cuda_preflight,
     validate_temporal_execution_plan,
@@ -117,6 +118,69 @@ def test_plan_uses_only_node_edge_budgets_and_is_identical_for_variants(
     assert set(plan["variant_plan_fingerprints"].values()) == {
         plan["plan_fingerprint"]
     }
+
+
+def test_loader_autotune_measures_candidates_and_selects_throughput(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    days = [date(2023, 4, day) for day in range(1, 9)] + [date(2024, 4, 1)]
+    _write_index(tmp_path, [(day, 20, 20) for day in days])
+    dataset = _Dataset(tmp_path, days)
+    plan = build_temporal_execution_plan(dataset, _config(), max_nodes=20, max_edges=20)
+    measured: list[tuple[int, int | None]] = []
+
+    def measure(
+        _dataset: Any,
+        _configuration: Any,
+        rows: Any,
+        *,
+        workers: int,
+        prefetch_factor: int | None,
+    ) -> dict[str, Any]:
+        measured.append((workers, prefetch_factor))
+        throughput = 1.0 + workers * 10.0 + float(prefetch_factor or 0)
+        return {
+            "status": "measured",
+            "workers": workers,
+            "prefetch_factor": prefetch_factor,
+            "graph_days_per_second": throughput,
+            "calibration_batch_count": len(rows),
+        }
+
+    monkeypatch.setattr(preflight, "allowed_cpu_ids", lambda: (0, 1, 2, 3))
+    monkeypatch.setattr(preflight, "_measure_loader_candidate", measure)
+    monkeypatch.setattr(preflight, "require_torch", lambda: (object(), None))
+    monkeypatch.setattr(
+        kbo_runner,
+        "_device_and_precision",
+        lambda *_args: (SimpleNamespace(type="cuda"), None, {}),
+    )
+    monkeypatch.setattr(preflight, "host_resource_inventory", lambda *_args, **_kwargs: {})
+
+    result = autotune_temporal_loader(dataset, _config(), plan, progress=lambda _: None)
+
+    assert (0, None) in measured
+    assert set(prefetch for workers, prefetch in measured if workers > 0) == {1, 2, 4}
+    assert result["selected"]["workers"] == 4
+    assert result["selected"]["prefetch_factor"] == 4
+    assert result["training_plan_coverage_unchanged"] is True
+    assert result["held_out_test_loaded"] is False
+
+
+def test_loader_runtime_is_bound_into_plan_fingerprint(tmp_path: Path) -> None:
+    days = [date(2023, 4, 1), date(2024, 4, 1)]
+    _write_index(tmp_path, [(day, 20, 20) for day in days])
+    dataset = _Dataset(tmp_path, days)
+
+    serial = build_temporal_execution_plan(dataset, _config(), loader_workers=0)
+    parallel = build_temporal_execution_plan(
+        dataset, _config(), loader_workers=2, loader_prefetch_factor=4
+    )
+
+    assert serial["ordered_batches"] == parallel["ordered_batches"]
+    assert serial["plan_fingerprint"] != parallel["plan_fingerprint"]
+    assert serial["loader_runtime"]["prefetch_factor"] is None
+    assert parallel["loader_runtime"]["persistent_workers"] is True
 
 
 def test_oversize_single_day_is_retained_and_marked_for_cuda_gate(tmp_path: Path) -> None:
@@ -275,6 +339,13 @@ def test_compute_cuda_oom_is_audited_retryable_and_closes_device_iterator(
         def synchronize(_device: Any) -> None:
             cleanup["sync"] += 1
 
+        class Event:
+            def __init__(self, **_kwargs: Any) -> None:
+                pass
+
+            def record(self, *_args: Any) -> None:
+                return None
+
     class _Scaler:
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             pass
@@ -301,6 +372,9 @@ def test_compute_cuda_oom_is_audited_retryable_and_closes_device_iterator(
 
         def train(self) -> None:
             return None
+
+        def architecture_contract(self) -> dict[str, Any]:
+            return {"route_edge_chunking": "automatic_lossless"}
 
         def __call__(self, _batch: Any) -> Any:
             raise RuntimeError("CUDA out of memory during synthetic forward")
@@ -337,14 +411,49 @@ def test_compute_cuda_oom_is_audited_retryable_and_closes_device_iterator(
         lambda *_args, **_kwargs: (device, None, {"device": "cuda:0"}),
     )
     monkeypatch.setattr(preflight, "require_torch", lambda: (fake_torch, None))
-    monkeypatch.setattr(kbo_runner, "_model_config", lambda *_args: object())
+    monkeypatch.setattr(
+        kbo_runner,
+        "_model_config",
+        lambda *_args: SimpleNamespace(to_dict=lambda: {}),
+    )
     monkeypatch.setattr(preflight, "KBORelGNNModel", _Model)
     monkeypatch.setattr(preflight, "make_adamw", lambda *_args, **_kwargs: _Optimizer())
-    monkeypatch.setattr(preflight, "_planned_device_batches", lambda *_args: tracked)
+    monkeypatch.setattr(
+        preflight, "_planned_device_batches", lambda *_args, **_kwargs: tracked
+    )
+    monkeypatch.setattr(
+        preflight,
+        "resource_snapshot",
+        lambda *_args: {
+            "wall_time": 0.0,
+            "process_cpu_seconds": 0.0,
+            "system_cpu_totals": None,
+            "available_ram_bytes": None,
+            "process_peak_rss_bytes": None,
+            "cuda_allocated_bytes": 0,
+            "cuda_reserved_bytes": 0,
+            "gpu_utilization_percent": None,
+            "gpu_memory_utilization_percent": None,
+        },
+    )
+    monkeypatch.setattr(preflight, "tensor_shape_manifest", lambda *_args: {})
     output = tmp_path / "compute-oom.json"
+    loader_autotune = {
+        "status": "measured",
+        "selected": {
+            "workers": 2,
+            "prefetch_factor": 2,
+            "host_memory_safe": True,
+        },
+    }
 
     with pytest.raises(RuntimeError, match="CUDA out of memory"):
-        preflight.run_temporal_cuda_preflight(dataset, _config(), output=output)
+        preflight.run_temporal_cuda_preflight(
+            dataset,
+            _config(),
+            output=output,
+            loader_autotune=loader_autotune,
+        )
 
     saved = json.loads(output.read_text(encoding="utf-8"))
     assert saved["status"] == "failed_cuda_oom"

@@ -22,10 +22,10 @@ from cpv26.training.kbo_capacity_comparison import (
 )
 
 SCALE_COMPARISON_PROTOCOL = "single_seed_validation_scale_comparison"
-SCALE_COMPARISON_PROTOCOL_VERSION = 1
+SCALE_COMPARISON_PROTOCOL_VERSION = 2
 SCALE_COMPARISON_REPORT = "scale_comparison_report.json"
 
-_SUPPORTED_SOURCE_PROTOCOL_VERSION = 1
+_SUPPORTED_SOURCE_PROTOCOL_VERSION = 2
 _VARIANTS = ("full", "node_only")
 _BASELINE_CAPACITY = {"hidden_dim": 128, "layers": 3, "heads": 4}
 _CANDIDATE_CAPACITY = {"hidden_dim": 256, "layers": 3, "heads": 8}
@@ -45,6 +45,7 @@ _OBJECTIVE_FIELDS = (
 _GRAPH_CONFIG_FIELDS = (
     "route_message_normalization",
     "route_schedule",
+    "route_edge_chunk_size",
     "graph_control",
     "graph_control_seed",
 )
@@ -390,6 +391,24 @@ def _runs(
             context=f"{context}/{variant} parameter_count",
             minimum=1,
         )
+        trainable_parameter_count = _integer(
+            run.get("trainable_parameter_count"),
+            context=f"{context}/{variant} trainable_parameter_count",
+            minimum=1,
+        )
+        parameter_contract = _mapping(
+            run.get("parameter_contract"),
+            context=f"{context}/{variant} parameter_contract",
+        )
+        if (
+            parameter_contract.get("optimizer_covers_all_trainable") is not True
+            or parameter_contract.get("parameter_count") != parameter_count
+            or parameter_contract.get("trainable_parameter_count")
+            != trainable_parameter_count
+        ):
+            raise ValueError(
+                f"{context}/{variant} does not prove exact optimizer parameter coverage"
+            )
         loss = _number(
             run.get("validation_selection_loss"),
             context=f"{context}/{variant} validation_selection_loss",
@@ -411,6 +430,18 @@ def _runs(
             "optimizer_steps": optimizer_steps,
             "skipped_optimizer_steps": skipped_optimizer_steps,
             "parameter_count": parameter_count,
+            "trainable_parameter_count": trainable_parameter_count,
+            "parameter_contract": _plain(parameter_contract),
+            "shared_parameter_initialization_sha256": _sha256(
+                run.get("shared_parameter_initialization_sha256"),
+                context=f"{context}/{variant} shared initialization hash",
+            ),
+            "architecture": _plain(
+                _mapping(
+                    run.get("architecture"),
+                    context=f"{context}/{variant} architecture",
+                )
+            ),
             "initial_model_state_sha256": _sha256(
                 run.get("initial_model_state_sha256"),
                 context=f"{context}/{variant} initial_model_state_sha256",
@@ -435,16 +466,21 @@ def _validate_initialization_audit(
     )
     if audit_seed != expected_seed:
         raise ValueError(f"{context} initialization seed differs from report seed")
-    if audit.get("all_variants_equal") is not True:
-        raise ValueError(f"{context} initialization audit does not prove variant equality")
-    root_hash = _sha256(
-        audit.get("initial_model_state_sha256"),
-        context=f"{context} initialization hash",
-    )
-    root_count = _integer(
-        audit.get("parameter_count"),
-        context=f"{context} initialization parameter_count",
-        minimum=1,
+    if audit.get("all_shared_parameters_equal") is not True:
+        raise ValueError(
+            f"{context} initialization audit does not prove shared-parameter equality"
+        )
+    legacy_all_variants_equal = audit.get("all_variants_equal")
+    if (
+        legacy_all_variants_equal is not None
+        and legacy_all_variants_equal is not True
+    ):
+        raise ValueError(
+            f"{context} initialization audit contains a failed legacy equality claim"
+        )
+    shared_hash = _sha256(
+        audit.get("shared_parameter_initialization_sha256"),
+        context=f"{context} shared initialization hash",
     )
     variants = _mapping(
         audit.get("variants"), context=f"{context} initialization variants"
@@ -466,22 +502,37 @@ def _validate_initialization_audit(
             context=f"{context} {variant} initialization parameter_count",
             minimum=1,
         )
-        if variant_hash != root_hash or variant_count != root_count:
-            raise ValueError(f"{context} initialization variants are not identical")
-        if runs[variant]["initial_model_state_sha256"] != root_hash:
+        trainable_count = _integer(
+            variant_audit.get("trainable_parameter_count"),
+            context=f"{context} {variant} trainable parameter count",
+            minimum=1,
+        )
+        variant_shared_hash = _sha256(
+            variant_audit.get("shared_parameter_initialization_sha256"),
+            context=f"{context} {variant} shared initialization hash",
+        )
+        if variant_shared_hash != shared_hash:
+            raise ValueError(f"{context} shared parameter initialization differs")
+        if runs[variant]["initial_model_state_sha256"] != variant_hash:
             raise ValueError(
                 f"{context}/{variant} saved run initialization disagrees with audit"
             )
-        if runs[variant]["parameter_count"] != root_count:
+        if (
+            runs[variant]["parameter_count"] != variant_count
+            or runs[variant]["trainable_parameter_count"] != trainable_count
+            or runs[variant]["shared_parameter_initialization_sha256"] != shared_hash
+        ):
             raise ValueError(
-                f"{context}/{variant} saved run parameter count disagrees with "
+                f"{context}/{variant} saved run parameter contract disagrees with "
                 "initialization audit"
             )
     return {
         "seed": expected_seed,
-        "all_variants_equal": True,
-        "initial_model_state_sha256": root_hash,
-        "parameter_count": root_count,
+        "all_shared_parameters_equal": True,
+        "shared_parameter_initialization_sha256": shared_hash,
+        "variant_parameter_counts": {
+            variant: int(runs[variant]["parameter_count"]) for variant in _VARIANTS
+        },
     }
 
 
@@ -531,28 +582,32 @@ def _validate_parameter_audit(
     *,
     context: str,
     audit_field: str,
-) -> int:
-    counts = {int(runs[variant]["parameter_count"]) for variant in _VARIANTS}
-    if len(counts) != 1:
-        raise ValueError(f"{context} full and node_only parameter counts differ")
-    count = next(iter(counts))
+) -> dict[str, int]:
+    counts = {variant: int(runs[variant]["parameter_count"]) for variant in _VARIANTS}
+    if counts["full"] <= counts["node_only"]:
+        raise ValueError(f"{context} node_only did not remove relational capacity")
     audit = _mapping(
         report.get("parameter_count_audit"), context=f"{context} parameter_count_audit"
     )
     if audit_field == "expanded_128x3":
-        if audit.get("within_capacity_variants_equal") is not True:
-            raise ValueError(f"{context} parameter audit does not prove variant equality")
+        declared_raw = audit.get("expanded_128x3")
     else:
-        if audit.get("all_variants_equal") is not True:
-            raise ValueError(f"{context} parameter audit does not prove variant equality")
-    declared = _integer(
-        audit.get(audit_field),
+        declared_raw = audit.get("variant_parameter_counts")
+    declared = _mapping(
+        declared_raw,
         context=f"{context} parameter_count_audit.{audit_field}",
-        minimum=1,
     )
-    if declared != count:
+    declared_counts = {
+        variant: _integer(
+            declared.get(variant),
+            context=f"{context} parameter_count_audit.{audit_field}.{variant}",
+            minimum=1,
+        )
+        for variant in _VARIANTS
+    }
+    if declared_counts != counts:
         raise ValueError(f"{context} parameter audit disagrees with its runs")
-    return count
+    return counts
 
 
 def _validate_budget_audit(
@@ -780,11 +835,10 @@ def compare_kbo_scale_reports(
     candidate_compact = candidate_config.get("compact_kbo_channels", False)
     if not isinstance(baseline_compact, bool) or not isinstance(candidate_compact, bool):
         raise ValueError("compact_kbo_channels must be boolean when declared")
-    if baseline_compact or candidate_compact:
+    if baseline_compact is not True or candidate_compact is not True:
         raise ValueError(
-            "compact_kbo_channels must be false: the 128x3/256x3 capacity "
-            "comparison requires legacy dense channels; "
-            "compare compact architecture in a separate protocol"
+            "compact_kbo_channels must be true for both runs: production scale "
+            "comparisons reject legacy dense channels with inactive trainable parameters"
         )
 
     baseline_epochs = _integer(
@@ -884,20 +938,23 @@ def compare_kbo_scale_reports(
         comparison_group=None,
     )
 
-    baseline_parameter_count = _validate_parameter_audit(
+    baseline_parameter_counts = _validate_parameter_audit(
         baseline,
         baseline_runs,
         context="baseline 128x3",
         audit_field="expanded_128x3",
     )
-    candidate_parameter_count = _validate_parameter_audit(
+    candidate_parameter_counts = _validate_parameter_audit(
         candidate,
         candidate_runs,
         context="candidate 256x3",
         audit_field="parameter_count",
     )
-    if candidate_parameter_count <= baseline_parameter_count:
-        raise ValueError("256x3 model does not have more parameters than 128x3")
+    for variant in _VARIANTS:
+        if candidate_parameter_counts[variant] <= baseline_parameter_counts[variant]:
+            raise ValueError(
+                f"256x3 {variant} does not have more parameters than 128x3 {variant}"
+            )
 
     baseline_budget = _validate_budget_audit(
         baseline,
@@ -1049,15 +1106,22 @@ def compare_kbo_scale_reports(
             ),
         },
         "parameter_count_audit": {
-            "baseline_128x3": baseline_parameter_count,
-            "candidate_256x3": candidate_parameter_count,
-            "increase": candidate_parameter_count - baseline_parameter_count,
-            "candidate_to_baseline_ratio": candidate_parameter_count
-            / baseline_parameter_count,
-            "within_capacity_variants_equal": True,
+            "baseline_128x3": baseline_parameter_counts,
+            "candidate_256x3": candidate_parameter_counts,
+            "increase_by_variant": {
+                variant: candidate_parameter_counts[variant]
+                - baseline_parameter_counts[variant]
+                for variant in _VARIANTS
+            },
+            "candidate_to_baseline_ratio_by_variant": {
+                variant: candidate_parameter_counts[variant]
+                / baseline_parameter_counts[variant]
+                for variant in _VARIANTS
+            },
+            "variant_counts_intentionally_distinct": True,
         },
         "initialization_audit": {
-            "within_capacity_variants_equal": True,
+            "within_capacity_shared_parameters_equal": True,
             "baseline_128x3": baseline_initialization,
             "candidate_256x3": candidate_initialization,
         },

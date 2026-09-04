@@ -510,16 +510,22 @@ GPU 미사용 현상이 아닙니다. 기존 v5 scale 명령은 같은 고정 �
 
 #### temporal-v7 실행 계약
 
-temporal-v7은 중복된 완성 daily graph가 아니라 immutable season-sharded event archive를
-저장합니다. 질의시각 직전의 사건만 읽어 player/team/game node와 `batter_game_event`,
-`pitcher_game_event`, `team_game_event`, `batter_pa_pitcher_event` 네 route를 갖는 historical
-subgraph를 query-time에 materialize합니다. 현재 질의 경기는 점수 없는 두 team-game edge만
-가지며 현재 출전선수·라인업·PA edge를 topology 선정에 사용하지 않습니다.
+temporal-v7은 중복된 완성 daily graph가 아니라 immutable global columnar event archive를
+저장합니다. 질의시각 직전까지 사용 가능하고 유효한 모든 사건을 읽어 player/team/game node와
+`batter_game_event`, `pitcher_game_event`, `team_game_event`, `batter_pa_pitcher_event` 네 route를
+갖는 full-history graph를 query-time에 materialize합니다. 현재 질의 경기는 점수 없는 두
+team-game edge만 가지며 현재 출전선수·라인업·PA edge를 topology 선정에 사용하지 않습니다.
 
-각 날짜 질의 그래프의 전체 과거 game node는 최신 160개로 제한하고, seed team별 160개·player별 48개의
-확장 한도와 365일 lookback을 적용합니다. 이는 25시즌 전체를 한 GPU batch에 상주시켜 생기는
-메모리 폭주를 막으면서 과거 경기 단위 관계를 유지하는 sampling contract입니다. PA와 route
-edge의 raw cap은 사용하지 않습니다.
+365일 lookback, seed team별·player별 경기 수, 전체 historical game node, PA 또는 route edge를
+자르는 cap은 없습니다. policy의 `recency_reference_days=365`는 recency feature의 스케일만
+정규화하며 어떤 사건도 만료시키지 않습니다. 원천 version은 pickle-free numeric `.npy`와
+UTF-8 blob/offset column에 한 번만 기록됩니다. DataLoader worker는 column을 read-only mmap으로
+열어 OS page cache를 공유하며 decoded raw-record dict를 보관하지 않습니다. cutoff별로 정렬된
+logical-key change prefix는 `available_at`, `ingested_at`, `valid_from`, `valid_to`를 모두 적용하고,
+forward access에서는 새 prefix만 aggregate state에 반영합니다. epoch rewind는 compact key-change
+stream을 replay하며 per-day full-history graph/state cache나 원천 전체 decode를 만들지 않습니다.
+VRAM은 그래프 관계를 버리는 대신 exact node/edge
+physical batch plan과 lossless relation-message chunking으로 제어합니다.
 
 아래 단일 명령이 event archive 작성·검증, 2025 validation까지만 포함한 sample index,
 adaptive all-batch CUDA preflight, seed 2026의 256×3×8-head `full`/`node_only` 각 30 epoch

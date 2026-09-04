@@ -26,7 +26,7 @@ from cpv26.training import kbo_matched_ablation as matched
 from cpv26.training import kbo_runner as runner
 
 CAPACITY_COMPARISON_PROTOCOL = "single_seed_validation_capacity_comparison"
-CAPACITY_COMPARISON_PROTOCOL_VERSION = 1
+CAPACITY_COMPARISON_PROTOCOL_VERSION = 2
 CAPACITY_COMPARISON_VARIANTS = ("full", "node_only")
 RECOVERY_PREDICTION_TASKS = ("match", "live_hit", "pa", "box_pa", "box_pitch")
 BASELINE_CAPACITY = {"hidden_dim": 64, "layers": 2}
@@ -34,7 +34,7 @@ EXPANDED_CAPACITY = {"hidden_dim": 128, "layers": 3}
 CAPACITY_COMPARISON_REPORT = "capacity_comparison_report.json"
 CAPACITY_COMPARISON_MANIFEST = "capacity_comparison_config.json"
 FULL_NODE_COMPARISON_PROTOCOL = "single_seed_validation_full_node_comparison"
-FULL_NODE_COMPARISON_PROTOCOL_VERSION = 1
+FULL_NODE_COMPARISON_PROTOCOL_VERSION = 2
 FULL_NODE_COMPARISON_REPORT = "full_node_comparison_report.json"
 FULL_NODE_COMPARISON_MANIFEST = "full_node_comparison_config.json"
 
@@ -405,9 +405,8 @@ def _orphan_initialization_consensus(
     *,
     seed: int,
 ) -> dict[str, Any]:
-    """Recover the historical initialization from both completed child reports."""
-    hashes: set[str] = set()
-    counts: set[int] = set()
+    """Recover each architecture's initialization from completed child reports."""
+    variants: dict[str, dict[str, Any]] = {}
     for variant in CAPACITY_COMPARISON_VARIANTS:
         path = suite_directory / f"seed-{seed}" / variant / "training_report.json"
         training = _load_json(path)
@@ -415,6 +414,7 @@ def _orphan_initialization_consensus(
             raise ValueError(f"baseline {seed}/{variant} is not completed")
         initial_hash = training.get("initial_model_state_sha256")
         parameter_count = training.get("parameter_count")
+        trainable_parameter_count = training.get("trainable_parameter_count")
         if not isinstance(initial_hash, str) or not initial_hash:
             raise ValueError(
                 f"baseline {seed}/{variant} has no historical initialization hash"
@@ -427,17 +427,22 @@ def _orphan_initialization_consensus(
             raise ValueError(
                 f"baseline {seed}/{variant} has no positive historical parameter count"
             )
-        hashes.add(initial_hash)
-        counts.add(parameter_count)
-    if len(hashes) != 1 or len(counts) != 1:
-        raise ValueError(
-            "baseline full and node_only child reports do not share historical "
-            "initialization consensus"
-        )
-    return {
-        "initial_model_state_sha256": next(iter(hashes)),
-        "parameter_count": next(iter(counts)),
-    }
+        if (
+            isinstance(trainable_parameter_count, bool)
+            or not isinstance(trainable_parameter_count, int)
+            or trainable_parameter_count <= 0
+        ):
+            raise ValueError(
+                f"baseline {seed}/{variant} has no positive trainable parameter count"
+            )
+        variants[variant] = {
+            "initial_model_state_sha256": initial_hash,
+            "parameter_count": parameter_count,
+            "trainable_parameter_count": trainable_parameter_count,
+        }
+    if variants["full"]["parameter_count"] <= variants["node_only"]["parameter_count"]:
+        raise ValueError("historical node_only child did not remove relational capacity")
+    return {"variants": variants}
 
 
 def _initialization_diagnostic(
@@ -536,6 +541,8 @@ def _recover_baseline_child(
         != expected_initialization.get("initial_model_state_sha256")
         or int(training.get("parameter_count", -1))
         != int(expected_initialization.get("parameter_count", -2))
+        or int(training.get("trainable_parameter_count", -1))
+        != int(expected_initialization.get("trainable_parameter_count", -2))
     ):
         raise ValueError(
             f"{context} does not match the historical child initialization consensus"
@@ -612,7 +619,13 @@ def _recover_baseline_child(
         "skipped_optimizer_steps": skipped_steps,
         "attempted_optimizer_steps": attempted_steps,
         "parameter_count": int(training["parameter_count"]),
+        "trainable_parameter_count": int(training["trainable_parameter_count"]),
+        "parameter_contract": _plain(training["parameter_contract"]),
         "initial_model_state_sha256": str(training["initial_model_state_sha256"]),
+        "shared_parameter_initialization_sha256": str(
+            expected_initialization["shared_parameter_initialization_sha256"]
+        ),
+        "architecture": _plain(expected_initialization["architecture"]),
         "graph_control": runner._graph_control_report(expected_config),
         "route_message_normalization": expected_config.route_message_normalization,
         "route_schedule_preset": expected_config.route_schedule,
@@ -671,10 +684,15 @@ def _validate_baseline_child(
         "completed_epochs",
         "attempted_optimizer_steps",
         "parameter_count",
+        "trainable_parameter_count",
         "initial_model_state_sha256",
     ):
         if child.get(field) != training.get(field):
             raise ValueError(f"{context} report and training lineage differ at {field}")
+    if _plain(child.get("parameter_contract")) != _plain(
+        training.get("parameter_contract")
+    ):
+        raise ValueError(f"{context} report and training parameter contract differ")
     if child.get("test_used_during_training") is not False:
         raise ValueError(f"{context} does not prove that held-out test stayed sealed")
     if (
@@ -753,10 +771,7 @@ def _validate_baseline_suite(
         )
     if report.get("protocol") != "matched_from_scratch_validation_graph_ablation":
         raise ValueError("baseline is not a matched validation graph-ablation suite")
-    if report.get("protocol_version") not in {
-        None,
-        matched.MATCHED_ABLATION_PROTOCOL_VERSION,
-    }:
+    if report.get("protocol_version") != matched.MATCHED_ABLATION_PROTOCOL_VERSION:
         raise ValueError("baseline matched-suite protocol version is unsupported")
     if report.get("selection_split") != "validation":
         raise ValueError("baseline matched suite did not select on validation")
@@ -892,46 +907,36 @@ def _validate_baseline_suite(
                 seed=seed,
             )
             reproduced_initialization = _two_variant_initialization_audit(dataset, config)
-            if (
-                reproduced_initialization.get("parameter_count")
-                != historical_initialization["parameter_count"]
-            ):
-                raise ValueError(
-                    "historical baseline parameter count is incompatible with the current model"
-                )
             reproduced_variants = reproduced_initialization.get("variants")
-            if not isinstance(reproduced_variants, Mapping) or any(
-                not isinstance(reproduced_variants.get(variant), Mapping)
-                or reproduced_variants[variant].get("parameter_count")
-                != historical_initialization["parameter_count"]
-                for variant in CAPACITY_COMPARISON_VARIANTS
-            ):
+            historical_variants = historical_initialization["variants"]
+            if not isinstance(reproduced_variants, Mapping):
                 raise ValueError(
-                    "historical baseline parameter count differs from a current variant"
+                    "current initialization audit has no variant records"
                 )
-            raw_initializations = report.get("initialization_audit")
-            raw_initialization = (
-                raw_initializations.get(seed_key)
-                if isinstance(raw_initializations, Mapping)
-                else None
-            )
+            for variant in CAPACITY_COMPARISON_VARIANTS:
+                reproduced = reproduced_variants.get(variant)
+                historical = historical_variants[variant]
+                if not isinstance(reproduced, Mapping) or any(
+                    reproduced.get(field) != historical[field]
+                    for field in (
+                        "initial_model_state_sha256",
+                        "parameter_count",
+                        "trainable_parameter_count",
+                    )
+                ):
+                    raise ValueError(
+                        f"historical baseline {variant} initialization is incompatible "
+                        "with the current architecture"
+                    )
             orphan_initialization_audit = {
-                "authority": "completed_full_and_node_only_child_consensus",
-                "historical_child_consensus": _plain(historical_initialization),
-                "current_reproduction": _initialization_diagnostic(
-                    reproduced_initialization,
-                    consensus=historical_initialization,
-                ),
-                "top_level_snapshot": _initialization_diagnostic(
-                    raw_initialization,
-                    consensus=historical_initialization,
-                    current=reproduced_initialization,
-                ),
-                "current_hash_match_required": False,
-                "current_parameter_count_match_required": True,
+                "authority": "completed_variant_specific_child_records",
+                "historical_children": _plain(historical_initialization),
+                "current_reproduction": _plain(reproduced_initialization),
+                "exact_variant_hash_and_count_match_required": True,
             }
             for variant in CAPACITY_COMPARISON_VARIANTS:
                 expected_child = matched._variant_config(config, variant, seed)
+                variant_initialization = reproduced_variants[variant]
                 recovered, recovery_lineage = _recover_baseline_child(
                     dataset=dataset,
                     dataset_directory=dataset_directory,
@@ -940,7 +945,7 @@ def _validate_baseline_suite(
                     seed=seed,
                     variant=variant,
                     expected_config=expected_child,
-                    expected_initialization=historical_initialization,
+                    expected_initialization=variant_initialization,
                     allow_validation_recovery_write=allow_validation_recovery_write,
                 )
                 runs[variant], validated_lineage = _validate_baseline_child(
@@ -962,12 +967,22 @@ def _validate_baseline_suite(
 
     completed = {int(run["completed_epochs"]) for run in runs.values()}
     attempts = {int(run["attempted_optimizer_steps"]) for run in runs.values()}
-    counts = {int(run["parameter_count"]) for run in runs.values()}
-    initial_states = {str(run["initial_model_state_sha256"]) for run in runs.values()}
     if len(completed) != 1 or len(attempts) != 1:
         raise ValueError("baseline full and node_only did not receive the same fixed budget")
-    if len(counts) != 1 or len(initial_states) != 1:
-        raise ValueError("baseline full and node_only do not have matched initialization")
+    counts = {
+        variant: int(runs[variant]["parameter_count"])
+        for variant in CAPACITY_COMPARISON_VARIANTS
+    }
+    shared_hashes = {
+        str(runs[variant].get("shared_parameter_initialization_sha256"))
+        for variant in CAPACITY_COMPARISON_VARIANTS
+    }
+    if counts["full"] <= counts["node_only"]:
+        raise ValueError("baseline node_only did not remove relational trainable capacity")
+    if len(shared_hashes) != 1 or "None" in shared_hashes:
+        raise ValueError(
+            "baseline full and node_only do not prove shared-parameter initialization"
+        )
 
     lineage = {
         "suite_directory": str(suite_directory),
@@ -1074,34 +1089,53 @@ def _two_variant_initialization_audit(
     """Audit exactly full/node_only without constructing unrelated ablation models."""
 
     torch, _ = require_torch()
+    node_config = matched._variant_config(config, "node_only", config.seed)
+    torch.manual_seed(config.seed)
+    random.seed(config.seed)
+    node_model: Any = KBORelGNNModel(runner._model_config(dataset, node_config))
+    shared_parameter_names = tuple(sorted(dict(node_model.named_parameters())))
+    del node_model
+
     variants: dict[str, dict[str, Any]] = {}
-    reference_hash: str | None = None
-    reference_count: int | None = None
+    shared_hash: str | None = None
     for variant in CAPACITY_COMPARISON_VARIANTS:
         variant_config = matched._variant_config(config, variant, config.seed)
         torch.manual_seed(config.seed)
         random.seed(config.seed)
-        model = KBORelGNNModel(runner._model_config(dataset, variant_config))
+        model: Any = KBORelGNNModel(runner._model_config(dataset, variant_config))
         state_hash = runner._model_state_sha256(model)
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
+        trainable_parameter_count = sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        )
+        variant_shared_hash = runner._parameter_state_sha256(
+            model, shared_parameter_names
+        )
         variants[variant] = {
             "initial_model_state_sha256": state_hash,
             "parameter_count": parameter_count,
+            "trainable_parameter_count": trainable_parameter_count,
+            "shared_parameter_initialization_sha256": variant_shared_hash,
+            "architecture": model.architecture_contract(),
         }
-        if reference_hash is None:
-            reference_hash = state_hash
-            reference_count = parameter_count
-        elif state_hash != reference_hash or parameter_count != reference_count:
+        if shared_hash is None:
+            shared_hash = variant_shared_hash
+        elif variant_shared_hash != shared_hash:
             raise ValueError(
-                "full and node_only do not share identical initialization and parameter count"
+                "full and node_only common parameters do not share identical initialization"
             )
         del model
-    assert reference_hash is not None and reference_count is not None
+    assert shared_hash is not None
     return {
         "seed": config.seed,
-        "all_variants_equal": True,
-        "initial_model_state_sha256": reference_hash,
-        "parameter_count": reference_count,
+        "comparison_basis": (
+            "same seed, split, data, optimizer-attempt budget, and identical initialization "
+            "for shared parameters; variant-specific capacity is not padded"
+        ),
+        "all_shared_parameters_equal": True,
+        "shared_parameter_tensors": len(shared_parameter_names),
+        "shared_parameter_initialization_sha256": shared_hash,
+        "variant_architectures_intentionally_distinct": True,
         "variants": variants,
     }
 
@@ -1167,6 +1201,12 @@ def _matched_variant_run(
     temporal_preflight_report: Path | None = None,
 ) -> dict[str, Any]:
     run_directory = output / run_group / variant
+    raw_variants = initialization.get("variants")
+    if not isinstance(raw_variants, Mapping) or not isinstance(
+        raw_variants.get(variant), Mapping
+    ):
+        raise ValueError(f"initialization audit has no {variant} architecture record")
+    variant_initialization = cast(Mapping[str, Any], raw_variants[variant])
     prefix = f"[{label}/{variant}] "
 
     def child_progress(message: str) -> None:
@@ -1178,7 +1218,7 @@ def _matched_variant_run(
             dataset_directory,
             run_directory,
             config,
-            initialization,
+            variant_initialization,
             child_progress,
         )
     else:
@@ -1187,7 +1227,7 @@ def _matched_variant_run(
             dataset_directory,
             run_directory,
             config,
-            initialization,
+            variant_initialization,
             child_progress,
             temporal_preflight_report=temporal_preflight_report,
         )
@@ -1196,7 +1236,7 @@ def _matched_variant_run(
         training,
         dataset,
         config,
-        initialization,
+        variant_initialization,
     )
     if temporal_preflight_report is None:
         validation = matched._reevaluate_best_on_validation(
@@ -1243,7 +1283,13 @@ def _matched_variant_run(
         "skipped_optimizer_steps": int(training["skipped_optimizer_steps"]),
         "attempted_optimizer_steps": int(training["attempted_optimizer_steps"]),
         "parameter_count": int(training["parameter_count"]),
+        "trainable_parameter_count": int(training["trainable_parameter_count"]),
+        "parameter_contract": _plain(training["parameter_contract"]),
         "initial_model_state_sha256": str(training["initial_model_state_sha256"]),
+        "shared_parameter_initialization_sha256": str(
+            variant_initialization["shared_parameter_initialization_sha256"]
+        ),
+        "architecture": _plain(variant_initialization["architecture"]),
         "graph_control": runner._graph_control_report(config),
         "route_message_normalization": config.route_message_normalization,
         "route_schedule_preset": config.route_schedule,
@@ -1508,6 +1554,14 @@ def train_kbo_full_node_comparison(
         else KBOGraphDataset(directory),
     )
     temporal_schema = dataset.manifest.get("graph_schema") == "temporal_v7"
+    if temporal_schema:
+        dataset = cast(
+            KBOGraphDataset,
+            open_kbo_graph_dataset(
+                directory,
+                label_year_ceiling=config.validation_season,
+            ),
+        )
     if temporal_schema != (temporal_preflight_report is not None):
         raise ValueError(
             "temporal_v7 comparison requires exactly one passed adaptive CUDA preflight"
@@ -1616,20 +1670,47 @@ def train_kbo_full_node_comparison(
             report["runs"] = runs
             runner._atomic_json(report_path, report)
 
-        parameter_counts = {int(run["parameter_count"]) for run in runs.values()}
-        initial_states = {
-            str(run["initial_model_state_sha256"]) for run in runs.values()
+        parameter_counts = {
+            variant: int(runs[variant]["parameter_count"])
+            for variant in CAPACITY_COMPARISON_VARIANTS
         }
-        if len(parameter_counts) != 1 or len(initial_states) != 1:
-            raise ValueError("full and node_only do not have matched initialization")
+        trainable_counts = {
+            variant: int(runs[variant]["trainable_parameter_count"])
+            for variant in CAPACITY_COMPARISON_VARIANTS
+        }
+        for variant in CAPACITY_COMPARISON_VARIANTS:
+            expected = initialization["variants"][variant]
+            if (
+                runs[variant]["initial_model_state_sha256"]
+                != expected["initial_model_state_sha256"]
+                or parameter_counts[variant] != int(expected["parameter_count"])
+                or trainable_counts[variant]
+                != int(expected["trainable_parameter_count"])
+            ):
+                raise ValueError(f"{variant} initialization or architecture lineage differs")
+        shared_hashes = {
+            str(runs[variant]["shared_parameter_initialization_sha256"])
+            for variant in CAPACITY_COMPARISON_VARIANTS
+        }
+        if shared_hashes != {
+            str(initialization["shared_parameter_initialization_sha256"])
+        }:
+            raise ValueError("full and node_only common-parameter initialization differs")
+        if parameter_counts["full"] <= parameter_counts["node_only"]:
+            raise ValueError("node_only did not remove relational trainable capacity")
         full_loss = float(runs["full"]["validation_selection_loss"])
         for run in runs.values():
             run["selection_loss_delta_vs_full"] = (
                 float(run["validation_selection_loss"]) - full_loss
             )
         report["parameter_count_audit"] = {
-            "all_variants_equal": True,
-            "parameter_count": next(iter(parameter_counts)),
+            "variant_parameter_counts": parameter_counts,
+            "variant_trainable_parameter_counts": trainable_counts,
+            "node_only_removed_parameter_count": (
+                parameter_counts["full"] - parameter_counts["node_only"]
+            ),
+            "variant_counts_intentionally_distinct": True,
+            "all_shared_parameters_identically_initialized": True,
         }
         report["budget_audit"] = _full_node_budget_audit(runs)
         report["validation_sample_count_audit"] = _validation_count_audit(runs)
@@ -1795,22 +1876,43 @@ def train_kbo_capacity_comparison(
             report["runs"]["expanded_128x3"] = expanded_runs
             runner._atomic_json(report_path, report)
 
-        baseline_parameter_count = int(baseline.runs["full"]["parameter_count"])
-        expanded_counts = {int(run["parameter_count"]) for run in expanded_runs.values()}
-        expanded_states = {
-            str(run["initial_model_state_sha256"]) for run in expanded_runs.values()
+        baseline_counts = {
+            variant: int(baseline.runs[variant]["parameter_count"])
+            for variant in CAPACITY_COMPARISON_VARIANTS
         }
-        if len(expanded_counts) != 1 or len(expanded_states) != 1:
-            raise ValueError("128x3 full and node_only do not have matched initialization")
-        expanded_parameter_count = next(iter(expanded_counts))
-        if expanded_parameter_count <= baseline_parameter_count:
-            raise ValueError("128x3 model does not have more parameters than the 64x2 baseline")
+        expanded_counts = {
+            variant: int(expanded_runs[variant]["parameter_count"])
+            for variant in CAPACITY_COMPARISON_VARIANTS
+        }
+        expanded_trainable_counts = {
+            variant: int(expanded_runs[variant]["trainable_parameter_count"])
+            for variant in CAPACITY_COMPARISON_VARIANTS
+        }
+        for variant in CAPACITY_COMPARISON_VARIANTS:
+            expected = initialization["variants"][variant]
+            if (
+                expanded_runs[variant]["initial_model_state_sha256"]
+                != expected["initial_model_state_sha256"]
+                or expanded_counts[variant] != int(expected["parameter_count"])
+            ):
+                raise ValueError(f"128x3 {variant} initialization lineage differs")
+            if expanded_counts[variant] <= baseline_counts[variant]:
+                raise ValueError(
+                    f"128x3 {variant} does not have more parameters than its 64x2 counterpart"
+                )
+        if expanded_counts["full"] <= expanded_counts["node_only"]:
+            raise ValueError("128x3 node_only did not remove relational trainable capacity")
 
         report["parameter_count_audit"] = {
-            "baseline_64x2": baseline_parameter_count,
-            "expanded_128x3": expanded_parameter_count,
-            "increase": expanded_parameter_count - baseline_parameter_count,
-            "within_capacity_variants_equal": True,
+            "baseline_64x2": baseline_counts,
+            "expanded_128x3": expanded_counts,
+            "expanded_128x3_trainable": expanded_trainable_counts,
+            "increase_by_variant": {
+                variant: expanded_counts[variant] - baseline_counts[variant]
+                for variant in CAPACITY_COMPARISON_VARIANTS
+            },
+            "variant_counts_intentionally_distinct": True,
+            "all_shared_parameters_identically_initialized_within_capacity": True,
         }
         report["budget_audit"] = _budget_audit(
             baseline.runs,

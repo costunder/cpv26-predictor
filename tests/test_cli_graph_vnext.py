@@ -292,7 +292,7 @@ def test_pair_command_forwards_production_scale_execution_options(
     config = calls[0]
     assert (config.hidden_dim, config.layers, config.heads) == (256, 3, 8)
     assert config.activation_checkpointing is True
-    assert config.compact_kbo_channels is False
+    assert config.compact_kbo_channels is True
 
 
 def test_scale_preflight_uses_production_defaults_and_writes_requested_report(
@@ -339,7 +339,7 @@ def test_scale_preflight_uses_production_defaults_and_writes_requested_report(
     assert config.batch_days == 8
     assert config.accumulate_steps == 1
     assert config.activation_checkpointing is True
-    assert config.compact_kbo_channels is False
+    assert config.compact_kbo_channels is True
     assert config.chronological is True
     assert config.train_seasons == tuple(range(2001, 2025))
     assert (config.validation_season, config.test_season) == (2025, 2026)

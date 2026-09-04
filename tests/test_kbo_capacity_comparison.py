@@ -46,9 +46,25 @@ def _training_report(
     checkpoint: Path,
     *,
     loss: float,
-    parameter_count: int = 100,
-    initial_hash: str = "baseline-initial",
+    parameter_count: int | None = None,
+    initial_hash: str | None = None,
 ) -> dict[str, Any]:
+    capacity_name = "baseline" if config.hidden_dim == 64 else "expanded"
+    variant = "node_only" if config.route_schedule == "node_only" else "full"
+    resolved_count = parameter_count if parameter_count is not None else (
+        60 if capacity_name == "baseline" and variant == "node_only"
+        else 100 if capacity_name == "baseline"
+        else 240 if variant == "node_only"
+        else 400
+    )
+    resolved_hash = initial_hash or f"{capacity_name}-{variant}-initial"
+    architecture = {
+        "variant": variant,
+        "configured_relational_layers": config.layers,
+        "effective_relational_layers": 0 if variant == "node_only" else config.layers,
+        "relational_message_passing_enabled": variant == "full",
+        "relational_parameter_count": 0 if variant == "node_only" else 40,
+    }
     history = [
         {
             "epoch": 1,
@@ -75,8 +91,16 @@ def _training_report(
         "optimizer_steps": 10,
         "skipped_optimizer_steps": 0,
         "attempted_optimizer_steps": 10,
-        "parameter_count": parameter_count,
-        "initial_model_state_sha256": initial_hash,
+        "parameter_count": resolved_count,
+        "trainable_parameter_count": resolved_count,
+        "parameter_contract": {
+            "parameter_count": resolved_count,
+            "trainable_parameter_count": resolved_count,
+            "optimizer_covers_all_trainable": True,
+            "architecture": architecture,
+        },
+        "all_epochs_trainable_parameters_received_gradient": True,
+        "initial_model_state_sha256": resolved_hash,
         "best_checkpoint_sha256": sha256_file(checkpoint),
         "last_checkpoint_sha256": sha256_file(checkpoint.with_name("last.pt")),
         "history": history,
@@ -108,8 +132,12 @@ def _write_baseline(tmp_path: Path) -> tuple[Path, Path, runner.KBOTrainingConfi
             "best_epoch": 2,
             "completed_epochs": 2,
             "attempted_optimizer_steps": 10,
-            "parameter_count": 100,
-            "initial_model_state_sha256": "baseline-initial",
+            "parameter_count": training["parameter_count"],
+            "trainable_parameter_count": training["trainable_parameter_count"],
+            "parameter_contract": training["parameter_contract"],
+            "initial_model_state_sha256": training["initial_model_state_sha256"],
+            "shared_parameter_initialization_sha256": "baseline-shared-initial",
+            "architecture": training["parameter_contract"]["architecture"],
             "route_message_normalization": config.route_message_normalization,
             "route_schedule_preset": config.route_schedule,
             "graph_control": runner._graph_control_report(config),
@@ -191,17 +219,34 @@ def _patch_protocol_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _initialization_fixture(config: runner.KBOTrainingConfig) -> dict[str, Any]:
-    initial_hash = "baseline-initial" if config.hidden_dim == 64 else "expanded-initial"
-    parameter_count = 100 if config.hidden_dim == 64 else 400
+    capacity_name = "baseline" if config.hidden_dim == 64 else "expanded"
+    counts = {
+        "full": 100 if config.hidden_dim == 64 else 400,
+        "node_only": 60 if config.hidden_dim == 64 else 240,
+    }
+    shared_hash = f"{capacity_name}-shared-initial"
     return {
         "seed": config.seed,
-        "all_variants_equal": True,
-        "initial_model_state_sha256": initial_hash,
-        "parameter_count": parameter_count,
+        "all_shared_parameters_equal": True,
+        "shared_parameter_initialization_sha256": shared_hash,
+        "variant_architectures_intentionally_distinct": True,
         "variants": {
             variant: {
-                "initial_model_state_sha256": initial_hash,
-                "parameter_count": parameter_count,
+                "initial_model_state_sha256": f"{capacity_name}-{variant}-initial",
+                "parameter_count": counts[variant],
+                "trainable_parameter_count": counts[variant],
+                "shared_parameter_initialization_sha256": shared_hash,
+                "architecture": {
+                    "variant": variant,
+                    "configured_relational_layers": config.layers,
+                    "effective_relational_layers": (
+                        0 if variant == "node_only" else config.layers
+                    ),
+                    "relational_message_passing_enabled": variant == "full",
+                    "relational_parameter_count": (
+                        0 if variant == "node_only" else counts["full"] - counts["node_only"]
+                    ),
+                },
             }
             for variant in capacity.CAPACITY_COMPARISON_VARIANTS
         },
@@ -343,8 +388,8 @@ def _patch_candidate_runs(
             config,
             checkpoint,
             loss=loss,
-            parameter_count=400,
-            initial_hash="expanded-initial",
+            parameter_count=int(initialization["parameter_count"]),
+            initial_hash=str(initialization["initial_model_state_sha256"]),
         )
         (run_directory / "training_report.json").write_text(
             json.dumps(training), encoding="utf-8"
@@ -388,7 +433,11 @@ def test_candidate_config_allows_only_the_128x3_capacity_change() -> None:
 def test_comparison_manifest_normalizes_legacy_missing_execution_fields(
     tmp_path: Path,
 ) -> None:
-    config = replace(_baseline_config(), hidden_dim=128, layers=3)
+    # A manifest without the field is a pre-compact legacy artifact, so its
+    # explicit comparison target must use the same legacy architecture.
+    config = replace(
+        _baseline_config(), hidden_dim=128, layers=3, compact_kbo_channels=False
+    )
     manifest = {
         "protocol": capacity.CAPACITY_COMPARISON_PROTOCOL,
         "training_config": asdict(config),
@@ -842,7 +891,7 @@ def test_null_selected_seed_record_is_malformed_and_never_recovered(
         )
 
 
-def test_orphan_recovery_records_top_level_drift_and_rejects_test_evaluation(
+def test_orphan_recovery_ignores_obsolete_top_level_drift_and_rejects_test_evaluation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -866,10 +915,11 @@ def test_orphan_recovery_records_top_level_drift_and_rejects_test_evaluation(
     initialization = recovered["baseline_suite_lineage"][
         "orphan_initialization_audit"
     ]
-    assert (
-        initialization["top_level_snapshot"]["hash_matches_child_consensus"]
-        is False
-    )
+    assert initialization["authority"] == "completed_variant_specific_child_records"
+    assert initialization["exact_variant_hash_and_count_match_required"] is True
+    assert initialization["historical_children"]["variants"]["full"][
+        "initial_model_state_sha256"
+    ] == "baseline-full-initial"
 
     _orphan_selected_seed(suite, base)
     checkpoint = suite / f"seed-{SEED}" / "full" / "best.pt"
@@ -893,7 +943,7 @@ def test_orphan_recovery_records_top_level_drift_and_rejects_test_evaluation(
         )
 
 
-def test_orphan_recovery_allows_current_initialization_hash_drift(
+def test_orphan_recovery_rejects_current_variant_initialization_hash_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -904,11 +954,9 @@ def test_orphan_recovery_allows_current_initialization_hash_drift(
     def drifted_initialization(dataset: Any, config: runner.KBOTrainingConfig) -> dict[str, Any]:
         value = _initialization_fixture(config)
         if config.hidden_dim == 64:
-            value["initial_model_state_sha256"] = "current-code-initial"
-            for variant in capacity.CAPACITY_COMPARISON_VARIANTS:
-                value["variants"][variant][
-                    "initial_model_state_sha256"
-                ] = "current-code-initial"
+            value["variants"]["full"][
+                "initial_model_state_sha256"
+            ] = "current-code-initial"
         return value
 
     monkeypatch.setattr(
@@ -916,25 +964,18 @@ def test_orphan_recovery_allows_current_initialization_hash_drift(
         "_two_variant_initialization_audit",
         drifted_initialization,
     )
-    _patch_orphan_checkpoint_validation(monkeypatch)
-    trained, evaluated = _patch_candidate_runs(monkeypatch)
-
-    report = capacity.train_kbo_capacity_comparison(
-        graph,
-        suite,
-        tmp_path / "capacity",
-        config=replace(base, hidden_dim=128, layers=3),
-        baseline_seed=SEED,
-        progress=lambda _: None,
-    )
-
-    audit = report["baseline_suite_lineage"]["orphan_initialization_audit"]
-    assert audit["authority"] == "completed_full_and_node_only_child_consensus"
-    assert audit["current_reproduction"]["hash_matches_child_consensus"] is False
-    assert audit["current_reproduction"][
-        "parameter_count_matches_child_consensus"
-    ] is True
-    assert trained == evaluated == ["full", "node_only"]
+    with pytest.raises(
+        ValueError,
+        match="historical baseline full initialization is incompatible",
+    ):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "capacity",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
 
 
 def test_orphan_recovery_rejects_child_initialization_mismatch(
@@ -949,7 +990,7 @@ def test_orphan_recovery_rejects_child_initialization_mismatch(
     training["initial_model_state_sha256"] = "different-child-initial"
     training_path.write_text(json.dumps(training), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="do not share historical initialization consensus"):
+    with pytest.raises(ValueError, match="node_only initialization is incompatible"):
         capacity.train_kbo_capacity_comparison(
             graph,
             suite,
@@ -973,9 +1014,8 @@ def test_orphan_recovery_rejects_current_parameter_count_drift(
     ) -> dict[str, Any]:
         value = _initialization_fixture(config)
         if config.hidden_dim == 64:
-            value["parameter_count"] = 101
-            for variant in capacity.CAPACITY_COMPARISON_VARIANTS:
-                value["variants"][variant]["parameter_count"] = 101
+            value["variants"]["full"]["parameter_count"] = 101
+            value["variants"]["full"]["trainable_parameter_count"] = 101
         return value
 
     monkeypatch.setattr(
@@ -983,7 +1023,7 @@ def test_orphan_recovery_rejects_current_parameter_count_drift(
         "_two_variant_initialization_audit",
         incompatible_initialization,
     )
-    with pytest.raises(ValueError, match="parameter count is incompatible"):
+    with pytest.raises(ValueError, match="full initialization is incompatible"):
         capacity.train_kbo_capacity_comparison(
             graph,
             suite,
@@ -1043,10 +1083,12 @@ def test_trains_only_128x3_full_and_node_only_and_reuses_baseline(
     assert tuple(report["runs"]["expanded_128x3"]) == ("full", "node_only")
     assert report["budget_audit"]["all_runs_equal"] is True
     assert report["parameter_count_audit"] == {
-        "baseline_64x2": 100,
-        "expanded_128x3": 400,
-        "increase": 300,
-        "within_capacity_variants_equal": True,
+        "baseline_64x2": {"full": 100, "node_only": 60},
+        "expanded_128x3": {"full": 400, "node_only": 240},
+        "expanded_128x3_trainable": {"full": 400, "node_only": 240},
+        "increase_by_variant": {"full": 300, "node_only": 180},
+        "variant_counts_intentionally_distinct": True,
+        "all_shared_parameters_identically_initialized_within_capacity": True,
     }
     comparison = report["validation_selection_comparison"]
     assert comparison["baseline_64x2"]["node_only_minus_full"] == pytest.approx(0.2)
@@ -1157,7 +1199,12 @@ def test_generic_full_node_runner_trains_exactly_two_conditions_and_seals_test(
     assert report["selection_split"] == "validation"
     assert report["test_used_for_training_selection_or_comparison"] is False
     assert report["smoke_test_only"] is False
-    assert report["initialization_audit"]["all_variants_equal"] is True
+    initialization = report["initialization_audit"]
+    assert initialization["all_shared_parameters_equal"] is True
+    assert (
+        initialization["variants"]["full"]["parameter_count"]
+        > initialization["variants"]["node_only"]["parameter_count"]
+    )
     assert report["budget_audit"]["all_variants_equal"] is True
     assert report["loader_lineage"]["all_non_route_settings_equal"] is True
     assert report["validation_selection_comparison"][

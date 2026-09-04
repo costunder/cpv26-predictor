@@ -21,8 +21,17 @@ class KBOGraphDatasetLike(Protocol):
     def load_day(self, day: date | str) -> GraphDay: ...
 
 
-def open_kbo_graph_dataset(directory: str | Path) -> KBOGraphDatasetLike:
-    """Dispatch without silently treating a temporal archive as a v5 cache."""
+def open_kbo_graph_dataset(
+    directory: str | Path,
+    *,
+    label_year_ceiling: int | None = None,
+) -> KBOGraphDatasetLike:
+    """Dispatch without silently treating a temporal archive as a v5 cache.
+
+    ``label_year_ceiling`` is also the raw temporal-shard decode ceiling. This
+    keeps held-out source records sealed inside persistent DataLoader workers,
+    not merely absent from their requested day list.
+    """
 
     resolved = Path(directory).expanduser().resolve()
     manifest_path = resolved / "manifest.json"
@@ -37,7 +46,15 @@ def open_kbo_graph_dataset(directory: str | Path) -> KBOGraphDatasetLike:
             raise ValueError("temporal KBO manifest version and graph_schema disagree")
         from .kbo_temporal_archive import KBOTemporalGraphDataset
 
-        return KBOTemporalGraphDataset(resolved)
+        return KBOTemporalGraphDataset(
+            resolved,
+            label_year_ceiling=label_year_ceiling,
+        )
+    # Materialized v2-v5 datasets already store one immutable graph per day.
+    # Their held-out labels/records are not decoded while loading a requested
+    # training day, so the temporal raw-shard ceiling has nothing to enforce.
+    # Keep accepting the argument because the shared runner must work across
+    # every supported archive generation.
     return KBOGraphDataset(resolved)
 
 

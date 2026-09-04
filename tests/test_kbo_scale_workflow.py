@@ -40,7 +40,7 @@ def test_completed_baseline_validator_accepts_6c4658b_schema() -> None:
 
     assert (config.hidden_dim, config.layers, config.heads) == (128, 3, 4)
     assert config.activation_checkpointing is False
-    assert config.compact_kbo_channels is False
+    assert config.compact_kbo_channels is True
     assert config.seed == lineage["seed"] == 2026
     assert runtime == baseline["runtime_signature"]
 
@@ -160,7 +160,7 @@ def test_prepare_derives_only_the_controlled_capacity_and_execution_change(
         layers=3,
         heads=8,
         activation_checkpointing=True,
-        compact_kbo_channels=False,
+        compact_kbo_channels=True,
     )
     assert actual == expected
     assert plan.preflight_report == output.parent / "candidate.scale_preflight.json"
@@ -241,7 +241,7 @@ def _plan(tmp_path: Path) -> workflow.KBOScaleTrainingPlan:
         test_season=2026,
         chronological=True,
         activation_checkpointing=True,
-        compact_kbo_channels=False,
+        compact_kbo_channels=True,
     )
     return workflow.KBOScaleTrainingPlan(
         baseline_report=baseline_path.resolve(),

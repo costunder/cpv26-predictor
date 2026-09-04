@@ -38,6 +38,13 @@ from cpv26.simulation.adapter import NEURAL_PA_OUTCOMES
 
 from .batch_transfer import move_batch, prefetch_batches
 from .optimizer_state import make_adamw, optimizer_parameter_names
+from .resource_telemetry import (
+    host_resource_inventory,
+    numeric_distribution,
+    resource_snapshot,
+    summarize_resource_interval,
+    tensor_shape_manifest,
+)
 
 CHECKPOINT_VERSION = 1
 GRAPH_CONTROL_PROTOCOL_VERSION = 1
@@ -88,8 +95,8 @@ class KBOTrainingConfig:
     workers: int = 2
     accumulate_steps: int = 1
     gradient_clip: float = 1.0
-    max_pa_per_day: int = 128
-    max_edges_per_route_per_day: int = 20000
+    max_pa_per_day: int = 0
+    max_edges_per_route_per_day: int = 0
     patience: int = 6
     seed: int = 2026
     match_weight: float = 1.0
@@ -107,10 +114,11 @@ class KBOTrainingConfig:
     chronological: bool = False
     route_message_normalization: str = "none"
     route_schedule: str = "full"
+    route_edge_chunk_size: int = 0
     graph_control: str = "intact"
     graph_control_seed: int = 2026
     activation_checkpointing: bool = False
-    compact_kbo_channels: bool = False
+    compact_kbo_channels: bool = True
 
     def __post_init__(self) -> None:
         positive = (
@@ -165,6 +173,12 @@ class KBOTrainingConfig:
             raise ValueError("route_message_normalization must be none or layer_norm")
         if self.route_schedule not in ROUTE_SCHEDULE_PRESETS:
             raise ValueError("route_schedule must be full, staged, core, or node_only")
+        if (
+            isinstance(self.route_edge_chunk_size, bool)
+            or not isinstance(self.route_edge_chunk_size, int)
+            or self.route_edge_chunk_size < 0
+        ):
+            raise ValueError("route_edge_chunk_size must be a non-negative integer")
         if self.graph_control not in GRAPH_CONTROL_MODES:
             raise ValueError("graph_control must be intact or permuted_endpoints")
         seasons = (*self.train_seasons, self.validation_season, self.test_season)
@@ -186,6 +200,7 @@ class KBOTrainingConfig:
         options["train_seasons"] = tuple(options.get("train_seasons", (2023,)))
         options.setdefault("route_message_normalization", "none")
         options.setdefault("route_schedule", "full")
+        options.setdefault("route_edge_chunk_size", 0)
         options.setdefault("graph_control", "intact")
         options.setdefault("graph_control_seed", 2026)
         options.setdefault("activation_checkpointing", False)
@@ -202,6 +217,11 @@ class _TemporalExecution:
     plan_fingerprint: str
     variant: str
     rows: tuple[Mapping[str, Any], ...]
+    loader_workers: int
+    loader_prefetch_factor: int | None
+    loader_persistent_workers: bool
+    preflight_resources: Mapping[str, Any]
+    loader_autotune: Mapping[str, Any]
 
     def split_rows(self, split: str) -> tuple[Mapping[str, Any], ...]:
         return tuple(row for row in self.rows if row["split"] == split)
@@ -214,6 +234,14 @@ class _TemporalExecution:
             "variant": self.variant,
             "train_batch_count": len(self.split_rows("train")),
             "validation_batch_count": len(self.split_rows("validation")),
+            "loader_runtime": {
+                "workers": self.loader_workers,
+                "prefetch_factor": self.loader_prefetch_factor,
+                "persistent_workers": self.loader_persistent_workers,
+                "packed_transfers": True,
+            },
+            "preflight_resource_measurements": dict(self.preflight_resources),
+            "loader_autotune": dict(self.loader_autotune),
         }
 
 
@@ -329,6 +357,28 @@ def _model_state_sha256(model: Any) -> str:
     return digest.hexdigest()
 
 
+def _parameter_state_sha256(
+    model: Any, parameter_names: Sequence[str] | None = None
+) -> str:
+    """Hash named parameter values, optionally over a declared shared subset."""
+
+    torch, _ = require_torch()
+    parameters = dict(model.named_parameters())
+    selected = tuple(sorted(parameters if parameter_names is None else parameter_names))
+    missing = sorted(set(selected).difference(parameters))
+    if missing:
+        raise ValueError(f"shared initialization names are absent from model: {missing}")
+    digest = hashlib.sha256()
+    for name in selected:
+        value = parameters[name]
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _move(value: Any, device: Any) -> Any:
     return move_batch(value, device, packed=True)
 
@@ -340,6 +390,7 @@ class _DayDataset:
         days: Sequence[date],
         *,
         expected_sample_fingerprints: Mapping[date, str] | None = None,
+        label_year_ceiling: int | None = None,
     ) -> None:
         self.directory = directory
         self.selected_days = tuple(days)
@@ -348,6 +399,7 @@ class _DayDataset:
             if expected_sample_fingerprints is None
             else dict(expected_sample_fingerprints)
         )
+        self.label_year_ceiling = label_year_ceiling
         self._dataset: KBOGraphDatasetLike | None = None
 
     def __len__(self) -> int:
@@ -355,7 +407,10 @@ class _DayDataset:
 
     def __getitem__(self, index: int) -> GraphDay:
         if self._dataset is None:
-            self._dataset = open_kbo_graph_dataset(self.directory)
+            self._dataset = open_kbo_graph_dataset(
+                self.directory,
+                label_year_ceiling=self.label_year_ceiling,
+            )
         day = self.selected_days[index]
         graph = self._dataset.load_day(day)
         if self.expected_sample_fingerprints is not None:
@@ -437,6 +492,7 @@ def _collate_loader_days(
     epoch: int,
     training: bool,
 ) -> Mapping[str, Any]:
+    started = time.perf_counter()
     batch = collate_kbo_day_graphs(
         days,
         device="cpu",
@@ -444,7 +500,12 @@ def _collate_loader_days(
         max_edges_per_route_per_day=config.max_edges_per_route_per_day,
         seed=config.seed + epoch if training else config.seed,
     )
-    return _prepare_graph_batch(batch, config)
+    prepared = dict(_prepare_graph_batch(batch, config))
+    prepared["_runtime_telemetry"] = {
+        "collate_seconds": time.perf_counter() - started,
+        "graph_days": len(days),
+    }
+    return prepared
 
 
 def _temporal_variant(config: KBOTrainingConfig) -> str:
@@ -495,6 +556,43 @@ def _validate_temporal_plan_rows(
         raise ValueError("temporal CUDA preflight must not impose a fixed day-count cap")
     if raw_plan.get("prefetch_depth") != 1:
         raise ValueError("temporal CUDA preflight must use exactly one-batch look-ahead")
+    loader_runtime = raw_plan.get("loader_runtime")
+    if not isinstance(loader_runtime, Mapping) or set(loader_runtime) != {
+        "workers",
+        "prefetch_factor",
+        "persistent_workers",
+        "loader_instances",
+        "simultaneous_worker_pools",
+        "total_worker_processes",
+        "packed_transfers",
+        "pin_memory",
+    }:
+        raise ValueError("temporal CUDA preflight loader runtime is malformed")
+    workers = _temporal_preflight_integer(
+        loader_runtime.get("workers"), context="temporal loader workers"
+    )
+    prefetch_factor = loader_runtime.get("prefetch_factor")
+    if workers == 0:
+        if prefetch_factor is not None or loader_runtime.get("persistent_workers") is not False:
+            raise ValueError("zero-worker temporal loader has invalid prefetch settings")
+    elif (
+        isinstance(prefetch_factor, bool)
+        or not isinstance(prefetch_factor, int)
+        or prefetch_factor < 1
+        or loader_runtime.get("persistent_workers") is not True
+    ):
+        raise ValueError("multiprocess temporal loader has invalid prefetch settings")
+    if (
+        loader_runtime.get("loader_instances") != 2
+        or loader_runtime.get("simultaneous_worker_pools") != (2 if workers > 0 else 0)
+        or loader_runtime.get("total_worker_processes") != workers * 2
+    ):
+        raise ValueError("temporal loader-pool residency is inconsistent")
+    if (
+        loader_runtime.get("packed_transfers") is not True
+        or loader_runtime.get("pin_memory") is not False
+    ):
+        raise ValueError("temporal loader transport contract differs")
 
     rows: list[Mapping[str, Any]] = []
     seen_dates: set[str] = set()
@@ -591,6 +689,32 @@ def _validate_temporal_plan_rows(
             raw_plan.get(name), context=f"temporal execution plan {name}"
         ) != expected:
             raise ValueError(f"temporal CUDA preflight {name} is inconsistent")
+    physical = raw_plan.get("physical_batching")
+    graph_days = [len(row["dates"]) for row in rows]
+    effective: list[int] = []
+    for split in ("train", "validation"):
+        split_rows = [row for row in rows if row["split"] == split]
+        for start in range(0, len(split_rows), config.accumulate_steps):
+            effective.append(
+                sum(
+                    len(row["dates"])
+                    for row in split_rows[start : start + config.accumulate_steps]
+                )
+            )
+    expected_physical = {
+        "unit": "graph_days",
+        "physical_graph_days": numeric_distribution(graph_days),
+        "effective_graph_days_per_optimizer_step": numeric_distribution(effective),
+        "gradient_accumulation_steps": config.accumulate_steps,
+        "data_parallel_workers": 1,
+        "formula": (
+            "effective graph-days = sum(dynamic physical graph-days in accumulation "
+            "group) * data-parallel workers"
+        ),
+        "no_graph_or_event_dropped_by_batching": True,
+    }
+    if physical != expected_physical:
+        raise ValueError("temporal physical/effective batch report is inconsistent")
     held_out = raw_plan.get("held_out_test")
     if not isinstance(held_out, Mapping) or dict(held_out) != {
         "season": config.test_season,
@@ -618,6 +742,49 @@ def _validate_temporal_measurements(
         raise ValueError("temporal selected attempt did not measure every batch")
     if report.get("all_actual_batches_measured") is not True:
         raise ValueError("temporal adaptive report did not attest every selected batch")
+    loader_autotune = measured.get("loader_autotune")
+    if not isinstance(loader_autotune, Mapping) or loader_autotune.get("status") != "measured":
+        raise ValueError("temporal selected attempt has no measured loader autotune")
+    tuned_loader = loader_autotune.get("selected")
+    planned_loader = raw_plan.get("loader_runtime")
+    if not isinstance(tuned_loader, Mapping) or not isinstance(planned_loader, Mapping):
+        raise ValueError("temporal loader autotune selection is malformed")
+    for name in (
+        "workers",
+        "prefetch_factor",
+        "persistent_workers",
+        "loader_instances",
+        "simultaneous_worker_pools",
+        "total_worker_processes",
+        "packed_transfers",
+        "pin_memory",
+    ):
+        if tuned_loader.get(name) != planned_loader.get(name):
+            raise ValueError("temporal loader autotune differs from the selected plan")
+    if tuned_loader.get("host_memory_safe") is not True:
+        raise ValueError("temporal loader autotune did not pass host-memory safety")
+    host_memory = tuned_loader.get("host_memory_safety")
+    if not isinstance(host_memory, Mapping) or host_memory.get("status") != "passed":
+        raise ValueError("temporal loader host-memory evidence is missing or unsafe")
+    resources = measured.get("resource_measurements")
+    if not isinstance(resources, Mapping):
+        raise ValueError("temporal selected attempt has no resource measurements")
+    for name in (
+        "host_inventory",
+        "interval",
+        "input_tensor_shapes_first_actual_batch",
+        "stage_seconds",
+        "throughput",
+        "steady_cuda_allocated_bytes",
+        "steady_cuda_reserved_bytes",
+        "peak_cuda_allocated_bytes",
+        "peak_cuda_reserved_bytes",
+        "physical_batching",
+    ):
+        if name not in resources:
+            raise ValueError(f"temporal resource measurements are missing {name}")
+    if resources.get("physical_batching") != raw_plan.get("physical_batching"):
+        raise ValueError("temporal resource batch report differs from the plan")
     limit = _temporal_preflight_fraction(
         report.get("max_reserved_fraction"), context="temporal memory limit"
     )
@@ -810,6 +977,13 @@ def _load_temporal_execution(
         plan_fingerprint=str(raw_plan["plan_fingerprint"]),
         variant=variant,
         rows=tuple(dict(row) for row in raw_rows),
+        loader_workers=int(raw_plan["loader_runtime"]["workers"]),
+        loader_prefetch_factor=raw_plan["loader_runtime"]["prefetch_factor"],
+        loader_persistent_workers=bool(
+            raw_plan["loader_runtime"]["persistent_workers"]
+        ),
+        preflight_resources=dict(measured["resource_measurements"]),
+        loader_autotune=dict(measured["loader_autotune"]),
     )
 
 
@@ -830,6 +1004,8 @@ def _planned_device_batches(
     batches: Any,
     rows: Sequence[Mapping[str, Any]],
     device: Any,
+    *,
+    observer: Callable[[str, Any], None] | None = None,
 ) -> Any:
     """Consume one DataLoader using the preflight's exact prefetch barriers."""
 
@@ -851,7 +1027,9 @@ def _planned_device_batches(
                     raise RuntimeError("temporal loader ended before its selected plan") from exc
                 yield _validate_temporal_batch(raw, row)
 
-        yield from prefetch_batches(checked_segment(), device, mover=_move)
+        yield from prefetch_batches(
+            checked_segment(), device, mover=_move, observer=observer
+        )
         start = end + 1
         if start < len(rows):
             # A false prefetch marker is a GPU-storage boundary, not just a
@@ -876,15 +1054,41 @@ def _loader(
     training: bool,
     packed_transfers: bool = True,
     planned_rows: Sequence[Mapping[str, Any]] | None = None,
+    workers_override: int | None = None,
+    prefetch_factor_override: int | None = None,
+    persistent_workers_override: bool | None = None,
 ) -> Any:
     torch, _ = require_torch()
+    selected_workers = config.workers if workers_override is None else workers_override
+    if (
+        isinstance(selected_workers, bool)
+        or not isinstance(selected_workers, int)
+        or selected_workers < 0
+    ):
+        raise ValueError("loader workers must be a non-negative integer")
+    selected_prefetch = (
+        2 if prefetch_factor_override is None else prefetch_factor_override
+    )
+    if selected_workers > 0 and (
+        isinstance(selected_prefetch, bool)
+        or not isinstance(selected_prefetch, int)
+        or selected_prefetch < 1
+    ):
+        raise ValueError("loader prefetch_factor must be positive when workers are used")
+    persistent = (
+        selected_workers > 0
+        if persistent_workers_override is None
+        else persistent_workers_override
+    )
+    if not isinstance(persistent, bool) or (persistent and selected_workers == 0):
+        raise ValueError("persistent workers require at least one loader worker")
     generator = torch.Generator().manual_seed(config.seed + epoch)
     ordered_days = sorted(days) if config.chronological or not training else days
     common: dict[str, Any] = {
-        "num_workers": config.workers,
+        "num_workers": selected_workers,
         # Workers start after model/CUDA initialization. Do not fork its
         # threaded runtime; keep this choice local to this DataLoader.
-        "multiprocessing_context": "spawn" if config.workers > 0 else None,
+        "multiprocessing_context": "spawn" if selected_workers > 0 else None,
         # Packed transfer creates one private pinned buffer per dtype.  Pinning
         # every collated leaf here as well would copy the same batch into pinned
         # memory twice before H2D.  The unpacked compatibility path still needs
@@ -930,13 +1134,17 @@ def _loader(
                 tuple(index_by_day[date.fromisoformat(str(value))] for value in row["dates"])
                 for row in planned_rows
             )
-            if config.workers > 0:
-                common.update(persistent_workers=True, prefetch_factor=2)
+            if selected_workers > 0:
+                common.update(
+                    persistent_workers=persistent,
+                    prefetch_factor=selected_prefetch,
+                )
             return torch.utils.data.DataLoader(
                 _DayDataset(
                     directory,
                     ordered_days,
                     expected_sample_fingerprints=fingerprint_by_day,
+                    label_year_ceiling=config.validation_season,
                 ),
                 batch_sampler=selected_batch_sampler,
                 **common,
@@ -963,15 +1171,26 @@ def _loader(
             shuffle=training and not config.chronological,
             seed=config.seed + epoch,
         )
-        if config.workers > 0:
-            common.update(persistent_workers=True, prefetch_factor=2)
+        if selected_workers > 0:
+            common.update(
+                persistent_workers=persistent,
+                prefetch_factor=selected_prefetch,
+            )
         return torch.utils.data.DataLoader(
-            _DayDataset(directory, ordered_days),
+            _DayDataset(
+                directory,
+                ordered_days,
+                label_year_ceiling=config.validation_season,
+            ),
             batch_sampler=budget_batch_sampler,
             **common,
         )
     return torch.utils.data.DataLoader(
-        _DayDataset(directory, ordered_days),
+        _DayDataset(
+            directory,
+            ordered_days,
+            label_year_ceiling=config.validation_season,
+        ),
         batch_size=config.batch_days,
         shuffle=training and not config.chronological,
         generator=generator,
@@ -1101,6 +1320,23 @@ def _counts(batch: Mapping[str, Any], *, include_boxscore: bool = False) -> dict
     return counts
 
 
+def _training_counts(
+    batch: Mapping[str, Any], *, include_boxscore: bool = False
+) -> dict[str, Any]:
+    """Keep count reductions on-device until the periodic/epoch sync boundary."""
+
+    counts: dict[str, Any] = {
+        "match": batch["match_targets"].numel(),
+        "live_hit": batch["live_hit_pa"].numel(),
+        "pa": batch["pa_targets"].numel(),
+        "run": batch["match_targets"].numel(),
+    }
+    if include_boxscore:
+        counts["box_pa"] = batch["box_pa_counts"].long().sum()
+        counts["box_pitch"] = batch["box_pitch_mask"].long().sum()
+    return counts
+
+
 def _resolved_route_schedule(
     config: KBOTrainingConfig,
 ) -> tuple[tuple[str, ...], ...] | None:
@@ -1132,6 +1368,7 @@ def _model_config(dataset: KBOGraphDatasetLike, config: KBOTrainingConfig) -> KB
         box_gradient_mode=_training_policies(config)["box_gradient_mode"],
         route_message_normalization=config.route_message_normalization,
         route_schedule=_resolved_route_schedule(config),
+        route_edge_chunk_size=config.route_edge_chunk_size,
         activation_checkpointing=config.activation_checkpointing,
         compact_kbo_channels=config.compact_kbo_channels,
     )
@@ -1159,6 +1396,66 @@ def _gradient_parameter_groups(model: Any) -> dict[str, list[Any]]:
     return {"shared": list(model.parameters())}
 
 
+def _parameter_contract(model: Any, optimizer: Any) -> dict[str, Any]:
+    """Prove that AdamW covers every trainable tensor exactly once."""
+
+    named = dict(model.named_parameters())
+    trainable = {name: parameter for name, parameter in named.items() if parameter.requires_grad}
+    optimizer_groups = optimizer_parameter_names(model, optimizer)
+    optimizer_names = [name for group in optimizer_groups for name in group]
+    missing = sorted(set(trainable).difference(optimizer_names))
+    duplicate_count = len(optimizer_names) - len(set(optimizer_names))
+    if missing or duplicate_count:
+        raise ValueError(
+            "optimizer does not cover every trainable parameter exactly once: "
+            f"missing={missing}, duplicates={duplicate_count}"
+        )
+    return {
+        "parameter_count": sum(parameter.numel() for parameter in named.values()),
+        "parameter_tensors": len(named),
+        "trainable_parameter_count": sum(
+            parameter.numel() for parameter in trainable.values()
+        ),
+        "trainable_parameter_tensors": len(trainable),
+        "optimizer_parameter_count": sum(
+            named[name].numel() for name in optimizer_names if named[name].requires_grad
+        ),
+        "optimizer_parameter_tensors": sum(
+            int(named[name].requires_grad) for name in optimizer_names
+        ),
+        "optimizer_covers_all_trainable": True,
+        "optimizer_missing_trainable_parameters": [],
+        "architecture": model.architecture_contract(),
+    }
+
+
+def _record_gradient_connections(model: Any, connected: set[str]) -> None:
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad and parameter.grad is not None:
+            connected.add(name)
+
+
+def _gradient_connectivity_report(model: Any, connected: set[str]) -> dict[str, Any]:
+    trainable = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    missing = sorted(set(trainable).difference(connected))
+    return {
+        "trainable_parameter_tensors": len(trainable),
+        "trainable_parameter_count": sum(
+            parameter.numel() for parameter in trainable.values()
+        ),
+        "gradient_connected_parameter_tensors": len(connected),
+        "gradient_connected_parameter_count": sum(
+            trainable[name].numel() for name in connected
+        ),
+        "all_trainable_parameters_received_gradient": not missing,
+        "parameters_without_gradient": missing,
+    }
+
+
 def _clip_gradient_norms(model: Any, max_norm: float) -> dict[str, Any]:
     """Detached auxiliary gradients must not rescale primary gradients via clipping."""
     torch, _ = require_torch()
@@ -1179,6 +1476,8 @@ def _policy_report(config: KBOTrainingConfig, model_config: KBORelGNNConfig) -> 
         "box_gradient_mode": model_config.box_gradient_mode,
         "route_message_normalization": config.route_message_normalization,
         "route_schedule_preset": config.route_schedule,
+        "route_edge_chunk_size": config.route_edge_chunk_size,
+        "route_edge_chunking_is_lossless": True,
         "resolved_route_schedule": (
             [list(layer) for layer in model_config.route_schedule]
             if model_config.route_schedule is not None
@@ -1212,6 +1511,33 @@ def _runtime_memory(device: Any) -> dict[str, int]:
         "peak_cuda_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
         "peak_cuda_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
     }
+
+
+def _cuda_stage_start(torch: Any, device: Any) -> Any | None:
+    if device.type != "cuda":
+        return None
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    return event
+
+
+def _cuda_stage_finish(
+    torch: Any,
+    device: Any,
+    started: Any | None,
+    destination: list[tuple[Any, Any]],
+) -> None:
+    if device.type != "cuda" or started is None:
+        return
+    finished = torch.cuda.Event(enable_timing=True)
+    finished.record()
+    destination.append((started, finished))
+
+
+def _cuda_event_seconds(events: Sequence[tuple[Any, Any]]) -> float | None:
+    if not events:
+        return None
+    return sum(float(start.elapsed_time(end)) for start, end in events) / 1000.0
 
 
 def _probability_report(targets: np.ndarray[Any, Any], values: np.ndarray[Any, Any]) -> Any:
@@ -1501,6 +1827,8 @@ def _checkpoint_state(
     history: Sequence[Mapping[str, Any]],
     initial_model_state_sha256: str,
     parameter_count: int,
+    trainable_parameter_count: int,
+    parameter_contract: Mapping[str, Any],
     temporal_execution: _TemporalExecution | None,
 ) -> dict[str, Any]:
     torch, _ = require_torch()
@@ -1513,6 +1841,8 @@ def _checkpoint_state(
         "graph_control": _graph_control_report(config),
         "initial_model_state_sha256": initial_model_state_sha256,
         "parameter_count": parameter_count,
+        "trainable_parameter_count": trainable_parameter_count,
+        "parameter_contract": dict(parameter_contract),
         "temporal_execution": (
             temporal_execution.lineage() if temporal_execution is not None else None
         ),
@@ -1595,7 +1925,13 @@ def train_kbo_relgnn(
     device, dtype, runtime = _device_and_precision(options.device, options.amp)
     directory = Path(dataset_directory).expanduser().resolve()
     output = Path(run_directory).expanduser().resolve()
-    dataset = open_kbo_graph_dataset(directory)
+    dataset = open_kbo_graph_dataset(
+        directory,
+        label_year_ceiling=options.validation_season,
+    )
+    resource_inventory = host_resource_inventory(
+        torch, device, dataset_directory=directory
+    )
     temporal_schema = dataset.manifest.get("graph_schema") == "temporal_v7"
     if temporal_schema != (temporal_preflight_report is not None):
         raise ValueError(
@@ -1635,6 +1971,8 @@ def train_kbo_relgnn(
         learning_rate=options.learning_rate,
         weight_decay=options.weight_decay,
     )
+    parameter_contract = _parameter_contract(model, optimizer)
+    trainable_parameter_count = int(parameter_contract["trainable_parameter_count"])
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and dtype == torch.float16)
     start_epoch, global_step, best_epoch, stale_epochs = 0, 0, 0, 0
     skipped_optimizer_steps = 0
@@ -1657,6 +1995,12 @@ def train_kbo_relgnn(
         saved_parameter_count = state.get("parameter_count")
         if saved_parameter_count is not None and int(saved_parameter_count) != parameter_count:
             raise ValueError("checkpoint parameter count differs from the current model")
+        if state.get("parameter_contract") != parameter_contract:
+            raise ValueError(
+                "checkpoint predates or differs from the verified trainable-parameter contract"
+            )
+        if int(state.get("trainable_parameter_count", -1)) != trainable_parameter_count:
+            raise ValueError("checkpoint trainable parameter count differs from the current model")
         expected_temporal = (
             temporal_execution.lineage() if temporal_execution is not None else None
         )
@@ -1696,8 +2040,10 @@ def train_kbo_relgnn(
                 "training_order": training_order,
                 "split_summary": split_summary,
                 "model": model_config.to_dict(),
+                "parameter_contract": parameter_contract,
                 "training_policies": _policy_report(options, model_config),
                 "runtime": runtime,
+                "resource_inventory": resource_inventory,
                 "temporal_execution": (
                     temporal_execution.lineage()
                     if temporal_execution is not None
@@ -1708,7 +2054,7 @@ def train_kbo_relgnn(
         )
     progress(
         f"RelGNN device={device} precision={runtime['precision']} "
-        f"parameters={parameter_count:,}; "
+        f"parameters={parameter_count:,}; trainable={trainable_parameter_count:,}; "
         f"train_days={len(splits['train'])}, validation_days={len(splits['validation'])}; "
         f"{options.test_season} test is not used during training"
     )
@@ -1739,31 +2085,36 @@ def train_kbo_relgnn(
         if temporal_execution is not None
         else None
     )
-    reuse_temporal_loaders = temporal_execution is not None
-    reusable_train_loader = (
-        _loader(
+    if temporal_execution is not None:
+        reusable_train_loader = _loader(
             directory,
             splits["train"],
             options,
             epoch=0,
             training=True,
             planned_rows=train_plan_rows,
+            workers_override=temporal_execution.loader_workers,
+            prefetch_factor_override=temporal_execution.loader_prefetch_factor,
+            persistent_workers_override=(
+                temporal_execution.loader_persistent_workers
+            ),
         )
-        if reuse_temporal_loaders
-        else None
-    )
-    reusable_validation_loader = (
-        _loader(
+        reusable_validation_loader = _loader(
             directory,
             splits["validation"],
             options,
             epoch=0,
             training=False,
             planned_rows=validation_plan_rows,
+            workers_override=temporal_execution.loader_workers,
+            prefetch_factor_override=temporal_execution.loader_prefetch_factor,
+            persistent_workers_override=(
+                temporal_execution.loader_persistent_workers
+            ),
         )
-        if reuse_temporal_loaders
-        else None
-    )
+    else:
+        reusable_train_loader = None
+        reusable_validation_loader = None
     for epoch in range(start_epoch, options.epochs):
         started = time.monotonic()
         model.train()
@@ -1775,53 +2126,168 @@ def train_kbo_relgnn(
             ("box_pa", "box_pitch") if model_config.include_boxscore_heads else ()
         )
         sums = dict.fromkeys(task_names, 0.0)
-        counts = dict.fromkeys(sums, 0)
-        gradient_audit = {
-            name: {"steps": 0, "clipped_steps": 0, "nonfinite_steps": 0,
-                   "max_finite_preclip_norm": 0.0}
-            for name in _gradient_parameter_groups(model)
+        counts = dict.fromkeys(task_names, 0)
+        loss_sum_tensors = {
+            name: torch.zeros((), dtype=torch.float64, device=device)
+            for name in task_names
         }
+        count_tensors = {
+            name: torch.zeros((), dtype=torch.int64, device=device)
+            for name in task_names
+        }
+        gradient_groups = _gradient_parameter_groups(model)
+        gradient_steps = dict.fromkeys(gradient_groups, 0)
+        gradient_clipped_tensors = {
+            name: torch.zeros((), dtype=torch.int64, device=device)
+            for name in gradient_groups
+        }
+        gradient_nonfinite_tensors = {
+            name: torch.zeros((), dtype=torch.int64, device=device)
+            for name in gradient_groups
+        }
+        gradient_max_tensors = {
+            name: torch.zeros((), dtype=torch.float64, device=device)
+            for name in gradient_groups
+        }
+        all_losses_finite = torch.ones((), dtype=torch.bool, device=device)
+        all_gradients_finite = torch.ones((), dtype=torch.bool, device=device)
+        gradient_connected_parameters: set[str] = set()
+        epoch_resource_start = resource_snapshot(torch, device)
+        stage_host_seconds = {
+            "source_wait_seconds": 0.0,
+            "h2d_host_dispatch_seconds": 0.0,
+            "forward_and_loss_host_seconds": 0.0,
+            "backward_host_seconds": 0.0,
+            "optimizer_host_seconds": 0.0,
+            "collate_worker_seconds": 0.0,
+            "periodic_synchronization_host_seconds": 0.0,
+            "epoch_final_synchronization_host_seconds": 0.0,
+        }
+        cuda_stage_events: dict[str, list[tuple[Any, Any]]] = {
+            "h2d": [],
+            "forward_and_loss": [],
+            "backward": [],
+            "optimizer": [],
+        }
+        first_input_shapes: dict[str, Any] | None = None
+        physical_graph_days: list[int] = []
+        effective_graph_days: list[int] = []
+        current_accumulated_graph_days = 0
+        processed_nodes = 0
+        processed_edges = 0
+        steady_allocated: list[int] = []
+        steady_reserved: list[int] = []
+        utilization_samples: list[Mapping[str, Any]] = []
+        post_fetch_step_host_seconds: list[float] = []
+
+        def observe_transfer(
+            name: str,
+            value: Any,
+            host_seconds: dict[str, float] = stage_host_seconds,
+            event_groups: dict[str, list[tuple[Any, Any]]] = cuda_stage_events,
+        ) -> None:
+            if name in host_seconds:
+                host_seconds[name] += float(value)
+            elif name == "h2d_cuda_event":
+                start_event, end_event = value
+                event_groups["h2d"].append((start_event, end_event))
+
         if device.type == "cuda" and train_plan_rows is not None:
-            source_batches = _planned_device_batches(loader, train_plan_rows, device)
+            source_batches = _planned_device_batches(
+                loader,
+                train_plan_rows,
+                device,
+                observer=observe_transfer,
+            )
         elif device.type == "cuda":
-            source_batches = prefetch_batches(loader, device, mover=_move)
+            source_batches = prefetch_batches(
+                loader,
+                device,
+                mover=_move,
+                observer=observe_transfer,
+            )
         else:
             source_batches = loader
         for index, raw_or_device_batch in enumerate(source_batches):
+            post_fetch_step_started = time.perf_counter()
             batch = (
                 raw_or_device_batch
                 if device.type == "cuda"
                 else _move(raw_or_device_batch, device)
             )
+            if first_input_shapes is None:
+                first_input_shapes = tensor_shape_manifest(batch, torch)
+            batch_telemetry = batch.get("_runtime_telemetry", {})
+            stage_host_seconds["collate_worker_seconds"] += float(
+                batch_telemetry.get("collate_seconds", 0.0)
+            )
+            graph_days = len(batch.get("day_ids", ()))
+            physical_graph_days.append(graph_days)
+            current_accumulated_graph_days += graph_days
+            processed_nodes += sum(
+                int(values.shape[0]) for values in batch["node_features"].values()
+            )
+            processed_edges += sum(int(route.num_edges) for route in batch["routes"])
+            forward_host_started = time.perf_counter()
+            forward_cuda_started = _cuda_stage_start(torch, device)
             with torch.autocast(device.type, enabled=dtype is not None, dtype=dtype):
                 losses = _losses(model(batch), batch, options)
-            if not bool(torch.isfinite(losses["loss"])):
-                raise FloatingPointError("non-finite RelGNN training loss")
+            _cuda_stage_finish(
+                torch,
+                device,
+                forward_cuda_started,
+                cuda_stage_events["forward_and_loss"],
+            )
+            stage_host_seconds["forward_and_loss_host_seconds"] += (
+                time.perf_counter() - forward_host_started
+            )
+            with torch.no_grad():
+                all_losses_finite.logical_and_(torch.isfinite(losses["loss"]))
             group_start = (index // options.accumulate_steps) * options.accumulate_steps
             group_size = min(options.accumulate_steps, len(loader) - group_start)
+            backward_host_started = time.perf_counter()
+            backward_cuda_started = _cuda_stage_start(torch, device)
             scaler.scale(losses["loss"] / group_size).backward()
-            batch_counts = _counts(batch, include_boxscore=model_config.include_boxscore_heads)
-            for name, count in batch_counts.items():
-                sums[name] += float(losses[f"{name}_loss"].detach().cpu()) * count
-                counts[name] += count
+            _cuda_stage_finish(
+                torch,
+                device,
+                backward_cuda_started,
+                cuda_stage_events["backward"],
+            )
+            stage_host_seconds["backward_host_seconds"] += (
+                time.perf_counter() - backward_host_started
+            )
+            _record_gradient_connections(model, gradient_connected_parameters)
+            batch_counts = _training_counts(
+                batch, include_boxscore=model_config.include_boxscore_heads
+            )
+            with torch.no_grad():
+                for name, count in batch_counts.items():
+                    loss_sum_tensors[name].add_(
+                        losses[f"{name}_loss"].detach().to(torch.float64) * count
+                    )
+                    count_tensors[name].add_(count)
             if (index + 1) % options.accumulate_steps == 0 or index + 1 == len(loader):
+                optimizer_host_started = time.perf_counter()
+                optimizer_cuda_started = _cuda_stage_start(torch, device)
                 scaler.unscale_(optimizer)
                 norms = _clip_gradient_norms(model, options.gradient_clip)
-                finite_gradients = True
-                for name, norm in norms.items():
-                    value = float(norm.detach().cpu())
-                    audit = gradient_audit[name]
-                    audit["steps"] += 1
-                    if math.isfinite(value):
-                        audit["clipped_steps"] += int(value > options.gradient_clip)
-                        audit["max_finite_preclip_norm"] = max(
-                            audit["max_finite_preclip_norm"], value
+                with torch.no_grad():
+                    for name, norm in norms.items():
+                        gradient_steps[name] += 1
+                        value = norm.detach().to(torch.float64)
+                        finite = torch.isfinite(value)
+                        gradient_clipped_tensors[name].add_(
+                            torch.logical_and(finite, value > options.gradient_clip)
                         )
-                    else:
-                        audit["nonfinite_steps"] += 1
-                        finite_gradients = False
-                if not scaler.is_enabled() and not finite_gradients:
-                    raise FloatingPointError("non-finite RelGNN gradients")
+                        gradient_nonfinite_tensors[name].add_(torch.logical_not(finite))
+                        gradient_max_tensors[name].copy_(
+                            torch.maximum(
+                                gradient_max_tensors[name],
+                                torch.where(finite, value, torch.zeros_like(value)),
+                            )
+                        )
+                        all_gradients_finite.logical_and_(finite)
                 previous_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
@@ -1830,14 +2296,217 @@ def train_kbo_relgnn(
                     skipped_optimizer_steps += 1
                 else:
                     global_step += 1
+                _cuda_stage_finish(
+                    torch,
+                    device,
+                    optimizer_cuda_started,
+                    cuda_stage_events["optimizer"],
+                )
+                stage_host_seconds["optimizer_host_seconds"] += (
+                    time.perf_counter() - optimizer_host_started
+                )
+                effective_graph_days.append(current_accumulated_graph_days)
+                current_accumulated_graph_days = 0
+            if device.type == "cuda":
+                steady_allocated.append(int(torch.cuda.memory_allocated(device)))
+                steady_reserved.append(int(torch.cuda.memory_reserved(device)))
             if (index + 1) % 10 == 0 or index + 1 == len(loader):
+                synchronization_started = time.perf_counter()
+                safety_and_loss = (
+                    torch.stack(
+                        (
+                            all_losses_finite.to(torch.float32),
+                            all_gradients_finite.to(torch.float32),
+                            losses["loss"].detach().to(torch.float32),
+                        )
+                    )
+                    .cpu()
+                    .tolist()
+                )
+                stage_host_seconds["periodic_synchronization_host_seconds"] += (
+                    time.perf_counter() - synchronization_started
+                )
+                if not bool(safety_and_loss[0]):
+                    raise FloatingPointError("non-finite RelGNN training loss")
+                if not scaler.is_enabled() and not bool(safety_and_loss[1]):
+                    raise FloatingPointError("non-finite RelGNN gradients")
+                utilization_samples.append(resource_snapshot(torch, device))
                 progress(
                     f"epoch {epoch + 1}/{options.epochs} batch {index + 1}/{len(loader)} "
-                    f"loss={float(losses['loss'].detach().cpu()):.4f}"
+                    f"loss={float(safety_and_loss[2]):.4f}"
                 )
+            post_fetch_step_host_seconds.append(
+                time.perf_counter() - post_fetch_step_started
+            )
             # Retain only the prefetcher's intentional current/next batch pair.
             # This also releases the last training batch before validation.
             del losses, batch, raw_or_device_batch
+        if current_accumulated_graph_days:
+            raise RuntimeError("effective batch accounting did not close at optimizer step")
+        if device.type == "cuda":
+            synchronization_started = time.perf_counter()
+            torch.cuda.synchronize(device)
+            stage_host_seconds["epoch_final_synchronization_host_seconds"] += (
+                time.perf_counter() - synchronization_started
+            )
+        aggregate_values = (
+            torch.stack(
+                tuple(loss_sum_tensors[name] for name in task_names)
+                + tuple(count_tensors[name].to(torch.float64) for name in task_names)
+                + tuple(
+                    gradient_clipped_tensors[name].to(torch.float64)
+                    for name in gradient_groups
+                )
+                + tuple(
+                    gradient_nonfinite_tensors[name].to(torch.float64)
+                    for name in gradient_groups
+                )
+                + tuple(gradient_max_tensors[name] for name in gradient_groups)
+            )
+            .cpu()
+            .tolist()
+        )
+        cursor = 0
+        for name in task_names:
+            sums[name] = float(aggregate_values[cursor])
+            cursor += 1
+        for name in task_names:
+            counts[name] = int(aggregate_values[cursor])
+            cursor += 1
+        clipped_counts: dict[str, int] = {}
+        nonfinite_counts: dict[str, int] = {}
+        maximum_norms: dict[str, float] = {}
+        for name in gradient_groups:
+            clipped_counts[name] = int(aggregate_values[cursor])
+            cursor += 1
+        for name in gradient_groups:
+            nonfinite_counts[name] = int(aggregate_values[cursor])
+            cursor += 1
+        for name in gradient_groups:
+            maximum_norms[name] = float(aggregate_values[cursor])
+            cursor += 1
+        gradient_audit = {
+            name: {
+                "steps": int(gradient_steps[name]),
+                "clipped_steps": clipped_counts[name],
+                "nonfinite_steps": nonfinite_counts[name],
+                "max_finite_preclip_norm": maximum_norms[name],
+            }
+            for name in gradient_groups
+        }
+        epoch_resource_end = resource_snapshot(torch, device)
+        interval_resources = summarize_resource_interval(
+            epoch_resource_start,
+            epoch_resource_end,
+            allowed_cpu_count=int(resource_inventory["allowed_cpu_count"]),
+        )
+        gpu_utilization_values: list[float] = []
+        gpu_memory_utilization_values: list[float] = []
+        for utilization_sample in utilization_samples:
+            raw_gpu_utilization = utilization_sample.get("gpu_utilization_percent")
+            if isinstance(raw_gpu_utilization, (int, float)):
+                gpu_utilization_values.append(float(raw_gpu_utilization))
+            raw_gpu_memory_utilization = utilization_sample.get(
+                "gpu_memory_utilization_percent"
+            )
+            if isinstance(raw_gpu_memory_utilization, (int, float)):
+                gpu_memory_utilization_values.append(
+                    float(raw_gpu_memory_utilization)
+                )
+        interval_resources["gpu_utilization_percent_periodic_mean"] = (
+            sum(gpu_utilization_values) / len(gpu_utilization_values)
+            if gpu_utilization_values
+            else None
+        )
+        interval_resources["gpu_memory_utilization_percent_periodic_mean"] = (
+            sum(gpu_memory_utilization_values) / len(gpu_memory_utilization_values)
+            if gpu_memory_utilization_values
+            else None
+        )
+        training_wall_seconds = float(interval_resources["wall_seconds"])
+        training_resource_measurements = {
+            "input_tensor_shapes_first_batch": first_input_shapes,
+            "physical_batch_size_graph_days": numeric_distribution(physical_graph_days),
+            "effective_batch_size_graph_days": numeric_distribution(effective_graph_days),
+            "gradient_accumulation_steps": options.accumulate_steps,
+            "data_parallel_workers": 1,
+            "stage_host_seconds": stage_host_seconds,
+            "stage_cuda_device_seconds": {
+                name: _cuda_event_seconds(events)
+                for name, events in cuda_stage_events.items()
+            },
+            "stage_timing_note": (
+                "CUDA event times are device durations and may overlap. Host times are "
+                "dispatch/wait durations. Collate worker time is summed across workers and "
+                "must not be added to wall time. Safety/progress device reads occur only at "
+                "10-batch or epoch-end boundaries and are reported as synchronization time."
+            ),
+            "step_timing": {
+                "post_fetch_step_host_seconds": numeric_distribution(
+                    post_fetch_step_host_seconds
+                ),
+                "end_to_end_epoch_wall_seconds": training_wall_seconds,
+                "mean_end_to_end_batch_wall_seconds": (
+                    training_wall_seconds / len(physical_graph_days)
+                    if physical_graph_days
+                    else None
+                ),
+                "note": (
+                    "post-fetch timings isolate batch compute/optimizer dispatch; the "
+                    "10-batch boundary entries also include their explicitly reported safety "
+                    "synchronization; the end-to-end mean includes loader wait, transfer, "
+                    "and compute."
+                ),
+            },
+            "resources": interval_resources,
+            "steady_cuda_allocated_bytes": numeric_distribution(steady_allocated),
+            "steady_cuda_reserved_bytes": numeric_distribution(steady_reserved),
+            "peak_cuda_allocated_bytes": (
+                int(torch.cuda.max_memory_allocated(device))
+                if device.type == "cuda"
+                else None
+            ),
+            "peak_cuda_reserved_bytes": (
+                int(torch.cuda.max_memory_reserved(device))
+                if device.type == "cuda"
+                else None
+            ),
+            "throughput": {
+                "graph_days_per_second": (
+                    sum(physical_graph_days) / training_wall_seconds
+                    if training_wall_seconds
+                    else None
+                ),
+                "nodes_per_second": (
+                    processed_nodes / training_wall_seconds
+                    if training_wall_seconds
+                    else None
+                ),
+                "edges_per_second": (
+                    processed_edges / training_wall_seconds
+                    if training_wall_seconds
+                    else None
+                ),
+            },
+        }
+        gradient_connectivity = _gradient_connectivity_report(
+            model, gradient_connected_parameters
+        )
+        # Temporal-v7 is the production graph contract and must exercise every
+        # registered trainable tensor. Older materialized fixtures can contain
+        # a schema route with no usable edge in a particular epoch; retain and
+        # report that observed-data gap without misclassifying the parameter as
+        # structurally disconnected.
+        if (
+            temporal_schema
+            and not gradient_connectivity[
+                "all_trainable_parameters_received_gradient"
+            ]
+        ):
+            raise RuntimeError(
+                "trainable parameters are disconnected from the epoch loss: "
+                + ", ".join(gradient_connectivity["parameters_without_gradient"])
+            )
         validation, _ = _evaluate_model(
             model,
             reusable_validation_loader
@@ -1866,6 +2535,8 @@ def train_kbo_relgnn(
             "train_losses": {name: sums[name] / max(1, counts[name]) for name in sums},
             "training_samples": counts,
             "gradient_audit": gradient_audit,
+            "gradient_connectivity": gradient_connectivity,
+            "resource_measurements": training_resource_measurements,
             "validation": validation,
             "elapsed_seconds": time.monotonic() - started,
             "best_epoch": best_epoch,
@@ -1897,6 +2568,8 @@ def train_kbo_relgnn(
             history=history,
             initial_model_state_sha256=initial_model_state_sha256,
             parameter_count=parameter_count,
+            trainable_parameter_count=trainable_parameter_count,
+            parameter_contract=parameter_contract,
             temporal_execution=temporal_execution,
         )
         if improved:
@@ -1915,15 +2588,57 @@ def train_kbo_relgnn(
         "status": "completed",
         "model": "role_aware_composite_relgnn",
         "runtime": runtime,
+        "resource_inventory": resource_inventory,
         "configuration": asdict(options),
         "model_config": model_config.to_dict(),
         "training_policies": policy,
         "graph_control": _graph_control_report(options),
         "initial_model_state_sha256": initial_model_state_sha256,
         "parameter_count": parameter_count,
+        "trainable_parameter_count": trainable_parameter_count,
+        "parameter_contract": parameter_contract,
+        "all_epochs_trainable_parameters_received_gradient": all(
+            row.get("gradient_connectivity", {}).get(
+                "all_trainable_parameters_received_gradient"
+            )
+            is True
+            for row in history
+        ),
         "temporal_execution": (
             temporal_execution.lineage() if temporal_execution is not None else None
         ),
+        "loader_selection": (
+            {
+                "source": "measured_temporal_cuda_preflight",
+                "workers": temporal_execution.loader_workers,
+                "prefetch_factor": temporal_execution.loader_prefetch_factor,
+                "persistent_workers": temporal_execution.loader_persistent_workers,
+                "loader_instances": 2,
+                "simultaneous_worker_pools": (
+                    2 if temporal_execution.loader_workers > 0 else 0
+                ),
+                "total_worker_processes": temporal_execution.loader_workers * 2,
+                "packed_transfers": True,
+                "autotune": dict(temporal_execution.loader_autotune),
+            }
+            if temporal_execution is not None
+            else {
+                "source": "explicit_training_configuration",
+                "workers": options.workers,
+                "prefetch_factor": 2 if options.workers else None,
+                "persistent_workers": False,
+                "loader_instances": 1,
+                "simultaneous_worker_pools": 0,
+                "total_worker_processes": options.workers,
+                "packed_transfers": True,
+            }
+        ),
+        "physical_execution": {
+            "route_edge_chunk_size_configured": options.route_edge_chunk_size,
+            "route_edge_chunking_is_lossless": True,
+            "architecture_contract": parameter_contract["architecture"],
+            "nodes_edges_events_dropped": 0,
+        },
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "training_seasons": list(options.train_seasons),
         "validation_season": options.validation_season,
@@ -1957,6 +2672,41 @@ def train_kbo_relgnn(
             else "observed_PA_at_least_one; not unconditional V26 candidates"
         ),
         "history": history,
+        "resource_measurements": {
+            "preflight": (
+                dict(temporal_execution.preflight_resources)
+                if temporal_execution is not None
+                else None
+            ),
+            "epochs": [
+                {
+                    "epoch": row["epoch"],
+                    **row["resource_measurements"],
+                }
+                for row in history
+            ],
+            "input_tensor_shapes": (
+                history[0]["resource_measurements"][
+                    "input_tensor_shapes_first_batch"
+                ]
+                if history
+                else None
+            ),
+            "physical_batch_size_graph_days": (
+                history[-1]["resource_measurements"][
+                    "physical_batch_size_graph_days"
+                ]
+                if history
+                else None
+            ),
+            "effective_batch_size_graph_days": (
+                history[-1]["resource_measurements"][
+                    "effective_batch_size_graph_days"
+                ]
+                if history
+                else None
+            ),
+        },
         **_runtime_memory(device),
     }
     _atomic_json(output / "training_report.json", report)
@@ -2066,6 +2816,21 @@ def evaluate_kbo_relgnn(
             epoch=0,
             training=False,
             planned_rows=planned_rows,
+            workers_override=(
+                temporal_execution.loader_workers
+                if temporal_execution is not None
+                else None
+            ),
+            prefetch_factor_override=(
+                temporal_execution.loader_prefetch_factor
+                if temporal_execution is not None
+                else None
+            ),
+            persistent_workers_override=(
+                temporal_execution.loader_persistent_workers
+                if temporal_execution is not None
+                else None
+            ),
         ),
         options,
         selected,

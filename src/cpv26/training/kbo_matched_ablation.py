@@ -27,7 +27,7 @@ MATCHED_GRAPH_VARIANTS = (
     "node_only",
     "rewired",
 )
-MATCHED_ABLATION_PROTOCOL_VERSION = 1
+MATCHED_ABLATION_PROTOCOL_VERSION = 2
 _LOSS_TASKS = ("match", "live_hit", "pa", "run", "box_pa", "box_pitch")
 _NAMED_CONTRASTS = (
     {
@@ -130,34 +130,56 @@ def _initialization_audit(
     seed: int,
 ) -> dict[str, Any]:
     torch, _ = require_torch()
+    node_only_config = _variant_config(base, "node_only", seed)
+    torch.manual_seed(seed)
+    random.seed(seed)
+    node_only_model: Any = KBORelGNNModel(
+        runner._model_config(dataset, node_only_config)
+    )
+    shared_parameter_names = tuple(sorted(dict(node_only_model.named_parameters())))
+    del node_only_model
+
     variants: dict[str, Any] = {}
-    reference_hash: str | None = None
-    reference_count: int | None = None
+    shared_hash: str | None = None
     for variant in MATCHED_GRAPH_VARIANTS:
         config = _variant_config(base, variant, seed)
         torch.manual_seed(seed)
         random.seed(seed)
-        model = KBORelGNNModel(runner._model_config(dataset, config))
+        model: Any = KBORelGNNModel(runner._model_config(dataset, config))
         state_hash = runner._model_state_sha256(model)
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
+        trainable_parameter_count = sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        )
+        variant_shared_hash = runner._parameter_state_sha256(
+            model, shared_parameter_names
+        )
         variants[variant] = {
             "initial_model_state_sha256": state_hash,
             "parameter_count": parameter_count,
+            "trainable_parameter_count": trainable_parameter_count,
+            "shared_parameter_initialization_sha256": variant_shared_hash,
+            "architecture": model.architecture_contract(),
         }
-        if reference_hash is None:
-            reference_hash, reference_count = state_hash, parameter_count
-        elif state_hash != reference_hash or parameter_count != reference_count:
+        if shared_hash is None:
+            shared_hash = variant_shared_hash
+        elif variant_shared_hash != shared_hash:
             raise ValueError(
-                "matched variants do not share identical initialization and parameter count: "
+                "matched variants do not share identical common-parameter initialization: "
                 f"seed={seed}, variant={variant}"
             )
         del model
-    assert reference_hash is not None and reference_count is not None
+    assert shared_hash is not None
     return {
         "seed": seed,
-        "all_variants_equal": True,
-        "initial_model_state_sha256": reference_hash,
-        "parameter_count": reference_count,
+        "comparison_basis": (
+            "same seed and identical initialization for every parameter shared by all "
+            "variants; variant-specific relational capacity is reported, not padded"
+        ),
+        "all_shared_parameters_equal": True,
+        "shared_parameter_tensors": len(shared_parameter_names),
+        "shared_parameter_initialization_sha256": shared_hash,
+        "variant_architectures_intentionally_distinct": True,
         "variants": variants,
     }
 
@@ -240,6 +262,7 @@ def _normalized_legacy_execution_fields(
     normalized = dict(_plain(value))
     normalized.setdefault("activation_checkpointing", False)
     normalized.setdefault("compact_kbo_channels", False)
+    normalized.setdefault("route_edge_chunk_size", 0)
     return normalized
 
 
@@ -312,6 +335,20 @@ def _validate_child_report(
         raise ValueError("existing matched child run exceeds the requested target epochs")
     if report.get("test_used_during_training") is not False:
         raise ValueError("matched child report does not prove that test was held out")
+    contract = report.get("parameter_contract")
+    observed_gradient_coverage = report.get(
+        "all_epochs_trainable_parameters_received_gradient"
+    )
+    if (
+        not isinstance(contract, Mapping)
+        or contract.get("optimizer_covers_all_trainable") is not True
+        or not isinstance(observed_gradient_coverage, bool)
+        or int(report.get("trainable_parameter_count", -1))
+        != int(contract.get("trainable_parameter_count", -2))
+    ):
+        raise ValueError(
+            "matched child does not prove optimizer coverage and observed gradient auditing"
+        )
 
 
 def _validate_child_checkpoint(
@@ -341,6 +378,8 @@ def _validate_child_checkpoint(
         state.get("initial_model_state_sha256")
         != initialization["initial_model_state_sha256"]
         or int(state.get("parameter_count", -1)) != int(initialization["parameter_count"])
+        or int(state.get("trainable_parameter_count", -1))
+        != int(initialization["trainable_parameter_count"])
     ):
         raise ValueError("interrupted matched child has different initialization lineage")
 
@@ -447,6 +486,8 @@ def _verify_initialization_lineage(
     if (
         training.get("initial_model_state_sha256") != expected_hash
         or int(training.get("parameter_count", -1)) != expected_count
+        or int(training.get("trainable_parameter_count", -1))
+        != int(expected["trainable_parameter_count"])
     ):
         raise ValueError("matched training report does not match the audited initialization")
     for name, report_hash_key in (
@@ -1031,7 +1072,8 @@ def analyze_matched_graph_ablations(suite_directory: str | Path) -> dict[str, An
         raise ValueError(f"matched suite is not completed: {report.get('status')!r}")
     if report.get("protocol") != "matched_from_scratch_validation_graph_ablation":
         raise ValueError("report is not a matched validation graph-ablation suite")
-    if report.get("protocol_version") not in {None, MATCHED_ABLATION_PROTOCOL_VERSION}:
+    protocol_version = report.get("protocol_version")
+    if protocol_version not in {1, MATCHED_ABLATION_PROTOCOL_VERSION}:
         raise ValueError("matched suite protocol version is unsupported")
     if report.get("selection_split") != "validation":
         raise ValueError("matched suite did not use validation for selection")
@@ -1042,6 +1084,11 @@ def analyze_matched_graph_ablations(suite_directory: str | Path) -> dict[str, An
         raise ValueError("matched suite report has no completed runs")
     runs = _plain(raw_runs)
     warnings: list[str] = []
+    if protocol_version == 1:
+        warnings.append(
+            "legacy protocol v1 has no variant-specific trainable-parameter audit; "
+            "metrics are analyzed read-only and are not promoted to the v2 capacity contract"
+        )
     for seed, per_seed in runs.items():
         if not isinstance(per_seed, Mapping):
             raise ValueError(f"matched suite seed {seed!r} is not an object")
@@ -1139,6 +1186,7 @@ def analyze_matched_graph_ablations(suite_directory: str | Path) -> dict[str, An
     return {
         "report_path": str(report_path),
         "protocol": report.get("protocol"),
+        "protocol_version": protocol_version,
         "selection_split": report.get("selection_split"),
         "held_out_test_season": report.get("held_out_test_season"),
         "test_used_for_training_selection_or_comparison": report.get(
@@ -1227,8 +1275,10 @@ def train_matched_graph_ablations(
         "limitations": [
             "node_only retains graph-derived node/role features and removes relational "
             "messages only.",
-            "node_only keeps the unused route parameters, so equal parameter count is a "
-            "budget-control property rather than proof that every parameter receives gradients.",
+            "node_only has no relation-attention, route-gate, relational updater, or "
+            "relational-normalization parameters; variant-specific parameter counts are reported.",
+            "All parameters common to the variants share identical seeded initialization; "
+            "data, split, epochs, and optimizer-attempt budgets remain matched.",
             "Validation selects checkpoints and compares variants; the held-out test is "
             "never loaded.",
             "Population standard deviation across the requested training seeds is descriptive.",
@@ -1242,6 +1292,7 @@ def train_matched_graph_ablations(
             full_loss: float | None = None
             for variant in MATCHED_GRAPH_VARIANTS:
                 config = _variant_config(base_config, variant, seed)
+                variant_initialization = initialization[str(seed)]["variants"][variant]
                 run_directory = output / f"seed-{seed}" / variant
                 prefix = f"[{seed}/{variant}] "
 
@@ -1253,7 +1304,7 @@ def train_matched_graph_ablations(
                     directory,
                     run_directory,
                     config,
-                    initialization[str(seed)],
+                    variant_initialization,
                     child_progress,
                 )
                 _verify_initialization_lineage(
@@ -1261,7 +1312,7 @@ def train_matched_graph_ablations(
                     training,
                     dataset,
                     config,
-                    initialization[str(seed)],
+                    variant_initialization,
                 )
                 validation = _reevaluate_best_on_validation(run_directory, directory, config)
                 if validation.get("split") != "validation":
@@ -1283,10 +1334,18 @@ def train_matched_graph_ablations(
                     "optimizer_steps": int(training["optimizer_steps"]),
                     "skipped_optimizer_steps": int(training["skipped_optimizer_steps"]),
                     "attempted_optimizer_steps": int(training["attempted_optimizer_steps"]),
-                    "parameter_count": initialization[str(seed)]["parameter_count"],
-                    "initial_model_state_sha256": initialization[str(seed)][
-                        "initial_model_state_sha256"
+                    "parameter_count": int(training["parameter_count"]),
+                    "trainable_parameter_count": int(
+                        training["trainable_parameter_count"]
+                    ),
+                    "parameter_contract": training["parameter_contract"],
+                    "initial_model_state_sha256": str(
+                        training["initial_model_state_sha256"]
+                    ),
+                    "shared_parameter_initialization_sha256": variant_initialization[
+                        "shared_parameter_initialization_sha256"
                     ],
+                    "architecture": variant_initialization["architecture"],
                     "graph_control": runner._graph_control_report(config),
                     "route_message_normalization": config.route_message_normalization,
                     "route_schedule_preset": config.route_schedule,

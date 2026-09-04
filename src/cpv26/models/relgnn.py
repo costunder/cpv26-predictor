@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
@@ -121,6 +121,32 @@ class RelGNNDiagnosticsObserver(Protocol):
 
         ...
 
+    def observe_attention_summary(
+        self,
+        *,
+        layer_index: int,
+        route_name: str,
+        direction: Literal["forward", "reverse"],
+        source_channel: str,
+        destination_channel: str,
+        destination_degree: Any,
+        attention_square_sum: Any,
+        attention_minimum: Any,
+        attention_maximum: Any,
+        competitive_normalized_entropy: Any,
+        message: Any,
+        route_mask: Any,
+        destination_state: Any,
+    ) -> None:
+        """Observe an exact, node-bounded summary of a chunked aggregation.
+
+        The per-destination tensors reproduce every exported attention metric
+        without retaining an ``[edges, heads]`` tensor. This keeps diagnostics
+        on the same lossless streaming path as the actual forward.
+        """
+
+        ...
+
     def observe_gates(
         self,
         *,
@@ -201,6 +227,7 @@ class _CompositeRouteAttention(ModuleBase):
         num_heads: int,
         dropout: float,
         include_publication_delay: bool,
+        edge_chunk_size: int,
     ) -> None:
         require_torch()
         super().__init__()
@@ -209,6 +236,7 @@ class _CompositeRouteAttention(ModuleBase):
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
         self.include_publication_delay = include_publication_delay
+        self.edge_chunk_size = edge_chunk_size
 
         self.forward_source = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.reverse_source = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -261,6 +289,296 @@ class _CompositeRouteAttention(ModuleBase):
 
         event = None if self.event_encoder is None else self.event_encoder(batch.event_features)
         return event, self._temporal_context(batch)
+
+    def _resolved_edge_chunk_size(self, batch: TorchAtomicRouteBatch, state: Any) -> int:
+        """Return a lossless physical edge chunk; zero selects a memory budget."""
+
+        if self.edge_chunk_size:
+            return min(batch.num_edges, self.edge_chunk_size)
+        # Bound the dominant projected edge tensors to roughly 64 MiB. This is
+        # a physical execution budget only: every edge still participates in
+        # the same destination-wise softmax and weighted aggregation.
+        element_bytes = max(1, int(state.element_size()))
+        projected_bytes = element_bytes * self.hidden_dim * 4
+        attention_bytes = 4 * self.num_heads * 4
+        bytes_per_edge = max(1, projected_bytes + attention_bytes)
+        return min(batch.num_edges, max(1, (64 * 2**20) // bytes_per_edge))
+
+    def uses_edge_chunking(self, batch: TorchAtomicRouteBatch, state: Any) -> bool:
+        return batch.num_edges > self._resolved_edge_chunk_size(batch, state)
+
+    @staticmethod
+    def _slice_batch(
+        batch: TorchAtomicRouteBatch, start: int, stop: int
+    ) -> TorchAtomicRouteBatch:
+        edge_slice = slice(start, stop)
+        return replace(
+            batch,
+            source_index=batch.source_index[edge_slice],
+            destination_index=batch.destination_index[edge_slice],
+            event_features=batch.event_features[edge_slice],
+            event_age_seconds=batch.event_age_seconds[edge_slice],
+            publication_delay_seconds=batch.publication_delay_seconds[edge_slice],
+            weights=batch.weights[edge_slice],
+        )
+
+    def _aggregate_chunked(
+        self,
+        source_state: Any,
+        destination_state: Any,
+        batch: TorchAtomicRouteBatch,
+        *,
+        reverse: bool,
+        layer_index: int,
+        source_channel: str,
+        destination_channel: str,
+        diagnostics_observer: RelGNNDiagnosticsObserver | None,
+    ) -> tuple[Any, Any]:
+        """Streaming destination softmax without dropping or renormalizing edges."""
+
+        torch, _ = require_torch()
+        destination_count = int(destination_state.shape[0])
+        if reverse:
+            source_projection = self.reverse_source
+            query_projection = self.reverse_query
+            key_projection = self.reverse_key
+            value_projection = self.reverse_value
+            output_projection = self.reverse_output
+        else:
+            source_projection = self.forward_source
+            query_projection = self.forward_query
+            key_projection = self.forward_key
+            value_projection = self.forward_value
+            output_projection = self.forward_output
+
+        chunk_size = self._resolved_edge_chunk_size(batch, source_state)
+        attention_dtype = (
+            torch.float32
+            if source_state.dtype in (torch.float16, torch.bfloat16)
+            else source_state.dtype
+        )
+        running_max = torch.full(
+            (destination_count, self.num_heads),
+            -torch.inf,
+            dtype=attention_dtype,
+            device=destination_state.device,
+        )
+        denominator = torch.zeros_like(running_max)
+        weighted_values = torch.zeros(
+            (destination_count, self.num_heads, self.head_dim),
+            dtype=attention_dtype,
+            device=destination_state.device,
+        )
+        diagnostic_degree = None
+        diagnostic_square_numerator = None
+        diagnostic_minimum_numerator = None
+        diagnostic_maximum_numerator = None
+        diagnostic_weighted_logit_numerator = None
+        if diagnostics_observer is not None:
+            diagnostic_degree = torch.zeros(
+                destination_count,
+                dtype=torch.long,
+                device=destination_state.device,
+            )
+            diagnostic_square_numerator = torch.zeros_like(running_max)
+            diagnostic_minimum_numerator = torch.full_like(running_max, torch.inf)
+            diagnostic_maximum_numerator = torch.zeros_like(running_max)
+            diagnostic_weighted_logit_numerator = torch.zeros_like(running_max)
+        value_dtype = source_state.dtype
+
+        for start in range(0, batch.num_edges, chunk_size):
+            chunk = self._slice_batch(batch, start, min(batch.num_edges, start + chunk_size))
+            source_index = chunk.destination_index if reverse else chunk.source_index
+            destination_index = chunk.source_index if reverse else chunk.destination_index
+            context = source_projection(source_state[source_index])
+            if self.event_encoder is not None:
+                context = context + self.event_encoder(chunk.event_features)
+            context = self.context_norm(context + self._temporal_context(chunk))
+            context = self.dropout(context)
+            query = query_projection(destination_state[destination_index]).reshape(
+                chunk.num_edges, self.num_heads, self.head_dim
+            )
+            key = key_projection(context).reshape(
+                chunk.num_edges, self.num_heads, self.head_dim
+            )
+            value = value_projection(context).reshape(
+                chunk.num_edges, self.num_heads, self.head_dim
+            )
+            value_dtype = value.dtype
+            scores = (query.to(attention_dtype) * key.to(attention_dtype)).sum(
+                dim=-1
+            ) / math.sqrt(self.head_dim)
+            positive_weight = chunk.weights > 0
+            weighted_scores = scores.masked_fill(
+                ~positive_weight.unsqueeze(-1), -torch.inf
+            )
+            chunk_max = scores.new_full(
+                (destination_count, self.num_heads), -torch.inf
+            )
+            chunk_max.scatter_reduce_(
+                0,
+                destination_index.unsqueeze(-1).expand(-1, self.num_heads),
+                weighted_scores,
+                reduce="amax",
+                include_self=True,
+            )
+            next_max = torch.maximum(running_max, chunk_max).detach()
+            old_scale = torch.where(
+                torch.isfinite(running_max),
+                torch.exp(running_max - next_max),
+                torch.zeros_like(running_max),
+            )
+            gathered_max = next_max[destination_index]
+            centered_scores = torch.where(
+                positive_weight.unsqueeze(-1),
+                scores - gathered_max,
+                torch.zeros_like(scores),
+            )
+            numerator = (
+                torch.exp(centered_scores)
+                * chunk.weights.to(attention_dtype).unsqueeze(-1)
+            )
+            if diagnostics_observer is not None:
+                assert diagnostic_degree is not None
+                assert diagnostic_square_numerator is not None
+                assert diagnostic_minimum_numerator is not None
+                assert diagnostic_maximum_numerator is not None
+                assert diagnostic_weighted_logit_numerator is not None
+                detached_numerator = torch.where(
+                    positive_weight.unsqueeze(-1),
+                    numerator.detach(),
+                    torch.zeros_like(numerator),
+                )
+                diagnostic_degree.index_add_(
+                    0,
+                    destination_index,
+                    positive_weight.detach().long(),
+                )
+                detached_scale = old_scale.detach()
+                diagnostic_square_numerator = torch.index_add(
+                    diagnostic_square_numerator * detached_scale.square(),
+                    0,
+                    destination_index,
+                    detached_numerator.square(),
+                )
+                safe_weight = torch.where(
+                    positive_weight,
+                    chunk.weights.detach().to(attention_dtype),
+                    torch.ones_like(chunk.weights, dtype=attention_dtype),
+                )
+                weighted_logit = scores.detach() + safe_weight.log().unsqueeze(-1)
+                diagnostic_weighted_logit_numerator = torch.index_add(
+                    diagnostic_weighted_logit_numerator * detached_scale,
+                    0,
+                    destination_index,
+                    detached_numerator * weighted_logit,
+                )
+                chunk_minimum = torch.full_like(running_max, torch.inf)
+                chunk_minimum.scatter_reduce_(
+                    0,
+                    destination_index.unsqueeze(-1).expand(-1, self.num_heads),
+                    torch.where(
+                        positive_weight.unsqueeze(-1),
+                        detached_numerator,
+                        torch.full_like(detached_numerator, torch.inf),
+                    ),
+                    reduce="amin",
+                    include_self=True,
+                )
+                rescaled_minimum = torch.where(
+                    torch.isfinite(diagnostic_minimum_numerator),
+                    diagnostic_minimum_numerator * detached_scale,
+                    diagnostic_minimum_numerator,
+                )
+                diagnostic_minimum_numerator = torch.minimum(
+                    rescaled_minimum,
+                    chunk_minimum,
+                )
+                chunk_maximum = torch.zeros_like(running_max)
+                chunk_maximum.scatter_reduce_(
+                    0,
+                    destination_index.unsqueeze(-1).expand(-1, self.num_heads),
+                    detached_numerator,
+                    reduce="amax",
+                    include_self=True,
+                )
+                diagnostic_maximum_numerator = torch.maximum(
+                    diagnostic_maximum_numerator * detached_scale,
+                    chunk_maximum,
+                )
+            denominator = torch.index_add(
+                denominator * old_scale,
+                0,
+                destination_index,
+                numerator,
+            )
+            weighted_values = torch.index_add(
+                weighted_values * old_scale.unsqueeze(-1),
+                0,
+                destination_index,
+                numerator.unsqueeze(-1) * value.to(attention_dtype),
+            )
+            running_max = next_max
+
+        normalized = weighted_values / denominator.clamp_min(
+            torch.finfo(attention_dtype).tiny
+        ).unsqueeze(-1)
+        aggregate = output_projection(
+            normalized.reshape(destination_count, self.hidden_dim).to(value_dtype)
+        )
+        route_mask = denominator.sum(dim=-1) > 0
+        if diagnostics_observer is not None:
+            assert diagnostic_degree is not None
+            assert diagnostic_square_numerator is not None
+            assert diagnostic_minimum_numerator is not None
+            assert diagnostic_maximum_numerator is not None
+            assert diagnostic_weighted_logit_numerator is not None
+            safe_denominator = denominator.detach().clamp_min(
+                torch.finfo(attention_dtype).tiny
+            )
+            attention_square_sum = (
+                diagnostic_square_numerator / safe_denominator.square()
+            )
+            attention_minimum = diagnostic_minimum_numerator / safe_denominator
+            attention_maximum = diagnostic_maximum_numerator / safe_denominator
+            entropy = torch.zeros_like(safe_denominator)
+            reached = diagnostic_degree > 0
+            if bool(reached.any()):
+                entropy[reached] = (
+                    running_max[reached]
+                    + safe_denominator[reached].log()
+                    - diagnostic_weighted_logit_numerator[reached]
+                    / safe_denominator[reached]
+                ).clamp_min(0.0)
+            competitive_normalized_entropy = torch.zeros_like(entropy)
+            competitive = diagnostic_degree > 1
+            if bool(competitive.any()):
+                competitive_normalized_entropy[competitive] = (
+                    entropy[competitive]
+                    / diagnostic_degree[competitive]
+                    .to(attention_dtype)
+                    .log()
+                    .unsqueeze(-1)
+                ).clamp(0.0, 1.0)
+            direction: Literal["forward", "reverse"] = (
+                "reverse" if reverse else "forward"
+            )
+            diagnostics_observer.observe_attention_summary(
+                layer_index=layer_index,
+                route_name=batch.route_name,
+                direction=direction,
+                source_channel=source_channel,
+                destination_channel=destination_channel,
+                destination_degree=diagnostic_degree.detach(),
+                attention_square_sum=attention_square_sum.detach(),
+                attention_minimum=attention_minimum.detach(),
+                attention_maximum=attention_maximum.detach(),
+                competitive_normalized_entropy=competitive_normalized_entropy.detach(),
+                message=aggregate.detach(),
+                route_mask=route_mask.detach(),
+                destination_state=destination_state.detach(),
+            )
+        return aggregate, route_mask
 
     def aggregate(
         self,
@@ -320,6 +638,18 @@ class _CompositeRouteAttention(ModuleBase):
                     destination_state=destination_state.detach(),
                 )
             return empty_messages, empty_mask
+
+        if self.uses_edge_chunking(batch, source_state):
+            return self._aggregate_chunked(
+                source_state,
+                destination_state,
+                batch,
+                reverse=reverse,
+                layer_index=layer_index,
+                source_channel=source_channel,
+                destination_channel=destination_channel,
+                diagnostics_observer=diagnostics_observer,
+            )
 
         context = source_projection(source_state[source_index])
         if encoded_context is None:
@@ -427,6 +757,7 @@ class _CompositeRouteLayer(ModuleBase):
         dropout: float,
         include_publication_delay: bool,
         route_message_normalization: Literal["none", "layer_norm"],
+        route_edge_chunk_size: int,
         active_update_channels: Iterable[str] | None = None,
     ) -> None:
         require_torch()
@@ -442,6 +773,7 @@ class _CompositeRouteLayer(ModuleBase):
                     num_heads=num_heads,
                     dropout=dropout,
                     include_publication_delay=include_publication_delay,
+                    edge_chunk_size=route_edge_chunk_size,
                 )
                 for route_name, feature_dim in route_feature_dims.items()
             }
@@ -471,6 +803,49 @@ class _CompositeRouteLayer(ModuleBase):
             {channel: nn.GRUCell(hidden_dim, hidden_dim) for channel in channel_names}
         )
         self.norms = nn.ModuleDict({channel: nn.LayerNorm(hidden_dim) for channel in channel_names})
+
+    def prune_to_gate_keys(self, enabled_gate_keys: frozenset[str]) -> None:
+        """Remove direction-local modules that this layer cannot execute.
+
+        This runs after construction so scheduled variants consume the full
+        variant's RNG stream while unreachable parameters never reach AdamW.
+        """
+
+        active_update_channels: set[str] = set()
+        projection_names = ("source", "query", "key", "value", "output")
+        for route_name in tuple(self.messages):
+            route = self.registry.require(route_name)
+            forward_enabled = _gate_key(route_name, False) in enabled_gate_keys
+            reverse_enabled = (
+                route.bidirectional
+                and _gate_key(route_name, True) in enabled_gate_keys
+            )
+            if not forward_enabled and not reverse_enabled:
+                del self.messages[route_name]
+                continue
+            attention = self.messages[route_name]
+            if forward_enabled:
+                active_update_channels.add(
+                    _state_channel(route.destination_type, route.destination_role)
+                )
+            else:
+                for projection_name in projection_names:
+                    delattr(attention, f"forward_{projection_name}")
+            if reverse_enabled:
+                active_update_channels.add(
+                    _state_channel(route.source_type, route.source_role)
+                )
+            else:
+                for projection_name in projection_names:
+                    delattr(attention, f"reverse_{projection_name}")
+
+        for gate_key in tuple(self.route_gates):
+            if gate_key not in enabled_gate_keys:
+                del self.route_gates[gate_key]
+        for channel in tuple(self.updaters):
+            if channel not in active_update_channels:
+                del self.updaters[channel]
+                del self.norms[channel]
 
     def _new_route_gate(self) -> Any:
         return nn.Sequential(
@@ -579,8 +954,18 @@ class _CompositeRouteLayer(ModuleBase):
 
         for batch in route_batches:
             route = self.registry.require(batch.route_name)
+            forward_gate_key = _gate_key(batch.route_name, False)
+            reverse_gate_key = _gate_key(batch.route_name, True)
+            forward_enabled = (
+                enabled_gate_keys is None or forward_gate_key in enabled_gate_keys
+            )
+            reverse_enabled = route.bidirectional and (
+                enabled_gate_keys is None or reverse_gate_key in enabled_gate_keys
+            )
+            if not forward_enabled and not reverse_enabled:
+                continue
             if batch.route_name not in self.messages:
-                raise ValueError(f"route {batch.route_name!r} is not enabled in this backbone")
+                raise ValueError(f"route {batch.route_name!r} is not enabled in this layer")
             source_channel = self._endpoint_channel(
                 route,
                 source=True,
@@ -598,20 +983,14 @@ class _CompositeRouteLayer(ModuleBase):
             if validate_routes:
                 self._validate_tensor_batch(route, batch, source_state, destination_state)
 
-            forward_gate_key = _gate_key(batch.route_name, False)
-            reverse_gate_key = _gate_key(batch.route_name, True)
-            forward_enabled = (
-                enabled_gate_keys is None or forward_gate_key in enabled_gate_keys
-            )
-            reverse_enabled = route.bidirectional and (
-                enabled_gate_keys is None or reverse_gate_key in enabled_gate_keys
-            )
-            if not forward_enabled and not reverse_enabled:
-                continue
-
             attention = self.messages[batch.route_name]
             encoded_context = None
-            if reuse_route_context and route.bidirectional and batch.num_edges:
+            if (
+                reuse_route_context
+                and route.bidirectional
+                and batch.num_edges
+                and not attention.uses_edge_chunking(batch, source_state)
+            ):
                 encoded_context = attention.encode_route_context(batch)
 
             if forward_enabled:
@@ -766,6 +1145,7 @@ class CompositeRelGNNBackbone(ModuleBase):
         registry: RouteRegistry | None = None,
         route_message_normalization: str = "none",
         route_schedule: Any = None,
+        route_edge_chunk_size: int = 0,
         activation_checkpointing: bool = False,
         active_update_channels: Iterable[str] | None = None,
     ) -> None:
@@ -788,6 +1168,12 @@ class CompositeRelGNNBackbone(ModuleBase):
             raise ValueError("route_message_normalization must be 'none' or 'layer_norm'")
         if not isinstance(activation_checkpointing, bool):
             raise ValueError("activation_checkpointing must be boolean")
+        if (
+            isinstance(route_edge_chunk_size, bool)
+            or not isinstance(route_edge_chunk_size, int)
+            or route_edge_chunk_size < 0
+        ):
+            raise ValueError("route_edge_chunk_size must be a non-negative integer")
 
         normalized_node_dims = {
             node_type: int(feature_dim) for node_type, feature_dim in configured_node_dims.items()
@@ -833,6 +1219,7 @@ class CompositeRelGNNBackbone(ModuleBase):
             Literal["none", "layer_norm"], route_message_normalization
         )
         self.activation_checkpointing = activation_checkpointing
+        self.route_edge_chunk_size = route_edge_chunk_size
         self.route_schedule = _normalize_route_schedule(
             route_schedule,
             num_layers=num_layers,
@@ -892,8 +1279,7 @@ class CompositeRelGNNBackbone(ModuleBase):
                 if node_type != "player" or player_encoder is None
             }
         )
-        self.layers = nn.ModuleList(
-            [
+        constructed_layers = [
                 _CompositeRouteLayer(
                     normalized_node_dims,
                     normalized_route_dims,
@@ -903,11 +1289,25 @@ class CompositeRelGNNBackbone(ModuleBase):
                     dropout=dropout,
                     include_publication_delay=include_publication_delay,
                     route_message_normalization=self.route_message_normalization,
+                    route_edge_chunk_size=route_edge_chunk_size,
                     active_update_channels=normalized_active_channels,
                 )
                 for _ in range(num_layers)
             ]
-        )
+        # ``node_only`` is represented by an explicitly empty gate schedule.
+        # Constructing the full layers first intentionally consumes the same RNG
+        # stream as the relational variant, so every shared encoder/head starts
+        # from identical values. The discarded layers are never registered on
+        # the model and therefore cannot become unused trainable parameters.
+        node_only = self.route_schedule is not None and not any(self.route_schedule)
+        if not node_only and self._enabled_gate_keys_by_layer is not None:
+            for layer, enabled_gate_keys in zip(
+                constructed_layers, self._enabled_gate_keys_by_layer, strict=True
+            ):
+                layer.prune_to_gate_keys(enabled_gate_keys)
+        self.layers = nn.ModuleList([] if node_only else constructed_layers)
+        if node_only:
+            self._enabled_gate_keys_by_layer = ()
         self._execution_optimization_enabled = True
 
     def _checkpointed_layer(
@@ -1117,6 +1517,10 @@ class CompositeRelGNNBackbone(ModuleBase):
             player_role_features=player_role_features,
             player_role_states=player_role_states,
         )
+        # A node-only architecture contains encoders and task heads but no
+        # relational layer. Do not even tensorize edges on this forward path.
+        if not self.layers:
+            return state
         tensor_batches = self._tensorize_routes(
             route_batches,
             cutoff_at=cutoff_at,

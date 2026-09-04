@@ -18,6 +18,7 @@ from cpv26.models.relgnn import RelGNNDiagnosticsObserver  # noqa: E402
 class _RecordingObserver:
     def __init__(self) -> None:
         self.attention_events: list[dict[str, Any]] = []
+        self.attention_summary_events: list[dict[str, Any]] = []
         self.gate_events: list[dict[str, Any]] = []
 
     @staticmethod
@@ -59,6 +60,41 @@ class _RecordingObserver:
         )
         self._record_tensors(event)
         self.attention_events.append(event)
+
+    def observe_attention_summary(
+        self,
+        *,
+        layer_index: int,
+        route_name: str,
+        direction: str,
+        source_channel: str,
+        destination_channel: str,
+        destination_degree: Any,
+        attention_square_sum: Any,
+        attention_minimum: Any,
+        attention_maximum: Any,
+        competitive_normalized_entropy: Any,
+        message: Any,
+        route_mask: Any,
+        destination_state: Any,
+    ) -> None:
+        event = dict(
+            layer_index=layer_index,
+            route_name=route_name,
+            direction=direction,
+            source_channel=source_channel,
+            destination_channel=destination_channel,
+            destination_degree=destination_degree,
+            attention_square_sum=attention_square_sum,
+            attention_minimum=attention_minimum,
+            attention_maximum=attention_maximum,
+            competitive_normalized_entropy=competitive_normalized_entropy,
+            message=message,
+            route_mask=route_mask,
+            destination_state=destination_state,
+        )
+        self._record_tensors(event)
+        self.attention_summary_events.append(event)
 
     def observe_gates(
         self,
@@ -104,6 +140,7 @@ def _model_and_batch(
     *,
     route_message_normalization: str = "none",
     route_schedule: Any = None,
+    route_edge_chunk_size: int = 0,
 ) -> tuple[Any, dict[str, Any]]:
     torch.manual_seed(83)
     model = KBORelGNNModel(
@@ -118,6 +155,8 @@ def _model_and_batch(
             pa_context_dim=0,
             route_message_normalization=route_message_normalization,
             route_schedule=route_schedule,
+            route_edge_chunk_size=route_edge_chunk_size,
+            compact_kbo_channels=True,
         )
     )
     route = TorchAtomicRouteBatch(
@@ -223,6 +262,31 @@ def test_default_observer_does_not_add_checkpoint_state() -> None:
     model, _ = _model_and_batch()
 
     assert all("diagnostic" not in name for name in model.state_dict())
+
+
+def test_chunked_observer_uses_exact_node_bounded_summary_without_dense_attention() -> None:
+    model, batch = _model_and_batch(route_edge_chunk_size=1)
+    expected = model(batch)
+    observer = _RecordingObserver()
+
+    actual = model(batch, diagnostics_observer=observer)
+
+    _assert_tree_equal(expected, actual)
+    assert observer.attention_events == []
+    assert len(observer.attention_summary_events) == 4
+    for event in observer.attention_summary_events:
+        assert event["destination_degree"].shape == (3,)
+        assert event["attention_square_sum"].shape == (3, 2)
+        assert event["attention_minimum"].shape == (3, 2)
+        assert event["attention_maximum"].shape == (3, 2)
+        assert event["competitive_normalized_entropy"].shape == (3, 2)
+        if event["direction"] == "forward":
+            assert event["destination_degree"].tolist() == [0, 1, 1]
+        else:
+            assert event["destination_degree"].tolist() == [2, 0, 0]
+            entropy = event["competitive_normalized_entropy"][0]
+            assert bool(((entropy > 0) & (entropy <= 1)).all())
+    assert len(observer.gate_events) == 4
 
 
 def test_default_message_combine_stacks_once_per_updated_channel(

@@ -51,7 +51,7 @@ def _default_training_config() -> runner.KBOTrainingConfig:
         route_schedule="full",
         graph_control="intact",
         activation_checkpointing=True,
-        compact_kbo_channels=False,
+        compact_kbo_channels=True,
     )
 
 
@@ -127,7 +127,7 @@ def _validate_strict_training_config(config: runner.KBOTrainingConfig) -> None:
         "route_message_normalization": "none",
         "route_schedule": "full",
         "graph_control": "intact",
-        "compact_kbo_channels": False,
+        "compact_kbo_channels": True,
         "activation_checkpointing": True,
     }
     differences = [
@@ -385,7 +385,10 @@ def _validate_archive(
     manifest_on_disk, manifest_sha256 = _load_json(
         manifest_path, context="temporal_v7 manifest"
     )
-    dataset = open_kbo_graph_dataset(plan.dataset_directory)
+    dataset = open_kbo_graph_dataset(
+        plan.dataset_directory,
+        label_year_ceiling=plan.config.validation_season,
+    )
     manifest = dataset.manifest
     if manifest != manifest_on_disk:
         raise ValueError("opened temporal_v7 archive disagrees with its manifest file")
@@ -407,6 +410,107 @@ def _validate_archive(
         raise ValueError("temporal_v7 workflow rejects materialized daily-snapshot archives")
     topology_lineage, topology, index_sha256 = _validate_topology_index(manifest, plan)
     return dataset, topology_lineage, topology, manifest_sha256, index_sha256
+
+
+def _validate_training_resources(
+    training: Mapping[str, Any], *, variant: str
+) -> dict[str, Any]:
+    inventory = _mapping(
+        training.get("resource_inventory"), context=f"{variant} resource_inventory"
+    )
+    for name in (
+        "logical_cpu_count",
+        "allowed_cpu_count",
+        "allowed_cpu_ids",
+        "physical_ram_bytes",
+        "available_ram_bytes_at_start",
+        "cgroup_memory_limit_bytes",
+        "visible_gpu_count",
+        "selected_gpu_name",
+        "mig_partition_visible",
+    ):
+        if name not in inventory:
+            raise ValueError(f"temporal child {variant} resource inventory lacks {name}")
+    loader = _mapping(
+        training.get("loader_selection"), context=f"{variant} loader_selection"
+    )
+    workers = _count(loader.get("workers"), context=f"{variant} loader workers")
+    prefetch = loader.get("prefetch_factor")
+    if workers == 0:
+        if prefetch is not None or loader.get("persistent_workers") is not False:
+            raise ValueError(f"temporal child {variant} zero-worker loader is malformed")
+    elif (
+        isinstance(prefetch, bool)
+        or not isinstance(prefetch, int)
+        or prefetch < 1
+        or loader.get("persistent_workers") is not True
+    ):
+        raise ValueError(f"temporal child {variant} parallel loader is malformed")
+    if loader.get("source") != "measured_temporal_cuda_preflight":
+        raise ValueError(f"temporal child {variant} did not use measured loader tuning")
+    expected_pool_contract = {
+        "loader_instances": 2,
+        "simultaneous_worker_pools": 2 if workers > 0 else 0,
+        "total_worker_processes": workers * 2,
+    }
+    if any(loader.get(name) != value for name, value in expected_pool_contract.items()):
+        raise ValueError(
+            f"temporal child {variant} loader pool residency differs from preflight"
+        )
+    autotune = _mapping(loader.get("autotune"), context=f"{variant} loader autotune")
+    if autotune.get("status") != "measured":
+        raise ValueError(f"temporal child {variant} loader autotune was not measured")
+    if training.get("all_epochs_trainable_parameters_received_gradient") is not True:
+        raise ValueError(
+            f"temporal child {variant} has trainable parameters without epoch gradients"
+        )
+
+    resources = _mapping(
+        training.get("resource_measurements"), context=f"{variant} resource measurements"
+    )
+    _mapping(resources.get("preflight"), context=f"{variant} preflight resources")
+    epochs = resources.get("epochs")
+    if not isinstance(epochs, list) or not epochs:
+        raise ValueError(f"temporal child {variant} has no epoch resource measurements")
+    required_epoch_fields = (
+        "input_tensor_shapes_first_batch",
+        "physical_batch_size_graph_days",
+        "effective_batch_size_graph_days",
+        "gradient_accumulation_steps",
+        "data_parallel_workers",
+        "stage_host_seconds",
+        "stage_cuda_device_seconds",
+        "step_timing",
+        "resources",
+        "steady_cuda_allocated_bytes",
+        "steady_cuda_reserved_bytes",
+        "peak_cuda_allocated_bytes",
+        "peak_cuda_reserved_bytes",
+        "throughput",
+    )
+    for epoch in epochs:
+        if not isinstance(epoch, Mapping) or any(
+            name not in epoch for name in required_epoch_fields
+        ):
+            raise ValueError(
+                f"temporal child {variant} epoch resource measurements are incomplete"
+            )
+    physical = _mapping(
+        training.get("physical_execution"), context=f"{variant} physical_execution"
+    )
+    if (
+        physical.get("route_edge_chunking_is_lossless") is not True
+        or physical.get("nodes_edges_events_dropped") != 0
+    ):
+        raise ValueError(f"temporal child {variant} physical execution shrank graph semantics")
+    return {
+        "resource_inventory": dict(inventory),
+        "loader_selection": dict(loader),
+        "preflight": dict(_mapping(resources["preflight"], context="preflight")),
+        "first_epoch": dict(epochs[0]),
+        "last_epoch": dict(epochs[-1]),
+        "physical_execution": dict(physical),
+    }
 
 
 def _validate_child_runtime(
@@ -461,6 +565,9 @@ def _validate_child_runtime(
             "runtime": runtime,
             "peak_cuda_allocated_bytes": allocated,
             "peak_cuda_reserved_bytes": reserved,
+            "resource_execution": _validate_training_resources(
+                training, variant=variant
+            ),
         }
     assert reference_runtime is not None
     signature = dict(_mapping(child.get("runtime_signature"), context="child runtime_signature"))
@@ -610,10 +717,12 @@ def run_kbo_temporal_workflow(
             "This workflow contains one fixed seed and cannot establish seed stability.",
             "Validation selects checkpoints and compares full versus node_only; 2026 test "
             "labels and samples remain sealed.",
-            "node_only retains graph-derived node/role features and equal unused relation "
-            "parameters; it removes relational messages only.",
-            "The temporal graph is a deterministic bounded historical subgraph, not all "
-            "twenty-five seasons resident in one GPU batch.",
+            "node_only retains graph-derived node/role features but registers no relation "
+            "layers; shared parameters are identically initialized while variant capacity "
+            "is intentionally different.",
+            "Each temporal sample uses every legally prior archived record required by "
+            "the full-history policy; dynamic batching changes transport boundaries only "
+            "and never truncates graph nodes, edges, events, or history.",
             "Raw plate-appearance relation coverage varies by season; player-game aggregate "
             "events provide the cross-era relation contract.",
             "Larger topology and higher CUDA memory use do not by themselves establish "
@@ -679,6 +788,19 @@ def run_kbo_temporal_workflow(
         selected_plan = _mapping(
             preflight.get("execution_plan"), context="temporal selected execution plan"
         )
+        selected_attempt_number = _count(
+            preflight.get("selected_attempt"),
+            context="temporal selected preflight attempt",
+            minimum=1,
+        )
+        attempts = preflight.get("attempts")
+        if (
+            not isinstance(attempts, list)
+            or selected_attempt_number > len(attempts)
+            or not isinstance(attempts[selected_attempt_number - 1], Mapping)
+        ):
+            raise ValueError("temporal selected preflight attempt evidence is malformed")
+        selected_attempt = attempts[selected_attempt_number - 1]
         report["preflight_gate"] = {
             "status": "passed",
             "report": str(plan.preflight_report_path),
@@ -692,6 +814,10 @@ def run_kbo_temporal_workflow(
             "all_actual_batches_measured": preflight.get(
                 "all_actual_batches_measured"
             ),
+            "loader_runtime": selected_plan.get("loader_runtime"),
+            "physical_batching": selected_plan.get("physical_batching"),
+            "loader_autotune": selected_attempt.get("loader_autotune"),
+            "resource_measurements": selected_attempt.get("resource_measurements"),
         }
         runner._atomic_json(report_path, report)
         failed_stage = "full_node_training"

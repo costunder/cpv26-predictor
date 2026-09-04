@@ -2,9 +2,10 @@
 
 Version five and six materialize one overlapping graph file for every cutoff
 day.  This module keeps each source-record version once, stores labels as
-references, and derives a deterministic target-centred temporal subgraph when
-a day is loaded.  Current-day results and participants are not consulted while
-the topology is selected.
+references, and derives a deterministic full-history temporal graph when a day
+is loaded.  Every prior event that is available and valid at the cutoff is
+preserved.  Current-day results and participants are not consulted while the
+topology is selected.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -39,9 +40,7 @@ from .kbo_graph_dataset import (
     _box_history_id,
     _box_label_audit,
     _common_box_records,
-    _complete_legacy_box_values,
     _History,
-    _json_default,
     _json_sha256,
     _label_boxes,
     _label_records,
@@ -53,10 +52,15 @@ from .kbo_graph_dataset import (
     _target_coverage,
     _team_features,
 )
+from .kbo_temporal_columnar import (
+    ColumnarRecordSelection,
+    MMapTemporalRecordStore,
+    write_columnar_record_store,
+)
 
 TEMPORAL_GRAPH_DATASET_VERSION = 7
 TEMPORAL_GRAPH_SCHEMA = "temporal_v7"
-TEMPORAL_MATERIALIZATION_CONTRACT_VERSION = 3
+TEMPORAL_MATERIALIZATION_CONTRACT_VERSION = 6
 TEMPORAL_SAMPLE_INDEX_SCHEMA_VERSION = 2
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -135,30 +139,28 @@ _ROUTE_ARRAY_FIELDS = (
 
 @dataclass(frozen=True, slots=True)
 class TemporalSamplingPolicy:
-    """Bound a deterministic target-centred history expansion."""
+    """Declare lossless temporal history and feature-only recency scaling.
 
-    lookback_days: int = 365
-    max_games_per_seed_team: int = 160
-    max_games_per_player: int = 48
-    max_historical_games_total: int = 160
+    The public name is retained because existing workflow lineage calls this a
+    sampling policy. It does not sample, cap, or expire graph history.
+    """
+
+    history_scope: str = "all_prior_records"
+    recency_reference_days: int = 365
 
     def __post_init__(self) -> None:
-        for name in (
-            "lookback_days",
-            "max_games_per_seed_team",
-            "max_games_per_player",
-            "max_historical_games_total",
-        ):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError(f"{name} must be a positive integer")
+        if self.history_scope != "all_prior_records":
+            raise ValueError("history_scope must be 'all_prior_records'")
+        value = self.recency_reference_days
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("recency_reference_days must be a positive integer")
 
     @property
     def fingerprint(self) -> str:
-        return _json_sha256({"version": 1, **asdict(self)})
+        return _json_sha256({"version": 2, **asdict(self)})
 
-    def to_dict(self) -> dict[str, int]:
-        return cast(dict[str, int], asdict(self))
+    def to_dict(self) -> dict[str, int | str]:
+        return cast(dict[str, int | str], asdict(self))
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,9 +174,104 @@ class _QueryDescriptor:
 @dataclass(frozen=True, slots=True)
 class _SelectedTopology:
     historical_games: tuple[str, ...]
-    game_records: Mapping[str, _Record]
-    active_plate_appearances: tuple[_Record, ...]
-    active_records: tuple[_Record, ...]
+    game_records: Mapping[str, Any]
+    active_plate_appearances: Sequence[Any]
+
+
+class _MMapHistory(_History):
+    """Incremental aggregate state driven by a memory-mapped cutoff prefix.
+
+    The worker does not own the source-version collection.  It owns only one
+    integer per logical record key plus the aggregates required by the current
+    graph.  Rewinds replay the compact key-change stream; forward sample access
+    consumes only the newly visible prefix.
+    """
+
+    def __init__(self, store: MMapTemporalRecordStore) -> None:
+        self.store = store
+        self._last_day: date | None = None
+        self._prefix_position = 0
+        self._active_record_by_key = np.full(store.key_count, -1, dtype=np.int64)
+        self._active_pa_mask = np.zeros(store.record_count, dtype=np.bool_)
+        super().__init__(
+            [],
+            1,
+            graph_schema="vnext",
+            knowledge_cutoff_uses_ingested_at=True,
+        )
+
+    def _rewind(self) -> None:
+        self._last_day = None
+        self._prefix_position = 0
+        self._active_record_by_key.fill(-1)
+        self._active_pa_mask.fill(False)
+        # Reinitialize aggregate dictionaries without ever constructing source
+        # versions or a Python schedule.
+        super().__init__(
+            [],
+            1,
+            graph_schema="vnext",
+            knowledge_cutoff_uses_ingested_at=True,
+        )
+
+    def advance(self, day: date) -> None:
+        if self._last_day is not None and day < self._last_day:
+            self._rewind()
+        stop = self.store.schedule_stop(day)
+        changed = self.store.changed_keys(self._prefix_position, stop)
+        for raw_key_index in changed:
+            key_index = int(raw_key_index)
+            previous = int(self._active_record_by_key[key_index])
+            selected = self.store.select_record(key_index, day)
+            if previous == selected:
+                continue
+            if previous >= 0:
+                previous_ref = self.store.ref(previous)
+                self._update(previous_ref, False)  # type: ignore[arg-type]
+                if previous_ref.kind == "pa":
+                    self._active_pa_mask[previous] = False
+            if selected >= 0:
+                selected_ref = self.store.ref(selected)
+                self._update(selected_ref, True)  # type: ignore[arg-type]
+                if selected_ref.kind == "pa":
+                    self._active_pa_mask[selected] = True
+            self._active_record_by_key[key_index] = selected
+        for group in sorted(self.changed_box_groups):
+            for record in self.box_applied.pop(group, ()):
+                self._update_box(record, False)
+            inputs = self.box_inputs.get(group, {})
+            if inputs:
+                applied = _common_box_records(list(inputs.values()), group[2])
+                for record in applied:
+                    self._update_box(record, True)
+                self.box_applied[group] = applied
+            else:
+                self.box_inputs.pop(group, None)
+        self.changed_box_groups.clear()
+        self._prefix_position = stop
+        self._last_day = day
+
+    def active_plate_appearances(self) -> ColumnarRecordSelection:
+        indices = np.flatnonzero(self._active_pa_mask)
+        if not len(indices):
+            return ColumnarRecordSelection(self.store, indices)
+        active_games = set(self.games)
+        selected = [
+            int(index)
+            for index in indices
+            if str(self.store.ref(int(index)).data["game_id"]) in active_games
+        ]
+        selected.sort(
+            key=lambda index: (
+                int(self.store.arrays["event_us"][index]),
+                self.store.strings["row_id"][index],
+            )
+        )
+        return ColumnarRecordSelection(self.store, np.asarray(selected, dtype=np.int64))
+
+    @property
+    def raw_python_record_residency(self) -> int:
+        return 0
 
 
 class _TemporalGraphDay(GraphDay):
@@ -211,16 +308,40 @@ class KBOTemporalGraphDataset:
         self.label_year_ceiling = label_year_ceiling
         self.policy = TemporalSamplingPolicy(**self.manifest["sampling_policy"])
         self._entries = {entry["day"]: entry for entry in self.manifest["days"]}
-        self._record_shards = _index_shards(self.manifest["record_shards"])
         self._label_shards = _index_shards(self.manifest["label_shards"])
         self._query_shards = _index_shards(self.manifest["query_shards"])
-        self._records_cache: dict[int, tuple[_Record, ...]] = {}
-        self._labels_cache: dict[int, dict[str, tuple[str, ...]]] = {}
+        self._record_store = MMapTemporalRecordStore(
+            self.directory,
+            self.manifest["record_store"],
+            label_year_ceiling=label_year_ceiling,
+        )
+        self._labels_cache: dict[int, dict[str, tuple[int, ...]]] = {}
         self._queries_cache: dict[int, dict[str, tuple[_QueryDescriptor, ...]]] = {}
-        self._stream_year: int | None = None
-        self._stream_last_day: date | None = None
-        self._stream_history: _History | None = None
-        self._stream_record_lookup: dict[str, _Record] = {}
+        self._stream_history: _MMapHistory | None = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize only metadata; worker processes reopen shared read-only maps."""
+
+        state = dict(self.__dict__)
+        state["_record_store_attestation"] = self._record_store.file_attestation
+        state.pop("_record_store", None)
+        state["_stream_history"] = None
+        state["_labels_cache"] = {}
+        state["_queries_cache"] = {}
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        attestation = state.pop("_record_store_attestation", None)
+        if not isinstance(attestation, Mapping):
+            raise ValueError("temporal worker is missing its parent-verified file attestation")
+        self.__dict__.update(state)
+        self._record_store = MMapTemporalRecordStore(
+            self.directory,
+            self.manifest["record_store"],
+            label_year_ceiling=self.label_year_ceiling,
+            trusted_file_attestation=attestation,
+        )
+        self._stream_history = None
 
     def days(self) -> tuple[date, ...]:
         parsed = tuple(date.fromisoformat(key) for key in sorted(self._entries))
@@ -240,96 +361,46 @@ class KBOTemporalGraphDataset:
                 f"labels after {self.label_year_ceiling} are sealed by label_year_ceiling"
             )
 
-        history, lookup = self._history_for_day(selected_day)
+        history = self._history_for_day(selected_day)
 
         # This ordering is a security boundary: descriptors are score/participant
         # free, and topology is frozen before any current-day label is resolved.
         descriptors = self._queries_for_year(selected_day.year).get(key, ())
         if not descriptors:
             raise ValueError(f"temporal archive has no query descriptor for {key}")
-        topology = _select_topology(history, descriptors, self.policy)
-        label_keys = self._labels_for_year(selected_day.year).get(key, ())
-        try:
-            labels = tuple(lookup[label_key] for label_key in label_keys)
-        except KeyError as exc:
-            raise ValueError(
-                f"label reference is missing from the immutable record shards: {exc}"
-            ) from exc
+        topology = _select_topology(history)
+        label_indices = self._labels_for_year(selected_day.year).get(key, ())
+        labels = tuple(self._record_store.ref(index) for index in label_indices)
         graph = _materialize_graph(
             selected_day, history, topology, descriptors, labels, self.policy
         )
         _validate_temporal_graph(graph)
         return graph
 
-    def _history_for_day(self, day: date) -> tuple[_History, dict[str, _Record]]:
-        """Reuse one monotonic history cursor per process and calendar year."""
+    def _history_for_day(self, day: date) -> _MMapHistory:
+        """Advance one compact cutoff-prefix cursor per persistent worker."""
 
-        rebuild = (
-            self._stream_history is None
-            or self._stream_year != day.year
-            or (self._stream_last_day is not None and day < self._stream_last_day)
-        )
-        if rebuild:
-            records, lookup = self._records_for_stream_year(day.year)
-            self._stream_history = _History(records, self.policy.lookback_days, graph_schema="v5")
-            self._stream_record_lookup = lookup
-            self._stream_year = day.year
-            self._stream_last_day = None
-        assert self._stream_history is not None
+        if self._stream_history is None:
+            self._stream_history = _MMapHistory(self._record_store)
         self._stream_history.advance(day)
-        self._stream_last_day = day
-        return self._stream_history, self._stream_record_lookup
+        return self._stream_history
 
-    def _records_for_stream_year(self, season: int) -> tuple[list[_Record], dict[str, _Record]]:
-        year_start = date(season, 1, 1)
-        year_end = date(season, 12, 31)
-        earliest = year_start - timedelta(days=self.policy.lookback_days)
-        records: list[_Record] = []
-        lookup: dict[str, _Record] = {}
-        for shard_year in range(earliest.year, season + 1):
-            for record in self._records_for_year(shard_year):
-                if earliest <= record.day <= year_end:
-                    records.append(record)
-                    lookup[_record_key(record)] = record
-        records.sort(key=lambda record: (record.kind, record.entity, record.rank))
-        return records, lookup
-
-    def _records_for_year(self, season: int) -> tuple[_Record, ...]:
-        cached = self._records_cache.get(season)
-        if cached is not None:
-            return cached
-        entry = self._record_shards.get(season)
-        if entry is None:
-            self._records_cache[season] = ()
-            return ()
-        arrays = _read_shard(self.directory, entry)
-        records = _decode_record_shard(arrays)
-        self._records_cache[season] = records
-        # Persistent workers only need the current and lookback shards.  Bound
-        # decoded Python objects so each worker does not accumulate 25 seasons.
-        while len(self._records_cache) > 3:
-            oldest = next(iter(self._records_cache))
-            if oldest == season:
-                break
-            del self._records_cache[oldest]
-        return records
-
-    def _labels_for_year(self, season: int) -> dict[str, tuple[str, ...]]:
+    def _labels_for_year(self, season: int) -> dict[str, tuple[int, ...]]:
         cached = self._labels_cache.get(season)
         if cached is not None:
             return cached
         entry = self._label_shards.get(season)
         if entry is None:
-            result: dict[str, tuple[str, ...]] = {}
+            result: dict[str, tuple[int, ...]] = {}
         else:
             arrays = _read_shard(self.directory, entry)
             days = _string_column(arrays, "day")
-            keys = _string_column(arrays, "record_key")
-            if len(days) != len(keys):
+            indices = np.asarray(arrays.get("record_index"), dtype=np.int64)
+            if indices.shape != (len(days),):
                 raise ValueError("label shard columns disagree")
-            grouped: dict[str, list[str]] = defaultdict(list)
-            for day, record_key in zip(days, keys, strict=True):
-                grouped[day].append(record_key)
+            grouped: dict[str, list[int]] = defaultdict(list)
+            for day, record_index in zip(days, indices, strict=True):
+                grouped[day].append(int(record_index))
             result = {day: tuple(values) for day, values in grouped.items()}
         self._labels_cache[season] = result
         return result
@@ -414,17 +485,15 @@ def build_kbo_temporal_archive(
     )
     if not selected_days:
         raise ValueError("no final KBO games in the requested temporal archive range")
-    earliest_record_day = selected_days[0] - timedelta(days=sampling.lookback_days)
     latest_record_day = selected_days[-1]
-    stored_records = tuple(
-        record for record in records if earliest_record_day <= record.day <= latest_record_day
-    )
+    stored_records = tuple(record for record in records if record.day <= latest_record_day)
     record_keys = [_record_key(record) for record in stored_records]
     if len(record_keys) != len(set(record_keys)):
         raise ValueError("source record versions do not have unique immutable keys")
     stored_key_set = set(record_keys)
 
-    labels: dict[int, list[tuple[str, str]]] = defaultdict(list)
+    record_index_by_key = {key: index for index, key in enumerate(record_keys)}
+    labels: dict[int, list[tuple[str, int]]] = defaultdict(list)
     queries: dict[int, list[_QueryDescriptor]] = defaultdict(list)
     day_entries: list[dict[str, Any]] = []
     for day in selected_days:
@@ -432,7 +501,9 @@ def build_kbo_temporal_archive(
         references = [_record_key(record) for record in rows]
         if not set(references) <= stored_key_set:
             raise ValueError("selected label is absent from the stored record interval")
-        labels[day.year].extend((day.isoformat(), reference) for reference in references)
+        labels[day.year].extend(
+            (day.isoformat(), record_index_by_key[reference]) for reference in references
+        )
         game_rows = [record for record in rows if record.kind == "game"]
         for record in game_rows:
             data = record.data
@@ -503,12 +574,12 @@ def build_kbo_temporal_archive(
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.building-", dir=output.parent))
     try:
-        record_entries = _write_record_shards(staging, stored_records)
+        record_store = write_columnar_record_store(staging, stored_records, record_keys)
         label_entries = _write_label_shards(staging, labels)
         query_entries = _write_query_shards(staging, queries)
         artifact_fingerprint = _artifact_fingerprint(
             build_fingerprint=build_fingerprint,
-            record_shards=record_entries,
+            record_store=record_store,
             label_shards=label_entries,
             query_shards=query_entries,
         )
@@ -534,7 +605,28 @@ def build_kbo_temporal_archive(
             "source_fingerprint": source_fingerprint,
             "source_provenance": provenance,
             "record_count": len(stored_records),
-            "record_shards": record_entries,
+            "history_coverage": {
+                "scope": "all_prior_records",
+                "eligible_source_records": len(stored_records),
+                "stored_source_records": len(stored_records),
+                "stored_fraction": 1.0,
+                "semantic_reduction": False,
+            },
+            "streaming_policy": {
+                "record_storage": "archive_global_columnar_numpy_npy",
+                "record_encoding": "pickle_free_utf8_blob_and_numeric_arrays",
+                "read_mode": "read_only_mmap_shared_page_cache",
+                "decode": "changed_records_only_without_persistent_source_dicts",
+                "history_cursor": "cutoff_prefix_key_change_stream",
+                "rewind": "replay_compact_key_changes_without_raw_history_decode",
+                "materialized_graph_lifetime": "physical_batch_scoped",
+                "raw_record_residency": "zero_decoded_source_records_per_worker",
+                "worker_memory_sharing": True,
+                "dense_graph_materialization": "once_per_sample_access",
+                "per_day_full_history_cache": False,
+                "production_ready": True,
+            },
+            "record_store": record_store,
             "label_shards": label_entries,
             "query_shards": query_entries,
             "days": day_entries,
@@ -562,12 +654,13 @@ def build_kbo_temporal_archive(
             "match_target_classes": ("away_win", "draw", "home_win"),
             "archive_policy": {
                 "primitive_storage": (
-                    "each selected source-record version occurs in one season shard"
+                    "each selected source-record version occurs once in global mmap columns"
                 ),
-                "labels": "season shards contain immutable record references only",
+                "labels": "season shards contain immutable global record indices only",
                 "query_topology": "game_id/home_team_id/away_team_id only",
                 "history": (
-                    "event day before cutoff; available and valid at cutoff; bounded lookback"
+                    "all event days before cutoff; available and valid at cutoff; no sampling, "
+                    "time window, node cap, or edge cap"
                 ),
                 "current_game": "exactly two team-game edges; no current participant or PA edges",
                 "same_day": "current labels are resolved only after historical topology selection",
@@ -657,64 +750,23 @@ def build_kbo_temporal_sample_index(
 
 def _select_topology(
     history: _History,
-    descriptors: Sequence[_QueryDescriptor],
-    policy: TemporalSamplingPolicy,
 ) -> _SelectedTopology:
-    active = tuple(history.active.values())
     game_records = dict(history.games)
-    seed_teams = {
-        team
-        for descriptor in descriptors
-        for team in (descriptor.home_team_id, descriptor.away_team_id)
-    }
-    games_by_team: dict[str, list[str]] = defaultdict(list)
-    for game_id, record in game_records.items():
-        games_by_team[str(record.data["home_team_id"])].append(game_id)
-        games_by_team[str(record.data["away_team_id"])].append(game_id)
-
-    def newest(game_ids: Sequence[str], limit: int) -> tuple[str, ...]:
-        return tuple(
-            sorted(
-                set(game_ids),
-                key=lambda game_id: (game_records[game_id].event_at, game_id),
-                reverse=True,
-            )[:limit]
+    if isinstance(history, _MMapHistory):
+        active_pa: Sequence[Any] = history.active_plate_appearances()
+    else:
+        active_pa_rows: list[_Record] = []
+        for record in history.active.values():
+            data = record.data
+            game_id = str(data.get("game_id", ""))
+            if game_id in game_records and record.kind == "pa":
+                active_pa_rows.append(record)
+        active_pa = tuple(
+            sorted(active_pa_rows, key=lambda record: (record.event_at, record.row_id))
         )
-
-    seed_games = {
-        game_id
-        for team in sorted(seed_teams)
-        for game_id in newest(games_by_team.get(team, ()), policy.max_games_per_seed_team)
-    }
-    participants_by_game: dict[str, set[str]] = defaultdict(set)
-    games_by_player: dict[str, set[str]] = defaultdict(set)
-    active_pa: list[_Record] = []
-    for record in active:
-        data = record.data
-        game_id = str(data.get("game_id", ""))
-        if game_id not in game_records:
-            continue
-        players: tuple[str, ...]
-        if record.kind == "pa":
-            active_pa.append(record)
-            players = (str(data["batter_id"]), str(data["pitcher_id"]))
-        elif record.kind.startswith("box_"):
-            players = (_box_history_id(data),)
-        else:
-            continue
-        participants_by_game[game_id].update(players)
-        for player in players:
-            games_by_player[player].add(game_id)
-    selected_players = {
-        player for game_id in seed_games for player in participants_by_game.get(game_id, ())
-    }
-    expanded_games = set(seed_games)
-    for player in sorted(selected_players):
-        expanded_games.update(newest(tuple(games_by_player[player]), policy.max_games_per_player))
-    bounded_games = newest(tuple(expanded_games), policy.max_historical_games_total)
     selected_games = tuple(
         sorted(
-            bounded_games,
+            game_records,
             key=lambda game_id: (game_records[game_id].event_at, game_id),
         )
     )
@@ -722,17 +774,10 @@ def _select_topology(
     return _SelectedTopology(
         historical_games=selected_games,
         game_records={game_id: game_records[game_id] for game_id in selected_games},
-        active_plate_appearances=tuple(
-            sorted(
-                (record for record in active_pa if record.data["game_id"] in selected_set),
-                key=lambda record: (record.event_at, record.row_id),
-            )
-        ),
-        active_records=tuple(
-            record
-            for record in active
-            if str(record.data.get("game_id", "")) in selected_set
-            and (record.kind == "pa" or record.kind.startswith("box_"))
+        active_plate_appearances=(
+            active_pa
+            if isinstance(active_pa, ColumnarRecordSelection)
+            else tuple(record for record in active_pa if record.data["game_id"] in selected_set)
         ),
     )
 
@@ -742,7 +787,7 @@ def _materialize_graph(
     history: _History,
     topology: _SelectedTopology,
     descriptors: Sequence[_QueryDescriptor],
-    labels: Sequence[_Record],
+    labels: Sequence[Any],
     policy: TemporalSamplingPolicy,
 ) -> GraphDay:
     cutoff = datetime.combine(day, time.min, tzinfo=_KST).timestamp()
@@ -751,7 +796,10 @@ def _materialize_graph(
     if historical_game_ids & current_game_ids:
         raise ValueError("current query game appeared in historical topology")
 
-    common = _historical_player_game_aggregates(topology.active_records)
+    common = {
+        "batting": history.routes["batter_game_participation"],
+        "pitching": history.routes["pitcher_game_participation"],
+    }
     historical_players = {player for aggregates in common.values() for player, _ in aggregates}
     historical_players.update(
         str(record.data[field])
@@ -823,14 +871,18 @@ def _materialize_graph(
 
     batting = np.asarray(
         [
-            _role_features(role_history(player, "batting"), cutoff, policy.lookback_days)
+            _role_features(
+                role_history(player, "batting"), cutoff, policy.recency_reference_days
+            )
             for player in player_ids
         ],
         dtype=np.float32,
     ).reshape(-1, 8)
     pitching = np.asarray(
         [
-            _role_features(role_history(player, "pitching"), cutoff, policy.lookback_days)
+            _role_features(
+                role_history(player, "pitching"), cutoff, policy.recency_reference_days
+            )
             for player in player_ids
         ],
         dtype=np.float32,
@@ -843,7 +895,9 @@ def _materialize_graph(
         "player_pitching_features": pitching,
         "team_features": np.asarray(
             [
-                _team_features(history.teams.get(team), cutoff, policy.lookback_days)
+                _team_features(
+                    history.teams.get(team), cutoff, policy.recency_reference_days
+                )
                 for team in team_ids
             ],
             dtype=np.float32,
@@ -856,7 +910,7 @@ def _materialize_graph(
                     historical_record=topology.game_records.get(game_id),
                     descriptor=descriptor_by_game.get(game_id),
                     cutoff=cutoff,
-                    lookback_days=policy.lookback_days,
+                    recency_reference_days=policy.recency_reference_days,
                 )
                 for game_id in game_ids
             ],
@@ -873,20 +927,24 @@ def _materialize_graph(
             if aggregate is None and query is not None:
                 aggregate = personal.get(_box_history_id(query)) or team_prior.get(query["team_id"])
             player_features.append(
-                _box_features(aggregate, cutoff, policy.lookback_days, dimension)
+                _box_features(aggregate, cutoff, policy.recency_reference_days, dimension)
             )
         arrays[f"player_box_{role}_features"] = np.asarray(
             player_features, dtype=np.float32
         ).reshape(-1, dimension)
         arrays[f"team_box_{role}_features"] = np.asarray(
             [
-                _box_features(team_prior.get(team), cutoff, policy.lookback_days, dimension)
+                _box_features(
+                    team_prior.get(team), cutoff, policy.recency_reference_days, dimension
+                )
                 for team in team_ids
             ],
             dtype=np.float32,
         ).reshape(-1, dimension)
 
-    _add_player_game_routes(arrays, common, players, games, cutoff, policy.lookback_days)
+    _add_player_game_routes(
+        arrays, common, players, games, cutoff, policy.recency_reference_days
+    )
     _add_raw_pa_route(arrays, topology.active_plate_appearances, players, cutoff)
     _add_team_game_route(arrays, topology.game_records, descriptors, teams, games, cutoff)
     current_games = [record for record in labels if record.kind == "game"]
@@ -895,40 +953,13 @@ def _materialize_graph(
     return _TemporalGraphDay(day, player_ids, team_ids, arrays, game_ids)
 
 
-def _historical_player_game_aggregates(
-    active_records: Sequence[_Record],
-) -> dict[str, dict[tuple[str, str], _Aggregate]]:
-    grouped: dict[tuple[str, str, str], list[_Record]] = defaultdict(list)
-    for record in active_records:
-        data = record.data
-        if record.kind == "pa":
-            grouped[(data["game_id"], data["batting_team_id"], "batting")].append(record)
-            grouped[(data["game_id"], data["fielding_team_id"], "pitching")].append(record)
-        elif record.kind.startswith("box_"):
-            grouped[(data["game_id"], data["team_id"], data["role"])].append(record)
-    result: dict[str, dict[tuple[str, str], _Aggregate]] = {
-        "batting": {},
-        "pitching": {},
-    }
-    for (_, _, role), records in sorted(grouped.items()):
-        for record in _common_box_records(records, role):
-            player = _box_history_id(record.data)
-            game_id = str(record.data["game_id"])
-            values = _complete_legacy_box_values(record.data)
-            if values is None:
-                values = np.zeros(7, dtype=np.float64)
-            aggregate = result[role].setdefault((player, game_id), _Aggregate())
-            aggregate.update(record, values, True)
-    return result
-
-
 def _add_player_game_routes(
     arrays: dict[str, Array],
     common: Mapping[str, Mapping[tuple[str, str], _Aggregate]],
     players: Mapping[str, int],
     games: Mapping[str, int],
     cutoff: float,
-    lookback_days: int,
+    recency_reference_days: int,
 ) -> None:
     for role, route in (
         ("batting", "batter_game_event"),
@@ -948,7 +979,10 @@ def _add_player_game_routes(
             [games[game_id] for _, game_id, _ in rows], dtype=np.int64
         )
         arrays[prefix + "event_features"] = np.asarray(
-            [_route_features(aggregate, cutoff, lookback_days, route) for _, _, aggregate in rows],
+            [
+                _route_features(aggregate, cutoff, recency_reference_days, route)
+                for _, _, aggregate in rows
+            ],
             dtype=np.float32,
         ).reshape(-1, 6)
         arrays[prefix + "event_age_seconds"] = np.asarray(
@@ -1094,7 +1128,7 @@ def _temporal_game_features(
     historical_record: _Record | None,
     descriptor: _QueryDescriptor | None,
     cutoff: float,
-    lookback_days: int,
+    recency_reference_days: int,
 ) -> list[float]:
     scheduled = None
     if not current and historical_record is not None:
@@ -1109,7 +1143,12 @@ def _temporal_game_features(
     if historical_record is None:
         raise ValueError(f"historical game {game_id!r} lacks a selected record")
     age = max(0.0, cutoff - historical_record.event_at.timestamp()) / 86400.0
-    return [0.0, 1.0, min(age / lookback_days, 1.0), scheduled_fraction]
+    return [
+        0.0,
+        1.0,
+        min(age / recency_reference_days, 1.0),
+        scheduled_fraction,
+    ]
 
 
 def _validate_temporal_graph(graph: GraphDay) -> None:
@@ -1161,143 +1200,8 @@ def _validate_temporal_graph(graph: GraphDay) -> None:
             raise ValueError("current query game must have exactly two score-free team edges")
 
 
-def _write_record_shards(directory: Path, records: Sequence[_Record]) -> list[dict[str, Any]]:
-    grouped: dict[int, list[_Record]] = defaultdict(list)
-    for record in records:
-        grouped[record.day.year].append(record)
-    entries = []
-    for season in sorted(grouped):
-        selected = sorted(
-            grouped[season],
-            key=lambda record: (record.day, record.kind, record.entity, record.rank),
-        )
-        path = directory / "records" / f"{season}.npz"
-        _write_npz_atomic(path, _encode_record_shard(selected))
-        entries.append(_shard_entry(directory, path, season, len(selected)))
-    return entries
-
-
-def _encode_record_shard(records: Sequence[_Record]) -> dict[str, Array]:
-    box_width = max((len(record.box_values) for record in records), default=0)
-    padded = np.zeros((len(records), box_width), dtype=np.float64)
-    lengths = np.zeros(len(records), dtype=np.int16)
-    for index, record in enumerate(records):
-        length = len(record.box_values)
-        lengths[index] = length
-        if length:
-            padded[index, :length] = record.box_values
-    string_columns: dict[str, list[str]] = defaultdict(list)
-    for record in records:
-        for name, value in (
-            ("record_key", _record_key(record)),
-            ("kind", record.kind),
-            ("entity", record.entity),
-            ("row_id", record.row_id),
-            ("day", record.day.isoformat()),
-            ("event_at", record.event_at.isoformat()),
-            ("available_at", record.available_at.isoformat()),
-            ("ingested_at", record.ingested_at.isoformat()),
-            ("valid_from", record.valid_from.isoformat()),
-            ("valid_to", record.valid_to.isoformat() if record.valid_to is not None else ""),
-            ("source_id", record.source_id),
-            ("digest", f"{record.digest:064x}"),
-            (
-                "data_json",
-                json.dumps(
-                    record.data,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                    default=_json_default,
-                ),
-            ),
-        ):
-            string_columns[name].append(value)
-    return {
-        **{name: np.asarray(values, dtype=np.str_) for name, values in string_columns.items()},
-        "values": np.asarray([record.values for record in records], dtype=np.float64).reshape(
-            -1, 7
-        ),
-        "box_values": padded,
-        "box_value_lengths": lengths,
-    }
-
-
-def _decode_record_shard(arrays: Mapping[str, Array]) -> tuple[_Record, ...]:
-    names = (
-        "record_key",
-        "kind",
-        "entity",
-        "row_id",
-        "day",
-        "event_at",
-        "available_at",
-        "ingested_at",
-        "valid_from",
-        "valid_to",
-        "source_id",
-        "digest",
-        "data_json",
-    )
-    columns = {name: _string_column(arrays, name) for name in names}
-    count = len(columns["record_key"])
-    if any(len(column) != count for column in columns.values()):
-        raise ValueError("record shard string columns disagree")
-    values = np.asarray(arrays.get("values"))
-    box_values = np.asarray(arrays.get("box_values"))
-    lengths = np.asarray(arrays.get("box_value_lengths"))
-    if (
-        values.shape != (count, 7)
-        or box_values.ndim != 2
-        or box_values.shape[0] != count
-        or lengths.shape != (count,)
-    ):
-        raise ValueError("record shard numeric columns disagree")
-    records = []
-    for index in range(count):
-        data = json.loads(columns["data_json"][index])
-        if not isinstance(data, dict):
-            raise ValueError("record data_json must decode to an object")
-        for name in (
-            "scheduled_start",
-            "event_at",
-            "available_at",
-            "ingested_at",
-            "valid_from",
-            "valid_to",
-        ):
-            if isinstance(data.get(name), str):
-                data[name] = _parse_datetime(data[name])
-        length = int(lengths[index])
-        if not 0 <= length <= box_values.shape[1]:
-            raise ValueError("invalid box_value_lengths entry")
-        record = _Record(
-            kind=columns["kind"][index],
-            entity=columns["entity"][index],
-            row_id=columns["row_id"][index],
-            day=date.fromisoformat(columns["day"][index]),
-            event_at=_parse_datetime(columns["event_at"][index]),
-            available_at=_parse_datetime(columns["available_at"][index]),
-            ingested_at=_parse_datetime(columns["ingested_at"][index]),
-            valid_from=_parse_datetime(columns["valid_from"][index]),
-            valid_to=_parse_datetime(columns["valid_to"][index])
-            if columns["valid_to"][index]
-            else None,
-            source_id=columns["source_id"][index],
-            data=data,
-            digest=int(columns["digest"][index], 16),
-            values=np.asarray(values[index], dtype=np.float64).copy(),
-            box_values=np.asarray(box_values[index, :length], dtype=np.float64).copy(),
-        )
-        if _record_key(record) != columns["record_key"][index]:
-            raise ValueError("record shard immutable key mismatch")
-        records.append(record)
-    return tuple(records)
-
-
 def _write_label_shards(
-    directory: Path, labels: Mapping[int, Sequence[tuple[str, str]]]
+    directory: Path, labels: Mapping[int, Sequence[tuple[str, int]]]
 ) -> list[dict[str, Any]]:
     entries = []
     for season in sorted(labels):
@@ -1307,7 +1211,7 @@ def _write_label_shards(
             path,
             {
                 "day": np.asarray([row[0] for row in rows], dtype=np.str_),
-                "record_key": np.asarray([row[1] for row in rows], dtype=np.str_),
+                "record_index": np.asarray([row[1] for row in rows], dtype=np.int64),
             },
         )
         entries.append(_shard_entry(directory, path, season, len(rows)))
@@ -1399,7 +1303,48 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
     expected_dims = {name: len(values) for name, values in TEMPORAL_ROUTE_FEATURE_NAMES.items()}
     if manifest.get("route_feature_dims") != expected_dims:
         raise ValueError("temporal archive route feature contract differs from v7")
-    TemporalSamplingPolicy(**cast(dict[str, Any], manifest.get("sampling_policy", {})))
+    raw_policy = manifest.get("sampling_policy")
+    if not isinstance(raw_policy, Mapping):
+        raise ValueError("temporal archive sampling_policy must be an object")
+    try:
+        policy = TemporalSamplingPolicy(**dict(raw_policy))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("temporal archive must declare lossless full-history policy") from exc
+    policy_fingerprint = _require_lowercase_sha256(
+        manifest.get("sampling_policy_fingerprint"),
+        "temporal archive sampling_policy_fingerprint",
+    )
+    if policy_fingerprint != policy.fingerprint:
+        raise ValueError("temporal archive sampling policy fingerprint is inconsistent")
+    archive_policy = manifest.get("archive_policy")
+    if not isinstance(archive_policy, Mapping) or archive_policy.get("history") != (
+        "all event days before cutoff; available and valid at cutoff; no sampling, "
+        "time window, node cap, or edge cap"
+    ):
+        raise ValueError("temporal archive does not guarantee complete prior history")
+    coverage = manifest.get("history_coverage")
+    if not isinstance(coverage, Mapping) or coverage != {
+        "scope": "all_prior_records",
+        "eligible_source_records": manifest.get("record_count"),
+        "stored_source_records": manifest.get("record_count"),
+        "stored_fraction": 1.0,
+        "semantic_reduction": False,
+    }:
+        raise ValueError("temporal archive history coverage is incomplete")
+    streaming = manifest.get("streaming_policy")
+    if (
+        not isinstance(streaming, Mapping)
+        or streaming.get("record_storage") != "archive_global_columnar_numpy_npy"
+        or streaming.get("read_mode") != "read_only_mmap_shared_page_cache"
+        or streaming.get("history_cursor") != "cutoff_prefix_key_change_stream"
+        or streaming.get("raw_record_residency")
+        != "zero_decoded_source_records_per_worker"
+        or streaming.get("worker_memory_sharing") is not True
+        or streaming.get("dense_graph_materialization") != "once_per_sample_access"
+        or streaming.get("per_day_full_history_cache") is not False
+        or streaming.get("production_ready") is not True
+    ):
+        raise ValueError("temporal archive lacks its production mmap streaming contract")
     days = manifest.get("days")
     if not isinstance(days, list) or not days:
         raise ValueError("temporal archive days must be a non-empty list")
@@ -1425,8 +1370,13 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
                 raise ValueError(f"temporal archive day {name} must be a non-negative integer")
         if entry["games"] != entry["query_games"]:
             raise ValueError("temporal archive day game counts disagree")
+    record_store = manifest.get("record_store")
+    if not isinstance(record_store, Mapping):
+        raise ValueError("temporal archive record_store must be an object")
+    if record_store.get("record_count") != manifest.get("record_count"):
+        raise ValueError("temporal archive record_store count disagrees")
     shard_entries: dict[str, list[Any]] = {}
-    for name in ("record_shards", "label_shards", "query_shards"):
+    for name in ("label_shards", "query_shards"):
         entries = manifest.get(name)
         if not isinstance(entries, list):
             raise ValueError(f"temporal archive {name} must be a list")
@@ -1439,7 +1389,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
     )
     expected_artifact_fingerprint = _artifact_fingerprint(
         build_fingerprint=build_fingerprint,
-        record_shards=shard_entries["record_shards"],
+        record_store=record_store,
         label_shards=shard_entries["label_shards"],
         query_shards=shard_entries["query_shards"],
     )
@@ -1471,7 +1421,7 @@ def _require_lowercase_sha256(value: Any, context: str) -> str:
 def _artifact_fingerprint(
     *,
     build_fingerprint: str,
-    record_shards: Sequence[Mapping[str, Any]],
+    record_store: Mapping[str, Any],
     label_shards: Sequence[Mapping[str, Any]],
     query_shards: Sequence[Mapping[str, Any]],
 ) -> str:
@@ -1480,7 +1430,7 @@ def _artifact_fingerprint(
     return _json_sha256(
         {
             "build_fingerprint": build_fingerprint,
-            "record_shards": list(record_shards),
+            "record_store": dict(record_store),
             "label_shards": list(label_shards),
             "query_shards": list(query_shards),
         }
@@ -1526,13 +1476,6 @@ def _string_column(arrays: Mapping[str, Array], name: str) -> list[str]:
     if raw.ndim != 1 or raw.dtype.kind not in {"U", "S"}:
         raise ValueError(f"temporal shard {name} must be a one-dimensional string column")
     return [str(value) for value in raw.tolist()]
-
-
-def _parse_datetime(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value)
-    if parsed.utcoffset() is None:
-        raise ValueError("temporal archive datetime must be timezone-aware")
-    return parsed
 
 
 def _as_day(value: date | str | None) -> date | None:

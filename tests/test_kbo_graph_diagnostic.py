@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
@@ -408,6 +409,60 @@ def test_collector_separates_forced_and_competitive_attention_gates_and_updates(
         "gate_input_message_norm"
     ]
     assert gates["actual_update_norm"]["count"] == 2
+
+
+def test_collector_merges_exact_chunked_attention_summary() -> None:
+    collector = RelGNNDiagnosticsCollector()
+    probabilities = torch.tensor([[0.25, 0.40], [0.75, 0.60]])
+    normalized_entropy = -(
+        probabilities * probabilities.log()
+    ).sum(dim=0) / math.log(2.0)
+    collector.observe_attention_summary(
+        layer_index=0,
+        route_name="batter_pa_pitcher",
+        direction="forward",
+        source_channel="player__batting",
+        destination_channel="player__pitching",
+        destination_degree=torch.tensor([1, 2, 0]),
+        attention_square_sum=torch.tensor(
+            [[1.0, 1.0], [0.625, 0.52], [0.0, 0.0]]
+        ),
+        attention_minimum=torch.tensor(
+            [[1.0, 1.0], [0.25, 0.40], [torch.inf, torch.inf]]
+        ),
+        attention_maximum=torch.tensor(
+            [[1.0, 1.0], [0.75, 0.60], [0.0, 0.0]]
+        ),
+        competitive_normalized_entropy=torch.stack(
+            [torch.zeros(2), normalized_entropy, torch.zeros(2)]
+        ),
+        message=torch.ones((3, 4)),
+        route_mask=torch.tensor([True, True, False]),
+        destination_state=torch.full((3, 4), 2.0),
+    )
+
+    attention = collector.report()["attention"]["by_layer_route_direction"][
+        "layer_0|batter_pa_pitcher|forward"
+    ]
+    assert attention["calls"] == 1
+    assert attention["dense_calls"] == 0
+    assert attention["chunked_summary_calls"] == 1
+    assert attention["positive_edges"] == 3
+    assert attention["forced_singleton_attention"] == {
+        "count": 2,
+        "mean": pytest.approx(1.0),
+        "std": pytest.approx(0.0),
+        "min": pytest.approx(1.0),
+        "max": pytest.approx(1.0),
+    }
+    assert attention["competitive_attention"]["count"] == 4
+    assert attention["competitive_attention"]["mean"] == pytest.approx(0.5)
+    assert attention["competitive_attention"]["min"] == pytest.approx(0.25)
+    assert attention["competitive_attention"]["max"] == pytest.approx(0.75)
+    assert attention["competitive_normalized_entropy"]["mean"] == pytest.approx(
+        float(normalized_entropy.mean().item())
+    )
+    assert attention["competitive_max_attention"]["mean"] == pytest.approx(0.675)
 
 
 def test_real_model_accepts_collector_and_emits_every_diagnostic_family() -> None:

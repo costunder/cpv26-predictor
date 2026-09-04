@@ -51,8 +51,10 @@ def _training_config(*, candidate: bool) -> dict[str, Any]:
         "chronological": True,
         "route_message_normalization": "none",
         "route_schedule": "full",
+        "route_edge_chunk_size": 0,
         "graph_control": "intact",
         "graph_control_seed": 2026,
+        "compact_kbo_channels": True,
     }
     if candidate:
         config["activation_checkpointing"] = True
@@ -112,14 +114,29 @@ def _run(
     attempted_steps: int,
     policy: dict[str, Any],
     initialization_hash: str,
+    shared_initialization_hash: str,
 ) -> dict[str, Any]:
+    node_only = policy["route_schedule"] == "node_only"
+    architecture = {
+        "variant": "node_only" if node_only else "relational",
+        "relational_message_passing_enabled": not node_only,
+    }
     return {
         "completed_epochs": 30,
         "attempted_optimizer_steps": attempted_steps,
         "optimizer_steps": attempted_steps,
         "skipped_optimizer_steps": 0,
         "parameter_count": parameters,
+        "trainable_parameter_count": parameters,
+        "parameter_contract": {
+            "parameter_count": parameters,
+            "trainable_parameter_count": parameters,
+            "optimizer_covers_all_trainable": True,
+            "architecture": architecture,
+        },
         "initial_model_state_sha256": initialization_hash,
+        "shared_parameter_initialization_sha256": shared_initialization_hash,
+        "architecture": architecture,
         "validation_selection_loss": loss,
         "validation_metrics": {
             "selection_target": "weighted",
@@ -146,13 +163,15 @@ def _reports() -> tuple[dict[str, Any], dict[str, Any]]:
             attempted_steps=900,
             policy=policies["full"],
             initialization_hash="b" * 64,
+            shared_initialization_hash="1" * 64,
         ),
         "node_only": _run(
             loss=4.55,
-            parameters=1_000_000,
+            parameters=650_000,
             attempted_steps=900,
             policy=policies["node_only"],
-            initialization_hash="b" * 64,
+            initialization_hash="a" * 64,
+            shared_initialization_hash="1" * 64,
         ),
     }
     candidate_runs = {
@@ -162,18 +181,20 @@ def _reports() -> tuple[dict[str, Any], dict[str, Any]]:
             attempted_steps=900,
             policy=policies["full"],
             initialization_hash="c" * 64,
+            shared_initialization_hash="2" * 64,
         ),
         "node_only": _run(
             loss=4.46,
-            parameters=3_000_000,
+            parameters=1_800_000,
             attempted_steps=900,
             policy=policies["node_only"],
-            initialization_hash="c" * 64,
+            initialization_hash="f" * 64,
+            shared_initialization_hash="2" * 64,
         ),
     }
     common = {
         "status": "completed",
-        "protocol_version": 1,
+        "protocol_version": 2,
         "dataset_fingerprint": "dataset-fingerprint",
         "split_day_fingerprint": "split-fingerprint",
         "split_days": {
@@ -203,15 +224,21 @@ def _reports() -> tuple[dict[str, Any], dict[str, Any]]:
         "expanded_capacity": {"hidden_dim": 128, "layers": 3},
         "initialization_audit": {
             "seed": 2026,
-            "all_variants_equal": True,
-            "initial_model_state_sha256": "b" * 64,
-            "parameter_count": 1_000_000,
+            "all_shared_parameters_equal": True,
+            "shared_parameter_initialization_sha256": "1" * 64,
             "variants": {
-                variant: {
+                "full": {
                     "initial_model_state_sha256": "b" * 64,
                     "parameter_count": 1_000_000,
-                }
-                for variant in VARIANTS
+                    "trainable_parameter_count": 1_000_000,
+                    "shared_parameter_initialization_sha256": "1" * 64,
+                },
+                "node_only": {
+                    "initial_model_state_sha256": "a" * 64,
+                    "parameter_count": 650_000,
+                    "trainable_parameter_count": 650_000,
+                    "shared_parameter_initialization_sha256": "1" * 64,
+                },
             },
         },
         "loader_lineage": {
@@ -224,10 +251,14 @@ def _reports() -> tuple[dict[str, Any], dict[str, Any]]:
             "expanded_128x3": baseline_runs,
         },
         "parameter_count_audit": {
-            "baseline_64x2": 300_000,
-            "expanded_128x3": 1_000_000,
-            "increase": 700_000,
-            "within_capacity_variants_equal": True,
+            "baseline_64x2": {"full": 300_000, "node_only": 200_000},
+            "expanded_128x3": {"full": 1_000_000, "node_only": 650_000},
+            "expanded_128x3_trainable": {
+                "full": 1_000_000,
+                "node_only": 650_000,
+            },
+            "increase_by_variant": {"full": 700_000, "node_only": 450_000},
+            "variant_counts_intentionally_distinct": True,
         },
         "budget_audit": {
             "seed": 2026,
@@ -262,22 +293,35 @@ def _reports() -> tuple[dict[str, Any], dict[str, Any]]:
         "capacity": {"hidden_dim": 256, "layers": 3},
         "initialization_audit": {
             "seed": 2026,
-            "all_variants_equal": True,
-            "initial_model_state_sha256": "c" * 64,
-            "parameter_count": 3_000_000,
+            "all_shared_parameters_equal": True,
+            "shared_parameter_initialization_sha256": "2" * 64,
             "variants": {
-                variant: {
+                "full": {
                     "initial_model_state_sha256": "c" * 64,
                     "parameter_count": 3_000_000,
-                }
-                for variant in VARIANTS
+                    "trainable_parameter_count": 3_000_000,
+                    "shared_parameter_initialization_sha256": "2" * 64,
+                },
+                "node_only": {
+                    "initial_model_state_sha256": "f" * 64,
+                    "parameter_count": 1_800_000,
+                    "trainable_parameter_count": 1_800_000,
+                    "shared_parameter_initialization_sha256": "2" * 64,
+                },
             },
         },
         "loader_lineage": _loader(candidate_config),
         "runs": candidate_runs,
         "parameter_count_audit": {
-            "all_variants_equal": True,
-            "parameter_count": 3_000_000,
+            "variant_parameter_counts": {
+                "full": 3_000_000,
+                "node_only": 1_800_000,
+            },
+            "variant_trainable_parameter_counts": {
+                "full": 3_000_000,
+                "node_only": 1_800_000,
+            },
+            "variant_counts_intentionally_distinct": True,
         },
         "budget_audit": {
             "all_variants_equal": True,
@@ -336,7 +380,9 @@ def test_scale_comparison_validates_lineage_and_writes_atomic_report(
     assert comparison[
         "dependency_gap_change_256x3_minus_128x3"
     ] == pytest.approx(0.01)
-    assert report["parameter_count_audit"]["candidate_to_baseline_ratio"] == 3.0
+    assert report["parameter_count_audit"][
+        "candidate_to_baseline_ratio_by_variant"
+    ] == {"full": 3.0, "node_only": pytest.approx(1_800_000 / 650_000)}
     checkpoint_audit = report["runtime_audit"]["permitted_execution_differences"][
         "activation_checkpointing"
     ]
@@ -491,7 +537,7 @@ def test_scale_comparison_rejects_lineage_or_policy_drift(
         ),
         (
             lambda _base, cand: cand["parameter_count_audit"].update(
-                parameter_count=999
+                variant_parameter_counts={"full": 999, "node_only": 1_800_000}
             ),
             "parameter audit disagrees",
         ),
@@ -521,7 +567,7 @@ def test_candidate_must_explicitly_declare_activation_checkpointing(
         compare_kbo_scale_reports(baseline_path, candidate_path)
 
 
-@pytest.mark.parametrize("value", [True, "false"])
+@pytest.mark.parametrize("value", [False, "true"])
 def test_scale_comparison_rejects_compact_or_invalid_architecture_flag(
     tmp_path: Path, value: Any
 ) -> None:

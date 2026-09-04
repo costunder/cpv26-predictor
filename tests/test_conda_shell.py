@@ -89,7 +89,7 @@ def _run(
         **(extra or {}),
     }
     # GNU Bash named sh starts in POSIX mode; the project scripts require Bash mode.
-    command = "set +o posix\n" + command
+    command = "set +o posix\ncpv26_test_body() {\n" + command + "\n}\ncpv26_test_body\n"
     # Files avoid Windows pipe-reader threads when Bash launches native Python.
     with (
         tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stdout,
@@ -124,8 +124,8 @@ def test_activation_loads_literal_values_without_evaluation(
         bash_executable,
         loader_project,
         """
-source "$CPV26_TEST_PROJECT/scripts/activate.sh" || exit 31
-[[ "$PWD" == "$(cd "$CPV26_TEST_PROJECT" && pwd)" ]] || exit 32
+source "$CPV26_TEST_PROJECT/scripts/activate.sh" || return 31
+[[ "$PWD" == "$(cd "$CPV26_TEST_PROJECT" && pwd)" ]] || return 32
 printf 'literal:%s\n' "$CPV26_TEST_LITERAL" "$CPV26_TEST_BACKTICK"
 printf 'spaces:%s\nequals:%s\nhome:%s\n' \
   "$CPV26_TEST_SPACES" "$CPV26_TEST_EQUALS" "$CPV26_HOME"
@@ -157,10 +157,10 @@ original_directory=$PWD
 original_path=$PATH
 source "$CPV26_TEST_PROJECT/scripts/activate.sh"
 status=$?
-[[ $status -ne 0 ]] || exit 31
-[[ "$CPV26_HOME" == unchanged && "$PWD" == "$original_directory" ]] || exit 32
-[[ "$PATH" == "$original_path" && -z "${VIRTUAL_ENV:-}" ]] || exit 33
-[[ -z "${CONDA_PREFIX:-}" && $- != *e* ]] || exit 34
+[[ $status -ne 0 ]] || return 31
+[[ "$CPV26_HOME" == unchanged && "$PWD" == "$original_directory" ]] || return 32
+[[ "$PATH" == "$original_path" && -z "${VIRTUAL_ENV:-}" ]] || return 33
+[[ -z "${CONDA_PREFIX:-}" && $- != *e* ]] || return 34
 printf 'shell survived\n'
 """,
         {"CPV26_HOME": "unchanged"},
@@ -187,8 +187,8 @@ def test_activation_failure_returns_to_the_calling_shell(
 original_directory=$PWD
 source "$CPV26_TEST_PROJECT/scripts/activate.sh"
 status=$?
-[[ $status -ne 0 && $- != *e* ]] || exit 31
-[[ "$CPV26_HOME" == unchanged && "$PWD" == "$original_directory" ]] || exit 32
+[[ $status -ne 0 && $- != *e* ]] || return 31
+[[ "$CPV26_HOME" == unchanged && "$PWD" == "$original_directory" ]] || return 32
 printf 'shell survived\n'
 """,
         {"CPV26_HOME": "unchanged"},
@@ -209,7 +209,7 @@ def test_activation_reports_readonly_export_failure(
 readonly CPV26_HOME=unchanged
 source "$CPV26_TEST_PROJECT/scripts/activate.sh"
 status=$?
-[[ $status -ne 0 && "$CPV26_HOME" == unchanged ]] || exit 31
+[[ $status -ne 0 && "$CPV26_HOME" == unchanged ]] || return 31
 printf 'shell survived\n'
 """,
     )
@@ -235,7 +235,7 @@ def test_activation_reports_unreadable_configuration(
             """
 source "$CPV26_TEST_PROJECT/scripts/activate.sh"
 status=$?
-[[ $status -ne 0 && "$CPV26_HOME" == unchanged ]] || exit 31
+[[ $status -ne 0 && "$CPV26_HOME" == unchanged ]] || return 31
 printf 'shell survived\n'
 """,
             {"CPV26_HOME": "unchanged"},
@@ -259,7 +259,7 @@ def test_setup_and_check_refuse_sourcing_without_changing_shell_options(
 original_options=$-
 source "$CPV26_TEST_PROJECT/scripts/$CPV26_TEST_SCRIPT"
 status=$?
-[[ $status -ne 0 && "$-" == "$original_options" ]] || exit 31
+[[ $status -ne 0 && "$-" == "$original_options" ]] || return 31
 printf 'shell survived\n'
 """,
         {"CPV26_TEST_SCRIPT": script},
@@ -308,7 +308,7 @@ python() {
   return "$status"
 }
 export -f python
-cd "$CPV26_TEST_PROJECT" || exit 31
+cd "$CPV26_TEST_PROJECT" || return 31
 "$BASH" "scripts/$CPV26_TEST_SCRIPT"
 """,
         environment,

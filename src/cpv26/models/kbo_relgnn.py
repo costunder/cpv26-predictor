@@ -191,6 +191,7 @@ class KBORelGNNConfig:
     box_gradient_mode: str = "shared"
     route_message_normalization: str = "none"
     route_schedule: tuple[tuple[str, ...], ...] | None = None
+    route_edge_chunk_size: int = 0
     activation_checkpointing: bool = False
     compact_kbo_channels: bool = False
 
@@ -247,10 +248,21 @@ class KBORelGNNConfig:
             raise ValueError("box_gradient_mode must be shared or head_only")
         if self.route_message_normalization not in {"none", "layer_norm"}:
             raise ValueError("route_message_normalization must be none or layer_norm")
+        if (
+            isinstance(self.route_edge_chunk_size, bool)
+            or not isinstance(self.route_edge_chunk_size, int)
+            or self.route_edge_chunk_size < 0
+        ):
+            raise ValueError("route_edge_chunk_size must be a non-negative integer")
         if not isinstance(self.activation_checkpointing, bool):
             raise ValueError("activation_checkpointing must be boolean")
         if not isinstance(self.compact_kbo_channels, bool):
             raise ValueError("compact_kbo_channels must be boolean")
+        if temporal_v7 and not self.compact_kbo_channels:
+            raise ValueError(
+                "temporal_v7 requires compact_kbo_channels=True so every registered "
+                "trainable channel participates in the forward"
+            )
         object.__setattr__(
             self,
             "route_schedule",
@@ -263,7 +275,7 @@ class KBORelGNNConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "node_feature_dims": dict(self.node_feature_dims),
             "role_feature_dims": dict(self.role_feature_dims),
             "route_feature_dims": dict(self.route_feature_dims),
@@ -288,6 +300,12 @@ class KBORelGNNConfig:
                 else [list(layer) for layer in self.route_schedule]
             ),
         }
+        # Zero is the lossless automatic execution policy. Omitting that new
+        # default keeps pre-existing v5/v6 model fingerprints and checkpoints
+        # byte-for-byte compatible; explicit nonzero overrides remain bound.
+        if self.route_edge_chunk_size:
+            result["route_edge_chunk_size"] = self.route_edge_chunk_size
+        return result
 
 
 class KBORelGNNModel(ModuleBase):
@@ -317,17 +335,33 @@ class KBORelGNNModel(ModuleBase):
             role_widths,
             hidden_dim=config.hidden_dim,
             dropout=config.dropout,
+            # False retains the exact pre-compact v5/v6 checkpoint structure.
+            # New temporal-v7 configs are rejected above unless they use the
+            # active-only architecture.
             active_roles=tuple(role_widths) if config.compact_kbo_channels else None,
         )
         active_update_channels = None
         if config.compact_kbo_channels:
-            active_update_channels = {
-                "team",
-                "player__batting",
-                "player__pitching",
-            }
-            if self.uses_game_nodes:
-                active_update_channels.add("game")
+            # Derive update cells from the actual configured route endpoints.
+            # A fixed {team, batting, pitching, game} set still registered an
+            # unused team/game updater for focused route subsets.
+            registry = kbo_route_registry()
+            active_update_channels = set()
+            for route_name in config.route_feature_dims:
+                route = registry.require(route_name)
+                destination_role = route.destination_role
+                active_update_channels.add(
+                    route.destination_type
+                    if route.destination_type != "player"
+                    else f"player__{destination_role}"
+                )
+                if route.bidirectional:
+                    source_role = route.source_role
+                    active_update_channels.add(
+                        route.source_type
+                        if route.source_type != "player"
+                        else f"player__{source_role}"
+                    )
         self.backbone: Any = CompositeRelGNNBackbone(
             node_feature_dims=node_widths,
             route_feature_dims=config.route_feature_dims,
@@ -339,6 +373,7 @@ class KBORelGNNModel(ModuleBase):
             registry=kbo_route_registry(),
             route_message_normalization=config.route_message_normalization,
             route_schedule=config.route_schedule,
+            route_edge_chunk_size=config.route_edge_chunk_size,
             activation_checkpointing=config.activation_checkpointing,
             active_update_channels=active_update_channels,
         )
@@ -399,6 +434,45 @@ class KBORelGNNModel(ModuleBase):
         cast(Any, self).register_buffer("joint_allowed", allowed)
         cast(Any, self).register_buffer("pa_support", pa_support)
         cast(Any, self).register_buffer("hit_support", hit_support)
+
+    def architecture_contract(self) -> dict[str, Any]:
+        """Describe the effective trainable architecture, including ablations."""
+
+        relational_parameters = [
+            parameter
+            for name, parameter in cast(Any, self).named_parameters()
+            if name.startswith("backbone.layers.")
+        ]
+        node_only = not bool(self.backbone.layers)
+        return {
+            "variant": "node_only" if node_only else "relational",
+            "configured_compact_kbo_channels": self.config.compact_kbo_channels,
+            "resolved_channel_architecture": (
+                "active_kbo_channels_only"
+                if self.config.compact_kbo_channels
+                else "legacy_all_player_role_channels"
+            ),
+            "configured_relational_layers": self.config.num_layers,
+            "effective_relational_layers": len(self.backbone.layers),
+            "relational_message_passing_enabled": not node_only,
+            "configured_route_count": len(self.config.route_feature_dims),
+            "route_edge_chunk_size": self.config.route_edge_chunk_size,
+            "route_edge_chunking": (
+                "automatic_lossless_64_mib_projected_edge_budget"
+                if self.config.route_edge_chunk_size == 0
+                else "explicit_lossless_edge_count"
+            ),
+            "relational_parameter_count": sum(
+                parameter.numel() for parameter in relational_parameters
+            ),
+            "relational_parameter_tensors": len(relational_parameters),
+            "node_only_contract": (
+                "node/role encoders and task heads only; no registered relation attention, "
+                "route gate, recurrent updater, or relational normalization parameters"
+                if node_only
+                else None
+            ),
+        }
 
     def forward(
         self,
@@ -679,7 +753,7 @@ def collate_kbo_day_graphs(
     device: Any = "cpu",
     max_pa_per_day: int | None = None,
     seed: int = 2026,
-    max_edges_per_route_per_day: int | None = 20_000,
+    max_edges_per_route_per_day: int | None = None,
 ) -> dict[str, Any]:
     """Validate NumPy graphs once on CPU, then form a disjoint tensor union.
 
