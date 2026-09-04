@@ -427,6 +427,7 @@ class _CompositeRouteLayer(ModuleBase):
         dropout: float,
         include_publication_delay: bool,
         route_message_normalization: Literal["none", "layer_norm"],
+        active_update_channels: Iterable[str] | None = None,
     ) -> None:
         require_torch()
         super().__init__()
@@ -452,8 +453,20 @@ class _CompositeRouteLayer(ModuleBase):
             if route.bidirectional:
                 self.route_gates[_gate_key(route_name, True)] = self._new_route_gate()
 
-        channel_names = set(node_types)
-        channel_names.update(f"{_PLAYER_CHANNEL_PREFIX}{role}" for role in PLAYER_ROLE_NAMES)
+        if active_update_channels is None:
+            channel_names = tuple(
+                sorted(
+                    {
+                        *node_types,
+                        *(
+                            f"{_PLAYER_CHANNEL_PREFIX}{role}"
+                            for role in PLAYER_ROLE_NAMES
+                        ),
+                    }
+                )
+            )
+        else:
+            channel_names = tuple(sorted(set(active_update_channels)))
         self.updaters = nn.ModuleDict(
             {channel: nn.GRUCell(hidden_dim, hidden_dim) for channel in channel_names}
         )
@@ -653,6 +666,10 @@ class _CompositeRouteLayer(ModuleBase):
             previous = channels[channel]
             if not route_messages or int(previous.shape[0]) == 0:
                 continue
+            if channel not in self.updaters:
+                raise RuntimeError(
+                    f"active route produced a message for disabled update channel {channel!r}"
+                )
             messages = torch.stack(
                 [item.gate_input_message for item in route_messages], dim=1
             )
@@ -749,6 +766,8 @@ class CompositeRelGNNBackbone(ModuleBase):
         registry: RouteRegistry | None = None,
         route_message_normalization: str = "none",
         route_schedule: Any = None,
+        activation_checkpointing: bool = False,
+        active_update_channels: Iterable[str] | None = None,
     ) -> None:
         require_torch()
         super().__init__()
@@ -767,6 +786,8 @@ class CompositeRelGNNBackbone(ModuleBase):
             raise ValueError("dropout must be in [0, 1)")
         if route_message_normalization not in _ROUTE_MESSAGE_NORMALIZATIONS:
             raise ValueError("route_message_normalization must be 'none' or 'layer_norm'")
+        if not isinstance(activation_checkpointing, bool):
+            raise ValueError("activation_checkpointing must be boolean")
 
         normalized_node_dims = {
             node_type: int(feature_dim) for node_type, feature_dim in configured_node_dims.items()
@@ -811,6 +832,7 @@ class CompositeRelGNNBackbone(ModuleBase):
         self.route_message_normalization = cast(
             Literal["none", "layer_norm"], route_message_normalization
         )
+        self.activation_checkpointing = activation_checkpointing
         self.route_schedule = _normalize_route_schedule(
             route_schedule,
             num_layers=num_layers,
@@ -823,6 +845,42 @@ class CompositeRelGNNBackbone(ModuleBase):
             else tuple(frozenset(layer) for layer in self.route_schedule)
         )
         self.player_encoder = player_encoder
+        normalized_active_channels: tuple[str, ...] | None = None
+        if active_update_channels is not None:
+            requested_channels = tuple(str(channel) for channel in active_update_channels)
+            if len(set(requested_channels)) != len(requested_channels):
+                raise ValueError("active_update_channels contains duplicate channels")
+            available_channels = set(normalized_node_dims)
+            available_roles = (
+                player_encoder.active_roles
+                if player_encoder is not None
+                else PLAYER_ROLE_NAMES
+            )
+            available_channels.update(
+                f"{_PLAYER_CHANNEL_PREFIX}{role}" for role in available_roles
+            )
+            unknown_channels = set(requested_channels).difference(available_channels)
+            if unknown_channels:
+                raise ValueError(
+                    f"unknown active update channels: {sorted(unknown_channels)}"
+                )
+            required_channels: set[str] = set()
+            for route_name in normalized_route_dims:
+                route = self.registry.require(route_name)
+                required_channels.add(
+                    _state_channel(route.destination_type, route.destination_role)
+                )
+                if route.bidirectional:
+                    required_channels.add(
+                        _state_channel(route.source_type, route.source_role)
+                    )
+            missing_channels = required_channels.difference(requested_channels)
+            if missing_channels:
+                raise ValueError(
+                    "active_update_channels omits enabled route endpoints: "
+                    f"{sorted(missing_channels)}"
+                )
+            normalized_active_channels = requested_channels
         self.node_encoders = nn.ModuleDict(
             {
                 node_type: nn.Sequential(
@@ -845,11 +903,63 @@ class CompositeRelGNNBackbone(ModuleBase):
                     dropout=dropout,
                     include_publication_delay=include_publication_delay,
                     route_message_normalization=self.route_message_normalization,
+                    active_update_channels=normalized_active_channels,
                 )
                 for _ in range(num_layers)
             ]
         )
         self._execution_optimization_enabled = True
+
+    def _checkpointed_layer(
+        self,
+        layer: Any,
+        state: RelGNNState,
+        route_batches: tuple[TorchAtomicRouteBatch, ...],
+        *,
+        layer_index: int,
+        enabled_gate_keys: frozenset[str] | None,
+    ) -> RelGNNState:
+        """Recompute one message-passing layer during backward to save activations."""
+
+        from torch.utils.checkpoint import checkpoint
+
+        node_names = tuple(state.node_states)
+        role_names = tuple(state.player_role_states)
+        flat_state = tuple(state.node_states[name] for name in node_names) + tuple(
+            state.player_role_states[name] for name in role_names
+        )
+
+        def run_layer(*values: Any) -> tuple[Any, ...]:
+            node_count = len(node_names)
+            current = RelGNNState(
+                dict(zip(node_names, values[:node_count], strict=True)),
+                dict(zip(role_names, values[node_count:], strict=True)),
+            )
+            updated = layer(
+                current,
+                route_batches,
+                validate_routes=False,
+                reuse_route_context=self._execution_optimization_enabled,
+                layer_index=layer_index,
+                enabled_gate_keys=enabled_gate_keys,
+            )
+            return tuple(updated.node_states[name] for name in node_names) + tuple(
+                updated.player_role_states[name] for name in role_names
+            )
+
+        outputs = checkpoint(
+            run_layer,
+            *flat_state,
+            use_reentrant=False,
+            preserve_rng_state=True,
+        )
+        if not isinstance(outputs, tuple):
+            outputs = (outputs,)
+        node_count = len(node_names)
+        return RelGNNState(
+            dict(zip(node_names, outputs[:node_count], strict=True)),
+            dict(zip(role_names, outputs[node_count:], strict=True)),
+        )
 
     @property
     def execution_optimization_enabled(self) -> bool:
@@ -997,6 +1107,8 @@ class CompositeRelGNNBackbone(ModuleBase):
         This avoids synchronizing the GPU for every route in every layer.
         """
 
+        torch, _ = require_torch()
+
         first_features = next(iter(node_features.values()), None)
         if first_features is None:
             raise ValueError("node_features must not be empty")
@@ -1017,15 +1129,42 @@ class CompositeRelGNNBackbone(ModuleBase):
                 if self._enabled_gate_keys_by_layer is None
                 else self._enabled_gate_keys_by_layer[layer_index]
             )
-            state = layer(
-                state,
-                tensor_batches,
-                validate_routes=validate_routes,
-                reuse_route_context=self._execution_optimization_enabled,
-                layer_index=layer_index,
-                diagnostics_observer=diagnostics_observer,
-                enabled_gate_keys=enabled_gate_keys,
-            )
+            if (
+                self.activation_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+                and diagnostics_observer is None
+            ):
+                # The public KBO path validates route tensors in the CPU collator.
+                # Keep explicit validation on for direct callers instead of hiding
+                # it inside a recomputed checkpoint closure.
+                if validate_routes:
+                    state = layer(
+                        state,
+                        tensor_batches,
+                        validate_routes=True,
+                        reuse_route_context=self._execution_optimization_enabled,
+                        layer_index=layer_index,
+                        enabled_gate_keys=enabled_gate_keys,
+                    )
+                else:
+                    state = self._checkpointed_layer(
+                        layer,
+                        state,
+                        tensor_batches,
+                        layer_index=layer_index,
+                        enabled_gate_keys=enabled_gate_keys,
+                    )
+            else:
+                state = layer(
+                    state,
+                    tensor_batches,
+                    validate_routes=validate_routes,
+                    reuse_route_context=self._execution_optimization_enabled,
+                    layer_index=layer_index,
+                    diagnostics_observer=diagnostics_observer,
+                    enabled_gate_keys=enabled_gate_keys,
+                )
         return state
 
     def forward(

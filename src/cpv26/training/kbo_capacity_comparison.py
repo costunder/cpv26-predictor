@@ -799,15 +799,13 @@ def _validate_baseline_suite(
         if getattr(config, field) != policy_value:
             raise ValueError(f"baseline base configuration must use {field}={policy_value}")
 
-    expected_manifest_config = asdict(config)
-    for field in (
-        "seed",
-        "route_message_normalization",
-        "route_schedule",
-        "graph_control",
-    ):
-        expected_manifest_config.pop(field)
-    if manifest.get("base_training_config") != _plain(expected_manifest_config):
+    expected_manifest_config = matched._normalized_manifest_training_config(
+        asdict(config)
+    )
+    saved_manifest_config = matched._normalized_manifest_training_config(
+        manifest.get("base_training_config")
+    )
+    if saved_manifest_config != expected_manifest_config:
         raise ValueError("baseline suite manifest and report training configurations differ")
     if manifest.get("test_policy") != "held_out_metadata_only_never_loaded_or_evaluated":
         raise ValueError("baseline suite manifest does not seal held-out test")
@@ -1140,7 +1138,14 @@ def _validate_or_write_manifest(path: Path, manifest: Mapping[str, Any]) -> None
         runner._atomic_json(path, manifest)
         return
     saved = _load_json(path)
-    if saved != _plain(manifest):
+    expected = dict(_plain(manifest))
+    for document in (saved, expected):
+        raw_config = document.get("training_config")
+        if isinstance(raw_config, Mapping):
+            document["training_config"] = matched._normalized_legacy_execution_fields(
+                raw_config, context="capacity comparison manifest"
+            )
+    if saved != expected:
         raise ValueError(
             "capacity comparison resume changes its dataset, baseline lineage, or fairness settings"
         )
@@ -1476,7 +1481,11 @@ def train_kbo_full_node_comparison(
         "smoke_test_only": config.max_days_per_split is not None,
         "seed": config.seed,
         "variants": list(CAPACITY_COMPARISON_VARIANTS),
-        "capacity": {"hidden_dim": config.hidden_dim, "layers": config.layers},
+        "capacity": {
+            "hidden_dim": config.hidden_dim,
+            "layers": config.layers,
+            "heads": config.heads,
+        },
         "runtime_signature": runtime_signature,
         "training_config": _plain(asdict(config)),
         "variant_policies": variant_protocols,

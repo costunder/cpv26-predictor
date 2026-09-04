@@ -720,6 +720,14 @@ def relgnn_train(
     max_days_per_split: Annotated[
         int | None, typer.Option(min=1, help="Explicit smoke test limit; not a full-season result.")
     ] = None,
+    activation_checkpointing: Annotated[
+        bool,
+        typer.Option(help="Recompute RelGNN layers during backward to reduce peak VRAM."),
+    ] = False,
+    compact_kbo_channels: Annotated[
+        bool,
+        typer.Option(help="Allocate updates only for KBO route-active player roles."),
+    ] = False,
 ) -> None:
     """Train role-aware RelGNN on selected seasons with later validation and held-out test."""
     if train_start_year > train_end_year:
@@ -775,6 +783,8 @@ def relgnn_train(
             route_schedule=route_schedule,
             graph_control=graph_control,
             graph_control_seed=graph_control_seed,
+            activation_checkpointing=activation_checkpointing,
+            compact_kbo_channels=compact_kbo_channels,
         )
         report = train_kbo_relgnn(
             directory, output, config=config, resume=resume, progress=console.print
@@ -1082,6 +1092,14 @@ def relgnn_pair_train(
     selection_target: Annotated[str, typer.Option()] = "auto",
     box_gradient_mode: Annotated[str, typer.Option()] = "auto",
     max_days_per_split: Annotated[int | None, typer.Option(min=1)] = None,
+    activation_checkpointing: Annotated[
+        bool,
+        typer.Option(help="Recompute RelGNN layers during backward to reduce peak VRAM."),
+    ] = False,
+    compact_kbo_channels: Annotated[
+        bool,
+        typer.Option(help="Allocate updates only for KBO route-active player roles."),
+    ] = False,
 ) -> None:
     """Train exactly full and node_only once with matched initialization."""
 
@@ -1128,6 +1146,8 @@ def relgnn_pair_train(
             route_message_normalization="none",
             route_schedule="full",
             graph_control="intact",
+            activation_checkpointing=activation_checkpointing,
+            compact_kbo_channels=compact_kbo_channels,
         )
         report = train_kbo_full_node_comparison(
             directory, target, config=config, progress=console.print
@@ -1143,6 +1163,226 @@ def relgnn_pair_train(
     console.print("Exactly two runs were trained; held-out test was not loaded.")
     if report.get("smoke_test_only"):
         console.print("[yellow]Limited-date smoke comparison, not a full-split result.[/yellow]")
+
+
+@app.command("relgnn-scale-preflight")
+def relgnn_scale_preflight(
+    dataset: Annotated[
+        Path | None, typer.Option(help="Graph dataset to scan; test graph payloads stay sealed.")
+    ] = None,
+    output: Annotated[
+        Path | None, typer.Option(help="JSON report path for workload and CUDA memory audit.")
+    ] = None,
+    device: Annotated[str, typer.Option(help="Explicit CUDA device.")] = "cuda:0",
+    train_start_year: Annotated[int, typer.Option(min=1, max=9999)] = 2001,
+    train_end_year: Annotated[int, typer.Option(min=1, max=9999)] = 2024,
+    validation_year: Annotated[int, typer.Option(min=1, max=9999)] = 2025,
+    test_year: Annotated[int, typer.Option(min=1, max=9999)] = 2026,
+    batch_days: Annotated[int, typer.Option(min=1)] = 8,
+    hidden_dim: Annotated[int, typer.Option(min=4)] = 256,
+    layers: Annotated[int, typer.Option(min=1)] = 3,
+    heads: Annotated[int, typer.Option(min=1)] = 8,
+    amp: Annotated[str, typer.Option()] = "auto",
+    seed: Annotated[int | None, typer.Option(min=0)] = None,
+    max_pa_per_day: Annotated[int, typer.Option(min=0)] = 0,
+    max_edges_per_route: Annotated[int, typer.Option(min=0)] = 0,
+    max_reserved_fraction: Annotated[
+        float,
+        typer.Option(
+            min=0.01,
+            max=1.0,
+            help="Reject before training when measured CUDA reservation exceeds this fraction.",
+        ),
+    ] = 0.85,
+    activation_checkpointing: Annotated[
+        bool,
+        typer.Option(help="Recompute RelGNN layers during backward in the candidate run."),
+    ] = True,
+    compact_kbo_channels: Annotated[
+        bool,
+        typer.Option(help="Use the separately fingerprinted active-channel architecture."),
+    ] = False,
+) -> None:
+    """Scan real batches and run forward/backward/AdamW before a larger training run."""
+
+    if train_start_year > train_end_year:
+        raise typer.BadParameter("--train-start-year must not exceed --train-end-year")
+    settings = _settings()
+    directory = (dataset or settings.home / "datasets" / "kbo_graph").expanduser().resolve()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    destination = (
+        output
+        or settings.home / "reports" / f"relgnn_scale_preflight_{stamp}_{uuid4().hex[:8]}.json"
+    ).expanduser().resolve()
+    try:
+        from cpv26.training.kbo_runner import KBOTrainingConfig
+        from cpv26.training.kbo_scale_preflight import run_kbo_scale_preflight
+
+        config = KBOTrainingConfig(
+            device=device,
+            epochs=30,
+            batch_days=batch_days,
+            hidden_dim=hidden_dim,
+            layers=layers,
+            heads=heads,
+            amp=amp,
+            workers=0,
+            accumulate_steps=1,
+            max_pa_per_day=max_pa_per_day,
+            max_edges_per_route_per_day=max_edges_per_route,
+            patience=0,
+            seed=settings.random_seed if seed is None else seed,
+            train_seasons=tuple(range(train_start_year, train_end_year + 1)),
+            validation_season=validation_year,
+            test_season=test_year,
+            chronological=True,
+            route_message_normalization="none",
+            route_schedule="full",
+            graph_control="intact",
+            activation_checkpointing=activation_checkpointing,
+            compact_kbo_channels=compact_kbo_channels,
+        )
+        report = run_kbo_scale_preflight(
+            directory,
+            config,
+            output=destination,
+            max_reserved_fraction=max_reserved_fraction,
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]RelGNN scale preflight failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    execution = report["execution"]
+    console.print(f"[green]RelGNN scale preflight passed[/green]: {destination}")
+    console.print(
+        f"Parameters: {execution['parameter_count']:,}; "
+        f"peak reserved: {execution['peak_reserved_bytes'] / 2**30:.2f} GiB "
+        f"({execution['peak_reserved_fraction']:.1%})"
+    )
+    console.print("Train/validation batches only; held-out test graph payloads were not loaded.")
+
+
+@app.command("relgnn-scale-report")
+def relgnn_scale_report(
+    baseline_report: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            help="Completed 64x2-vs-128x3 capacity_comparison_report.json.",
+        ),
+    ],
+    candidate_report: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            help="Completed 256x3 full_node_comparison_report.json.",
+        ),
+    ],
+    output: Annotated[
+        Path | None, typer.Option(help="Default: scale_comparison_report.json by candidate.")
+    ] = None,
+) -> None:
+    """Validate lineage and compare 128x3x4 against 256x3x8 on validation."""
+
+    destination = (
+        output
+        or candidate_report.expanduser().resolve().parent / "scale_comparison_report.json"
+    ).expanduser().resolve()
+    try:
+        from cpv26.training.kbo_scale_comparison import compare_kbo_scale_reports
+
+        report = compare_kbo_scale_reports(
+            baseline_report,
+            candidate_report,
+            output_path=destination,
+        )
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        error_console.print(f"[red]RelGNN scale report failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    comparison = report["validation_selection_comparison"]
+    console.print(f"[green]RelGNN scale comparison ready[/green]: {destination}")
+    console.print(
+        "full validation change 256x3-128x3: "
+        f"{comparison['candidate_minus_baseline']['full']:+.6f}; "
+        "dependency-gap change: "
+        f"{comparison['dependency_gap_change_256x3_minus_128x3']:+.6f}"
+    )
+    console.print("Held-out test was not loaded or evaluated.")
+
+
+@app.command("relgnn-scale-train")
+def relgnn_scale_train(
+    baseline_report: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            dir_okay=False,
+            help="Completed 64x2-vs-128x3 capacity report; all settings are inherited.",
+        ),
+    ],
+    dataset: Annotated[
+        Path,
+        typer.Option(
+            exists=True,
+            file_okay=False,
+            help="Exact graph dataset used by the completed baseline report.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(help="256x3x8 full/node_only directory; reuse to resume safely."),
+    ],
+    device: Annotated[
+        str | None,
+        typer.Option(help="Must exactly match baseline device; default inherits it."),
+    ] = None,
+    max_reserved_fraction: Annotated[
+        float,
+        typer.Option(
+            min=0.01,
+            max=1.0,
+            help="Fail before training above this measured CUDA reservation fraction.",
+        ),
+    ] = 0.85,
+) -> None:
+    """Derive, preflight, train, and compare one controlled 256x3x8 pair."""
+
+    try:
+        from cpv26.training.kbo_scale_workflow import train_kbo_scale_workflow
+
+        report = train_kbo_scale_workflow(
+            baseline_report,
+            dataset,
+            output,
+            device=device,
+            max_reserved_fraction=max_reserved_fraction,
+            progress=console.print,
+        )
+    except (
+        FileExistsError,
+        FileNotFoundError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        KeyError,
+    ) as exc:
+        error_console.print(f"[red]RelGNN scale training failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    comparison = report["comparison"]["validation_selection_comparison"]
+    console.print(f"[green]RelGNN scale workflow completed[/green]: {report['output_directory']}")
+    console.print(f"Preflight report: {report['preflight_report']}")
+    console.print(f"Scale report: {report['scale_report']}")
+    console.print(
+        "full validation change 256x3-128x3: "
+        f"{comparison['candidate_minus_baseline']['full']:+.6f}; "
+        "dependency-gap change: "
+        f"{comparison['dependency_gap_change_256x3_minus_128x3']:+.6f}"
+    )
+    console.print("Exactly full/node_only at one seed; held-out test stayed sealed.")
 
 
 @app.command("relgnn-ablation-report")

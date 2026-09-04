@@ -301,6 +301,10 @@ def test_suite_manifest_resume_allows_only_epoch_extension(
     path = tmp_path / "suite_config.json"
     original = manifest(base)
     matched._validate_or_write_manifest(path, original)
+    legacy = json.loads(path.read_text(encoding="utf-8"))
+    legacy["base_training_config"].pop("activation_checkpointing")
+    legacy["base_training_config"].pop("compact_kbo_channels")
+    path.write_text(json.dumps(legacy), encoding="utf-8")
     matched._validate_or_write_manifest(path, original)
     extended = manifest(replace(base, epochs=3))
     matched._validate_or_write_manifest(path, extended)
@@ -319,6 +323,25 @@ def test_suite_manifest_resume_allows_only_epoch_extension(
     changed_runtime["runtime_signature"]["torch_version"] = "different-runtime"
     with pytest.raises(ValueError, match="fairness setting"):
         matched._validate_or_write_manifest(path, changed_runtime)
+
+
+def test_child_report_normalizes_legacy_missing_execution_fields() -> None:
+    expected = matched._variant_config(_config(epochs=2), "full", 37)
+    configuration = asdict(expected)
+    configuration.pop("activation_checkpointing")
+    configuration.pop("compact_kbo_channels")
+    report = {
+        "configuration": configuration,
+        "completed_epochs": 2,
+        "test_used_during_training": False,
+    }
+
+    matched._validate_child_report(report, expected)
+
+    truncated = copy.deepcopy(report)
+    truncated["configuration"].pop("dropout")
+    with pytest.raises(ValueError, match="fairness settings"):
+        matched._validate_child_report(truncated, expected)
 
 
 def test_interrupted_child_checkpoint_rejects_fairness_and_control_mismatch(

@@ -385,6 +385,29 @@ def test_candidate_config_allows_only_the_128x3_capacity_change() -> None:
     assert "seeds" not in inspect.signature(capacity.train_kbo_capacity_comparison).parameters
 
 
+def test_comparison_manifest_normalizes_legacy_missing_execution_fields(
+    tmp_path: Path,
+) -> None:
+    config = replace(_baseline_config(), hidden_dim=128, layers=3)
+    manifest = {
+        "protocol": capacity.CAPACITY_COMPARISON_PROTOCOL,
+        "training_config": asdict(config),
+    }
+    legacy = json.loads(json.dumps(manifest))
+    legacy["training_config"].pop("activation_checkpointing")
+    legacy["training_config"].pop("compact_kbo_channels")
+    path = tmp_path / capacity.CAPACITY_COMPARISON_MANIFEST
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    capacity._validate_or_write_manifest(path, manifest)
+
+    truncated = json.loads(path.read_text(encoding="utf-8"))
+    truncated["training_config"].pop("dropout")
+    path.write_text(json.dumps(truncated), encoding="utf-8")
+    with pytest.raises(ValueError, match="resume changes"):
+        capacity._validate_or_write_manifest(path, manifest)
+
+
 def test_multi_seed_baseline_requires_explicit_selection_and_sealed_test(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -412,6 +435,34 @@ def test_multi_seed_baseline_requires_explicit_selection_and_sealed_test(
     report["test_used_for_training_selection_or_comparison"] = True
     report_path.write_text(json.dumps(report), encoding="utf-8")
     with pytest.raises(ValueError, match="held-out test stayed sealed"):
+        capacity.train_kbo_capacity_comparison(
+            graph,
+            suite,
+            tmp_path / "output",
+            config=replace(base, hidden_dim=128, layers=3),
+            baseline_seed=SEED,
+            progress=lambda _: None,
+        )
+
+
+def test_baseline_suite_normalizes_legacy_missing_execution_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph, suite, base = _write_baseline(tmp_path)
+    _patch_protocol_runtime(monkeypatch)
+    for filename in ("matched_retraining_report.json", "suite_config.json"):
+        path = suite / filename
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["base_training_config"].pop("activation_checkpointing")
+        document["base_training_config"].pop("compact_kbo_channels")
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    manifest_path = suite / "suite_config.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["test_policy"] = "invalid"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest does not seal"):
         capacity.train_kbo_capacity_comparison(
             graph,
             suite,

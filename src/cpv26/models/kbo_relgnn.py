@@ -126,6 +126,8 @@ class KBORelGNNConfig:
     box_gradient_mode: str = "shared"
     route_message_normalization: str = "none"
     route_schedule: tuple[tuple[str, ...], ...] | None = None
+    activation_checkpointing: bool = False
+    compact_kbo_channels: bool = False
 
     def __post_init__(self) -> None:
         for name in ("node_feature_dims", "role_feature_dims", "route_feature_dims"):
@@ -169,6 +171,10 @@ class KBORelGNNConfig:
             raise ValueError("box_gradient_mode must be shared or head_only")
         if self.route_message_normalization not in {"none", "layer_norm"}:
             raise ValueError("route_message_normalization must be none or layer_norm")
+        if not isinstance(self.activation_checkpointing, bool):
+            raise ValueError("activation_checkpointing must be boolean")
+        if not isinstance(self.compact_kbo_channels, bool):
+            raise ValueError("compact_kbo_channels must be boolean")
         object.__setattr__(
             self,
             "route_schedule",
@@ -198,6 +204,8 @@ class KBORelGNNConfig:
             "box_pitching_feature_dim": self.box_pitching_feature_dim,
             "box_gradient_mode": self.box_gradient_mode,
             "route_message_normalization": self.route_message_normalization,
+            "activation_checkpointing": self.activation_checkpointing,
+            "compact_kbo_channels": self.compact_kbo_channels,
             "route_schedule": (
                 None
                 if self.route_schedule is None
@@ -233,7 +241,17 @@ class KBORelGNNModel(ModuleBase):
             role_widths,
             hidden_dim=config.hidden_dim,
             dropout=config.dropout,
+            active_roles=tuple(role_widths) if config.compact_kbo_channels else None,
         )
+        active_update_channels = None
+        if config.compact_kbo_channels:
+            active_update_channels = {
+                "team",
+                "player__batting",
+                "player__pitching",
+            }
+            if self.uses_game_nodes:
+                active_update_channels.add("game")
         self.backbone: Any = CompositeRelGNNBackbone(
             node_feature_dims=node_widths,
             route_feature_dims=config.route_feature_dims,
@@ -245,6 +263,8 @@ class KBORelGNNModel(ModuleBase):
             registry=kbo_route_registry(),
             route_message_normalization=config.route_message_normalization,
             route_schedule=config.route_schedule,
+            activation_checkpointing=config.activation_checkpointing,
+            active_update_channels=active_update_channels,
         )
         self.match_head: Any = WDLHead(
             config.hidden_dim,

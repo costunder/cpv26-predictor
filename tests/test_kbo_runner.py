@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -209,6 +211,77 @@ def _config(epochs: int = 1, **overrides: Any) -> KBOTrainingConfig:
         dropout=0.0,
         **overrides,
     )
+
+
+def test_training_releases_each_device_batch_before_the_next_transfer(
+    graph_directory: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reference release changes lifetime only, never numerical/report results."""
+
+    torch = pytest.importorskip("torch")
+    config = _config()
+    reference = train_kbo_relgnn(
+        graph_directory,
+        tmp_path / "reference-lifetime",
+        config=config,
+        progress=lambda _: None,
+    )
+    original_move = runner_module._move
+    original_losses = runner_module._losses
+    previous_batch_sentinel: weakref.ReferenceType[Any] | None = None
+    previous_output: weakref.ReferenceType[Any] | None = None
+    transfer_count = 0
+
+    def tracked_move(value: Any, device: Any) -> Any:
+        nonlocal previous_batch_sentinel, transfer_count
+        gc.collect()
+        if previous_batch_sentinel is not None:
+            assert previous_batch_sentinel() is None, (
+                "the previous device batch still overlaps the next transfer"
+            )
+        if previous_output is not None:
+            assert previous_output() is None, (
+                "the previous model output still overlaps the next transfer"
+            )
+        moved = dict(original_move(value, device))
+        sentinel = torch.empty(1, device=device)
+        moved["_device_batch_lifetime_sentinel"] = sentinel
+        previous_batch_sentinel = weakref.ref(sentinel)
+        transfer_count += 1
+        return moved
+
+    def tracked_losses(outputs: Any, batch: Any, options: Any) -> Any:
+        nonlocal previous_output
+        previous_output = weakref.ref(outputs["match_logits"])
+        return original_losses(outputs, batch, options)
+
+    monkeypatch.setattr(runner_module, "_move", tracked_move)
+    monkeypatch.setattr(runner_module, "_losses", tracked_losses)
+    observed = train_kbo_relgnn(
+        graph_directory,
+        tmp_path / "observed-lifetime",
+        config=config,
+        progress=lambda _: None,
+    )
+    gc.collect()
+
+    assert transfer_count == 4  # two train batches followed by two validation batches
+    assert previous_batch_sentinel is not None and previous_batch_sentinel() is None
+    assert previous_output is not None and previous_output() is None
+    assert observed["initial_model_state_sha256"] == reference[
+        "initial_model_state_sha256"
+    ]
+    assert observed["parameter_count"] == reference["parameter_count"]
+    assert observed["optimizer_steps"] == reference["optimizer_steps"]
+    assert observed["best_validation_loss"] == reference["best_validation_loss"]
+    assert observed["history"][0]["train_losses"] == reference["history"][0][
+        "train_losses"
+    ]
+    assert observed["history"][0]["validation"] == reference["history"][0][
+        "validation"
+    ]
 
 
 def test_cuda_is_required_unless_cpu_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:

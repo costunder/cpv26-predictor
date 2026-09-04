@@ -88,6 +88,88 @@ def _model() -> Any:
     return KBORelGNNModel(_config())
 
 
+def test_activation_checkpointing_preserves_outputs_gradients_and_state_dict() -> None:
+    batch = collate_kbo_day_graphs([_day()])
+    config = replace(_config(), dropout=0.2)
+    plain = KBORelGNNModel(config)
+    checkpointed = KBORelGNNModel(replace(config, activation_checkpointing=True))
+    checkpointed.load_state_dict(plain.state_dict())
+    plain.train()
+    checkpointed.train()
+
+    torch.manual_seed(710)
+    plain_output = plain(batch)
+    torch.manual_seed(710)
+    checkpointed_output = checkpointed(batch)
+    for name in plain_output:
+        if torch.is_tensor(plain_output[name]):
+            torch.testing.assert_close(checkpointed_output[name], plain_output[name])
+
+    rng_before_backward = torch.get_rng_state().clone()
+    kbo_multitask_loss(plain_output, batch)["loss"].backward()
+    kbo_multitask_loss(checkpointed_output, batch)["loss"].backward()
+    assert torch.equal(torch.get_rng_state(), rng_before_backward)
+    plain_gradients = dict(plain.named_parameters())
+    checkpointed_gradients = dict(checkpointed.named_parameters())
+    assert plain.state_dict().keys() == checkpointed.state_dict().keys()
+    assert plain_gradients.keys() == checkpointed_gradients.keys()
+    for name, parameter in plain_gradients.items():
+        other = checkpointed_gradients[name]
+        if parameter.grad is None or other.grad is None:
+            assert parameter.grad is None and other.grad is None
+        else:
+            torch.testing.assert_close(other.grad, parameter.grad)
+
+
+def test_compact_kbo_channels_remove_only_route_inactive_capacity() -> None:
+    legacy = KBORelGNNModel(_config())
+    compact = KBORelGNNModel(replace(_config(), compact_kbo_channels=True))
+
+    assert set(legacy.backbone.player_encoder.adapters) == {
+        "batting",
+        "pitching",
+        "defense",
+        "baserunning",
+        "catcher",
+    }
+    assert set(compact.backbone.player_encoder.adapters) == {"batting", "pitching"}
+    assert set(compact.backbone.layers[0].updaters) == {
+        "team",
+        "player__batting",
+        "player__pitching",
+    }
+    assert tuple(legacy.backbone.layers[0].updaters) == tuple(
+        sorted(legacy.backbone.layers[0].updaters)
+    )
+    assert tuple(compact.backbone.layers[0].updaters) == tuple(
+        sorted(compact.backbone.layers[0].updaters)
+    )
+    raw_day = _day()
+    shared = torch.as_tensor(raw_day["node_features"]["player"])
+    with pytest.raises(ValueError, match="not active"):
+        compact.backbone.player_encoder.encode_state(
+            shared,
+            {
+                "batting": torch.as_tensor(raw_day["role_features"]["batting"]),
+                "pitching": torch.as_tensor(raw_day["role_features"]["pitching"]),
+                "defense": torch.empty((shared.shape[0], 0)),
+            },
+        )
+    assert sum(parameter.numel() for parameter in compact.parameters()) < sum(
+        parameter.numel() for parameter in legacy.parameters()
+    )
+
+    batch = collate_kbo_day_graphs([_day()])
+    output = compact(batch)
+    loss = kbo_multitask_loss(output, batch)["loss"]
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in compact.parameters()
+    )
+
+
 def _game_only_day(day_id: str = "2001-04-05", *, with_history: bool = True) -> dict[str, Any]:
     day = _day(day_id)
     day["node_features"]["player"] = np.empty((0, 4), dtype=np.float32)

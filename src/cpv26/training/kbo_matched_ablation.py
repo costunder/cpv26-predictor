@@ -230,6 +230,41 @@ def _suite_manifest(
     }
 
 
+def _normalized_legacy_execution_fields(
+    value: Any, *, context: str
+) -> dict[str, Any]:
+    """Fill only execution switches absent from pre-scale artifacts."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{context} has no training configuration")
+    normalized = dict(_plain(value))
+    normalized.setdefault("activation_checkpointing", False)
+    normalized.setdefault("compact_kbo_channels", False)
+    return normalized
+
+
+def _normalized_manifest_training_config(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("matched suite manifest has no base training configuration")
+    normalized = _normalized_legacy_execution_fields(
+        value, context="matched suite manifest"
+    )
+    projected_fields = {
+        "seed",
+        "route_message_normalization",
+        "route_schedule",
+        "graph_control",
+    }
+    present_fields = projected_fields.intersection(normalized)
+    if present_fields and present_fields != projected_fields:
+        raise ValueError(
+            "matched suite training configuration has a partial projected-policy field set"
+        )
+    for key in present_fields:
+        normalized.pop(key)
+    return dict(_plain(normalized))
+
+
 def _validate_or_write_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
     if not path.exists():
         runner._atomic_json(path, manifest)
@@ -237,6 +272,12 @@ def _validate_or_write_manifest(path: Path, manifest: Mapping[str, Any]) -> None
     with path.open(encoding="utf-8") as handle:
         saved = json.load(handle)
     left, right = dict(saved), _plain(manifest)
+    left["base_training_config"] = _normalized_manifest_training_config(
+        left.get("base_training_config")
+    )
+    right["base_training_config"] = _normalized_manifest_training_config(
+        right.get("base_training_config")
+    )
     old_seeds = list(left.pop("seeds"))
     new_seeds = list(right.pop("seeds"))
     if new_seeds[: len(old_seeds)] != old_seeds:
@@ -256,7 +297,12 @@ def _validate_or_write_manifest(path: Path, manifest: Mapping[str, Any]) -> None
 def _validate_child_report(
     report: Mapping[str, Any], expected: runner.KBOTrainingConfig
 ) -> None:
-    actual = dict(report["configuration"])
+    raw_actual = report.get("configuration")
+    if not isinstance(raw_actual, Mapping):
+        raise ValueError("existing matched child has no training configuration")
+    actual = _normalized_legacy_execution_fields(
+        raw_actual, context="existing matched child"
+    )
     expected_values = _plain(asdict(expected))
     actual_epochs = int(actual.pop("epochs"))
     expected_epochs = int(expected_values.pop("epochs"))

@@ -501,6 +501,40 @@ sealed metadata일 뿐 graph나 label을 로드하거나 평가하지 않는다.
 차이는 capacity/schema 확장 방향을 고르는 screening이며 seed 간 분산이나 안정성의 근거가
 아니다. 이 단계에서는 seed를 추가하지 않고 test도 계속 봉인한다.
 
+### 128×3 이후의 통제된 production-scale 후보
+
+128×3×4는 용량 민감도를 보는 중간 지점이다. 현재 v5 서버 schema에서 약 660만 parameter이고,
+후속 후보 256×3×8은 약 2,614만 parameter다. 그래프 감사의 전체 node/edge 수는 날짜별
+snapshot occurrence의 합이며 단일 거대 연결 그래프의 동시 메모리 크기가 아니다. loader는
+`batch_days`개의 독립 날짜 그래프를 합친다.
+
+`relgnn-scale-train` 하나가 완료된 128×3 capacity report를 검증하고 256×3×8 설정을 파생한 뒤,
+CUDA preflight → `full/node_only` pair → validation scale report를 순서대로 실행한다. v5,
+2001–2024 train, 2025 validation, 봉인된 2026 test, full 기간, uncapped PA/edge, seed 2026,
+30 epochs, batch-days 8과 accumulation 1만 허용한다. split, runtime, optimizer, objective와
+나머지 설정은 baseline에서 상속하므로 CLI에서 다시 적어 drift를 만들 수 없다.
+
+~~~bash
+cpv26 relgnn-scale-train \
+  --baseline-report var/runs/relgnn_capacity/kbo_2001_2024_v5_64x2_vs_128x3/capacity_comparison_report.json \
+  --dataset var/datasets/kbo_graph_2001_2026_v5 \
+  --output var/runs/relgnn_pairs/kbo_2001_2024_v5_256x3x8_seed2026 \
+  --max-reserved-fraction 0.85
+~~~
+
+preflight는 하나의 fresh model/AdamW를 유지한다. 첫 batch warmup 후 모든 실제 train/validation
+batch를 실행해 optimizer state를 materialize하고, allocator cache를 한 번 비운 다음 모든 batch를
+다시 실행한다. steady pass에서는 batch 사이 cache를 비우지 않아 장기 caching-allocator reserved
+high-water를 측정한다. 기본 허용선은 선택 GPU memory의 85%이며 실패 JSON도 atomic하게 남는다.
+본 runner도 iteration 끝에 GPU batch/output 참조를 끊어 다음 batch transfer와 겹치지 않는다.
+test GraphDay/label은 열지 않는다.
+
+preflight 통과 후에만 v5의 full/node_only를 학습한다. 최종 `scale_workflow_report.json`은 두
+용량의 초기화·split·runtime·표본·예산·실제 optimizer-step 수와 baseline/preflight/candidate
+SHA-256을 다시 확인한 뒤 한 번만 기록한다. Activation checkpointing 차이는 허용하지만 compact
+channel mode는 별도 아키텍처이므로 거부한다. 이 경로도 multi-seed와 held-out test 평가는
+수행하지 않는다.
+
 ## Matched-from-scratch 그래프 ablation (기존 6조건, 이번 범위에서는 사용하지 않음)
 
 `relgnn-ablation-train`은 고정 checkpoint intervention과 별개로 여섯 조건을 처음부터

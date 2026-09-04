@@ -185,12 +185,209 @@ def test_pair_command_trains_exactly_the_two_condition_protocol(
     assert config.graph_control == "intact"
 
 
+def test_pair_command_forwards_production_scale_execution_options(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from cpv26.training import kbo_capacity_comparison
+
+    _runtime(tmp_path, monkeypatch)
+    calls: list[Any] = []
+
+    def fake_pair(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["config"])
+        return {"validation_selection_comparison": {"node_only_minus_full": 0.0}}
+
+    monkeypatch.setattr(
+        kbo_capacity_comparison, "train_kbo_full_node_comparison", fake_pair
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "relgnn-pair-train",
+            "--dataset",
+            str(tmp_path / "graph"),
+            "--output",
+            str(tmp_path / "pair"),
+            "--device",
+            "cpu",
+            "--amp",
+            "off",
+            "--hidden-dim",
+            "256",
+            "--layers",
+            "3",
+            "--heads",
+            "8",
+            "--activation-checkpointing",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    config = calls[0]
+    assert (config.hidden_dim, config.layers, config.heads) == (256, 3, 8)
+    assert config.activation_checkpointing is True
+    assert config.compact_kbo_channels is False
+
+
+def test_scale_preflight_uses_production_defaults_and_writes_requested_report(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from cpv26.training import kbo_scale_preflight
+
+    _runtime(tmp_path, monkeypatch)
+    calls: list[dict[str, Any]] = []
+
+    def fake_preflight(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"args": args, **kwargs})
+        return {
+            "execution": {
+                "parameter_count": 26_140_772,
+                "peak_reserved_bytes": 5 * 2**30,
+                "peak_reserved_fraction": 0.5,
+            }
+        }
+
+    monkeypatch.setattr(kbo_scale_preflight, "run_kbo_scale_preflight", fake_preflight)
+    dataset = tmp_path / "graph"
+    output = tmp_path / "preflight.json"
+    result = CliRunner().invoke(
+        app,
+        [
+            "relgnn-scale-preflight",
+            "--dataset",
+            str(dataset),
+            "--output",
+            str(output),
+            "--seed",
+            "2026",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0]["args"][0] == dataset.resolve()
+    assert calls[0]["output"] == output.resolve()
+    assert calls[0]["max_reserved_fraction"] == 0.85
+    config = calls[0]["args"][1]
+    assert (config.hidden_dim, config.layers, config.heads) == (256, 3, 8)
+    assert config.batch_days == 8
+    assert config.accumulate_steps == 1
+    assert config.activation_checkpointing is True
+    assert config.compact_kbo_channels is False
+    assert config.chronological is True
+    assert config.train_seasons == tuple(range(2001, 2025))
+    assert (config.validation_season, config.test_season) == (2025, 2026)
+
+
+def test_scale_report_forwards_source_reports_and_destination(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from cpv26.training import kbo_scale_comparison
+
+    _runtime(tmp_path, monkeypatch)
+    baseline = tmp_path / "capacity_comparison_report.json"
+    candidate = tmp_path / "candidate" / "full_node_comparison_report.json"
+    candidate.parent.mkdir()
+    baseline.write_text("{}", encoding="utf-8")
+    candidate.write_text("{}", encoding="utf-8")
+    output = tmp_path / "scale.json"
+    calls: list[dict[str, Any]] = []
+
+    def fake_compare(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"args": args, **kwargs})
+        return {
+            "validation_selection_comparison": {
+                "candidate_minus_baseline": {"full": -0.01},
+                "dependency_gap_change_256x3_minus_128x3": 0.02,
+            }
+        }
+
+    monkeypatch.setattr(kbo_scale_comparison, "compare_kbo_scale_reports", fake_compare)
+    result = CliRunner().invoke(
+        app,
+        [
+            "relgnn-scale-report",
+            "--baseline-report",
+            str(baseline),
+            "--candidate-report",
+            str(candidate),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        {
+            "args": (baseline, candidate),
+            "output_path": output.resolve(),
+        }
+    ]
+
+
+def test_scale_train_uses_one_fail_closed_workflow_command(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from cpv26.training import kbo_scale_workflow
+
+    _runtime(tmp_path, monkeypatch)
+    baseline = tmp_path / "capacity_comparison_report.json"
+    baseline.write_text("{}", encoding="utf-8")
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    output = tmp_path / "candidate"
+    calls: list[dict[str, Any]] = []
+
+    def fake_workflow(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"args": args, **kwargs})
+        return {
+            "output_directory": str(output),
+            "preflight_report": str(tmp_path / "preflight.json"),
+            "scale_report": str(output / "scale_comparison_report.json"),
+            "comparison": {
+                "validation_selection_comparison": {
+                    "candidate_minus_baseline": {"full": -0.01},
+                    "dependency_gap_change_256x3_minus_128x3": 0.02,
+                }
+            },
+        }
+
+    monkeypatch.setattr(kbo_scale_workflow, "train_kbo_scale_workflow", fake_workflow)
+    result = CliRunner().invoke(
+        app,
+        [
+            "relgnn-scale-train",
+            "--baseline-report",
+            str(baseline),
+            "--dataset",
+            str(dataset),
+            "--output",
+            str(output),
+            "--device",
+            "cuda:0",
+            "--max-reserved-fraction",
+            "0.8",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0]["args"] == (baseline, dataset, output)
+    assert calls[0]["device"] == "cuda:0"
+    assert calls[0]["max_reserved_fraction"] == 0.8
+    assert callable(calls[0]["progress"])
+
+
 def test_new_graph_commands_have_help() -> None:
     runner = CliRunner()
     for command in (
         "kbo-graph-audit",
         "relgnn-capacity-compare",
         "relgnn-pair-train",
+        "relgnn-scale-preflight",
+        "relgnn-scale-report",
+        "relgnn-scale-train",
     ):
         result = runner.invoke(app, [command, "--help"])
         assert result.exit_code == 0, result.output

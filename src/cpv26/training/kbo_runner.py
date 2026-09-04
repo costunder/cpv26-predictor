@@ -104,6 +104,8 @@ class KBOTrainingConfig:
     route_schedule: str = "full"
     graph_control: str = "intact"
     graph_control_seed: int = 2026
+    activation_checkpointing: bool = False
+    compact_kbo_channels: bool = False
 
     def __post_init__(self) -> None:
         positive = (
@@ -146,6 +148,10 @@ class KBOTrainingConfig:
             raise ValueError("amp must be auto, off, fp16, or bf16")
         if not isinstance(self.chronological, bool):
             raise ValueError("chronological must be a boolean")
+        if not isinstance(self.activation_checkpointing, bool):
+            raise ValueError("activation_checkpointing must be a boolean")
+        if not isinstance(self.compact_kbo_channels, bool):
+            raise ValueError("compact_kbo_channels must be a boolean")
         if self.selection_target not in {"auto", "match", "weighted"}:
             raise ValueError("selection_target must be auto, match, or weighted")
         if self.box_gradient_mode not in {"auto", "shared", "head_only"}:
@@ -177,6 +183,8 @@ class KBOTrainingConfig:
         options.setdefault("route_schedule", "full")
         options.setdefault("graph_control", "intact")
         options.setdefault("graph_control_seed", 2026)
+        options.setdefault("activation_checkpointing", False)
+        options.setdefault("compact_kbo_channels", False)
         return cls(**options)
 
 
@@ -563,6 +571,8 @@ def _model_config(dataset: KBOGraphDataset, config: KBOTrainingConfig) -> KBORel
         box_gradient_mode=_training_policies(config)["box_gradient_mode"],
         route_message_normalization=config.route_message_normalization,
         route_schedule=_resolved_route_schedule(config),
+        activation_checkpointing=config.activation_checkpointing,
+        compact_kbo_channels=config.compact_kbo_channels,
     )
 
 
@@ -626,6 +636,8 @@ def _policy_report(config: KBOTrainingConfig, model_config: KBORelGNNConfig) -> 
         "execution_optimizations": {
             "shared_bidirectional_route_context": True,
             "dtype_packed_cuda_input_transfer": True,
+            "activation_checkpointing": config.activation_checkpointing,
+            "compact_kbo_channels": config.compact_kbo_channels,
             "optimizer_algorithm_changed": False,
         },
     }
@@ -812,6 +824,14 @@ def _evaluate_model(
                             if include_boxscore or not known_pa[index]:
                                 row["observed_pa_lower_bound"] = int(pa_minimum[index])
                         predictions[name].append(row)
+            # Drop every GPU-owning iteration local before the next loader item is
+            # transferred.  Python evaluates the next ``_move(...)`` RHS before
+            # rebinding these names; without the explicit release, the previous
+            # batch and outputs overlap the next transfer (and the final training
+            # batch overlaps the first validation batch in the caller).
+            if include_boxscore:
+                del box_probabilities
+            del labels, values, losses, outputs, batch
     means = {name: sums[name] / max(1, counts[name]) for name in sums}
     contributions = {name: means[name] * getattr(config, f"{name}_weight") for name in means}
     weighted_loss = sum(contributions.values())
@@ -1165,6 +1185,10 @@ def train_kbo_relgnn(
                     f"epoch {epoch + 1}/{options.epochs} batch {index + 1}/{len(loader)} "
                     f"loss={float(losses['loss'].detach().cpu()):.4f}"
                 )
+            # Ensure the next packed H2D transfer cannot overlap the previous
+            # GPU batch through Python's RHS-before-rebind evaluation order.
+            # This also releases the last training batch before validation.
+            del losses, batch
         validation, _ = _evaluate_model(
             model,
             _loader(directory, splits["validation"], options, epoch=epoch, training=False),

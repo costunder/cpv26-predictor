@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from enum import Enum
 from typing import Any
 
@@ -75,6 +75,7 @@ class RoleAwarePlayerEncoder(ModuleBase):
         *,
         hidden_dim: int = 128,
         dropout: float = 0.1,
+        active_roles: Iterable[str | PlayerRole] | None = None,
     ) -> None:
         require_torch()
         super().__init__()
@@ -92,13 +93,32 @@ class RoleAwarePlayerEncoder(ModuleBase):
         unknown = set(normalized_dims).difference(PLAYER_ROLES)
         if unknown:
             raise ValueError(f"unknown role dimensions: {sorted(unknown)}")
-        for role in PLAYER_ROLES:
+        if active_roles is None:
+            normalized_active_roles = PLAYER_ROLES
+        else:
+            requested = tuple(normalize_player_role(role) for role in active_roles)
+            if len(set(requested)) != len(requested):
+                raise ValueError("active_roles contains duplicate roles")
+            requested_set = set(requested)
+            normalized_active_roles = tuple(
+                role for role in PLAYER_ROLES if role in requested_set
+            )
+            inactive_dimensions = set(normalized_dims).difference(requested_set)
+            if inactive_dimensions:
+                raise ValueError(
+                    "role_feature_dims contains inactive roles: "
+                    f"{sorted(inactive_dimensions)}"
+                )
+        if not normalized_active_roles:
+            raise ValueError("active_roles cannot be empty")
+        for role in normalized_active_roles:
             normalized_dims.setdefault(role, 0)
         if any(value < 0 for value in normalized_dims.values()):
             raise ValueError("role feature dimensions must be non-negative")
 
         self.shared_input_dim = shared_input_dim
         self.hidden_dim = hidden_dim
+        self.active_roles = normalized_active_roles
         self.role_feature_dims = normalized_dims
         self.shared_core = nn.Sequential(
             nn.Linear(shared_input_dim, hidden_dim * 2),
@@ -129,6 +149,8 @@ class RoleAwarePlayerEncoder(ModuleBase):
         role: str | PlayerRole,
     ) -> Any:
         role_name = normalize_player_role(role)
+        if role_name not in self.role_feature_dims:
+            raise ValueError(f"player role {role_name!r} is not active in this encoder")
         expected_dim = self.role_feature_dims[role_name]
         if role_features is None:
             if expected_dim:
@@ -147,7 +169,7 @@ class RoleAwarePlayerEncoder(ModuleBase):
         shared_features: Any,
         role_features: Mapping[str | PlayerRole, Any | None] | None = None,
     ) -> tuple[Any, dict[str, Any]]:
-        """Encode the shared state and every canonical player-role channel.
+        """Encode the shared state and every active player-role channel.
 
         Missing role features are allowed only for adapters configured with
         width zero. This complete mapping is the contract consumed by the
@@ -160,10 +182,13 @@ class RoleAwarePlayerEncoder(ModuleBase):
             if role_name in supplied:
                 raise ValueError(f"duplicate role features after normalization: {role_name}")
             supplied[role_name] = features
+        inactive = set(supplied).difference(self.active_roles)
+        if inactive:
+            raise ValueError(f"player role features are not active: {sorted(inactive)}")
 
         shared_embedding = self.encode_shared(shared_features)
         encoded: dict[str, Any] = {}
-        for role_name in PLAYER_ROLES:
+        for role_name in self.active_roles:
             features = supplied.get(role_name)
             expected_dim = self.role_feature_dims[role_name]
             if features is None:
@@ -202,6 +227,8 @@ class RoleAwarePlayerEncoder(ModuleBase):
         encoded: dict[str, Any] = {}
         for raw_role, features in role_features.items():
             role_name = normalize_player_role(raw_role)
+            if role_name not in self.role_feature_dims:
+                raise ValueError(f"player role {role_name!r} is not active in this encoder")
             if role_name in encoded:
                 raise ValueError(
                     f"duplicate role features after normalization: {role_name}"
