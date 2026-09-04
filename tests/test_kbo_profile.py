@@ -272,7 +272,11 @@ def test_optimization_comparison_alternates_fresh_sessions_and_uses_medians(
 
     def loader(directory: Path, selected_days: Any, options: Any, **kwargs: Any) -> Any:
         assert directory == tmp_path and selected_days is days and options is config
-        assert kwargs == {"epoch": 0, "training": True}
+        assert kwargs == {
+            "epoch": 0,
+            "training": True,
+            "packed_transfers": flags[-1],
+        }
         return "same input batches"
 
     def measure(session: Any, batches: Any, options: Any, selected: Any, **kwargs: Any) -> Any:

@@ -18,7 +18,12 @@ from uuid import uuid4
 
 import numpy as np
 
-from cpv26.data.kbo_graph_dataset import GraphDay, KBOGraphDataset
+from cpv26.data.kbo_dataset_loader import (
+    KBOGraphDatasetLike,
+    open_kbo_graph_dataset,
+)
+from cpv26.data.kbo_graph_dataset import GraphDay
+from cpv26.data.kbo_graph_dataset import KBOGraphDataset as KBOGraphDataset
 from cpv26.data.kbo_playbyplay import sha256_file
 from cpv26.evaluation import evaluate_probabilities
 from cpv26.models._torch import require_torch
@@ -31,7 +36,7 @@ from cpv26.models.kbo_relgnn import (
 )
 from cpv26.simulation.adapter import NEURAL_PA_OUTCOMES
 
-from .batch_transfer import move_batch
+from .batch_transfer import move_batch, prefetch_batches
 from .optimizer_state import make_adamw, optimizer_parameter_names
 
 CHECKPOINT_VERSION = 1
@@ -188,6 +193,30 @@ class KBOTrainingConfig:
         return cls(**options)
 
 
+@dataclass(frozen=True, slots=True)
+class _TemporalExecution:
+    """Immutable selected CUDA plan shared by both temporal variants."""
+
+    report_path: Path
+    report_sha256: str
+    plan_fingerprint: str
+    variant: str
+    rows: tuple[Mapping[str, Any], ...]
+
+    def split_rows(self, split: str) -> tuple[Mapping[str, Any], ...]:
+        return tuple(row for row in self.rows if row["split"] == split)
+
+    def lineage(self) -> dict[str, Any]:
+        return {
+            "report_path": str(self.report_path),
+            "report_sha256": self.report_sha256,
+            "plan_fingerprint": self.plan_fingerprint,
+            "variant": self.variant,
+            "train_batch_count": len(self.split_rows("train")),
+            "validation_batch_count": len(self.split_rows("validation")),
+        }
+
+
 def _device_and_precision(requested: str, amp: str) -> tuple[Any, Any | None, dict[str, Any]]:
     torch, _ = require_torch()
     if amp not in {"auto", "off", "fp16", "bf16"}:
@@ -305,18 +334,48 @@ def _move(value: Any, device: Any) -> Any:
 
 
 class _DayDataset:
-    def __init__(self, directory: Path, days: Sequence[date]) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        days: Sequence[date],
+        *,
+        expected_sample_fingerprints: Mapping[date, str] | None = None,
+    ) -> None:
         self.directory = directory
         self.selected_days = tuple(days)
-        self._dataset: KBOGraphDataset | None = None
+        self.expected_sample_fingerprints = (
+            None
+            if expected_sample_fingerprints is None
+            else dict(expected_sample_fingerprints)
+        )
+        self._dataset: KBOGraphDatasetLike | None = None
 
     def __len__(self) -> int:
         return len(self.selected_days)
 
     def __getitem__(self, index: int) -> GraphDay:
         if self._dataset is None:
-            self._dataset = KBOGraphDataset(self.directory)
-        return self._dataset.load_day(self.selected_days[index])
+            self._dataset = open_kbo_graph_dataset(self.directory)
+        day = self.selected_days[index]
+        graph = self._dataset.load_day(day)
+        if self.expected_sample_fingerprints is not None:
+            try:
+                expected = self.expected_sample_fingerprints[day]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"temporal loader has no selected sample fingerprint for {day}"
+                ) from exc
+            # Verify in the worker before collate discards per-day boundaries.
+            # No digest cache is used: every epoch must attest the GraphDay it
+            # actually materialized, including labels, endpoints, and features.
+            from cpv26.data.kbo_temporal_archive import _sample_fingerprint
+
+            if _sample_fingerprint(graph) != expected:
+                raise RuntimeError(
+                    "materialized temporal sample differs from the selected CUDA plan: "
+                    f"{day.isoformat()}"
+                )
+        return graph
 
 
 def _graph_control_report(config: KBOTrainingConfig) -> dict[str, Any]:
@@ -388,6 +447,426 @@ def _collate_loader_days(
     return _prepare_graph_batch(batch, config)
 
 
+def _temporal_variant(config: KBOTrainingConfig) -> str:
+    if config.route_schedule == "full":
+        return "full"
+    if config.route_schedule == "node_only":
+        return "node_only"
+    raise ValueError("temporal_v7 production execution permits only full or node_only")
+
+
+def _temporal_preflight_integer(
+    value: Any, *, context: str, minimum: int = 0
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{context} must be an integer >= {minimum}")
+    return int(value)
+
+
+def _temporal_preflight_fraction(value: Any, *, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{context} must be a finite fraction")
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 < result <= 1.0:
+        raise ValueError(f"{context} must be a finite fraction in (0, 1]")
+    return result
+
+
+def _validate_temporal_plan_rows(
+    raw_plan: Mapping[str, Any],
+    *,
+    config: KBOTrainingConfig,
+) -> list[Mapping[str, Any]]:
+    raw_rows = raw_plan.get("ordered_batches")
+    if not isinstance(raw_rows, list) or not raw_rows:
+        raise ValueError("temporal CUDA preflight ordered batches are malformed")
+    budgets = raw_plan.get("budgets")
+    if not isinstance(budgets, Mapping) or set(budgets) != {"max_nodes", "max_edges"}:
+        raise ValueError("temporal CUDA preflight batch budgets are malformed")
+    max_nodes = _temporal_preflight_integer(
+        budgets["max_nodes"], context="temporal max_nodes", minimum=1
+    )
+    max_edges = _temporal_preflight_integer(
+        budgets["max_edges"], context="temporal max_edges", minimum=1
+    )
+    if raw_plan.get("batching_basis") != "node_and_edge_totals_only":
+        raise ValueError("temporal CUDA preflight batching basis is unsupported")
+    if raw_plan.get("fixed_day_count_cap") is not False:
+        raise ValueError("temporal CUDA preflight must not impose a fixed day-count cap")
+    if raw_plan.get("prefetch_depth") != 1:
+        raise ValueError("temporal CUDA preflight must use exactly one-batch look-ahead")
+
+    rows: list[Mapping[str, Any]] = []
+    seen_dates: set[str] = set()
+    split_counts = {"train": 0, "validation": 0}
+    seen_validation = False
+    oversize_count = 0
+    for index, value in enumerate(raw_rows):
+        if not isinstance(value, Mapping):
+            raise ValueError("temporal CUDA preflight batch row is malformed")
+        row = value
+        split = row.get("split")
+        if split not in split_counts:
+            raise ValueError("temporal CUDA preflight batch split is malformed")
+        if split == "validation":
+            seen_validation = True
+        elif seen_validation:
+            raise ValueError("temporal CUDA preflight train batch follows validation")
+        split_index = _temporal_preflight_integer(
+            row.get("split_batch_index"),
+            context=f"temporal batch {index} split_batch_index",
+        )
+        if split_index != split_counts[split]:
+            raise ValueError("temporal CUDA preflight split batch indices are not contiguous")
+        split_counts[split] += 1
+        dates = row.get("dates")
+        fingerprints = row.get("sample_fingerprints")
+        if (
+            not isinstance(dates, list)
+            or not dates
+            or not isinstance(fingerprints, list)
+            or len(fingerprints) != len(dates)
+        ):
+            raise ValueError("temporal CUDA preflight batch samples are malformed")
+        for raw_day, fingerprint in zip(dates, fingerprints, strict=True):
+            if not isinstance(raw_day, str):
+                raise ValueError("temporal CUDA preflight batch date is malformed")
+            try:
+                parsed = date.fromisoformat(raw_day)
+            except ValueError as exc:
+                raise ValueError("temporal CUDA preflight batch date is malformed") from exc
+            if (
+                parsed.isoformat() != raw_day
+                or raw_day in seen_dates
+                or parsed.year == config.test_season
+            ):
+                raise ValueError(
+                    "temporal CUDA preflight dates are duplicate, noncanonical, or held out"
+                )
+            seen_dates.add(raw_day)
+            if (
+                not isinstance(fingerprint, str)
+                or len(fingerprint) != 64
+                or any(character not in "0123456789abcdef" for character in fingerprint)
+            ):
+                raise ValueError("temporal CUDA preflight sample fingerprint is malformed")
+        nodes = _temporal_preflight_integer(
+            row.get("nodes"), context=f"temporal batch {index} nodes", minimum=1
+        )
+        edges = _temporal_preflight_integer(
+            row.get("edges"), context=f"temporal batch {index} edges", minimum=1
+        )
+        oversize = row.get("oversize_single_day")
+        if not isinstance(oversize, bool):
+            raise ValueError("temporal CUDA preflight oversize marker is malformed")
+        expected_oversize = len(dates) == 1 and (
+            nodes > max_nodes or edges > max_edges
+        )
+        if oversize is not expected_oversize:
+            raise ValueError("temporal CUDA preflight oversize marker is inconsistent")
+        oversize_count += int(oversize)
+        if not isinstance(row.get("prefetch_next"), bool):
+            raise ValueError("temporal CUDA preflight prefetch marker is malformed")
+        rows.append(row)
+
+    for index, row in enumerate(rows):
+        following = rows[index + 1] if index + 1 < len(rows) else None
+        expected_prefetch = bool(
+            following is not None
+            and following["split"] == row["split"]
+            and row["oversize_single_day"] is False
+            and following["oversize_single_day"] is False
+        )
+        if row["prefetch_next"] is not expected_prefetch:
+            raise ValueError("temporal CUDA preflight prefetch barrier is inconsistent")
+
+    summaries = {
+        "actual_batch_count": len(rows),
+        "train_batch_count": split_counts["train"],
+        "validation_batch_count": split_counts["validation"],
+        "oversize_single_day_batches": oversize_count,
+    }
+    for name, expected in summaries.items():
+        if _temporal_preflight_integer(
+            raw_plan.get(name), context=f"temporal execution plan {name}"
+        ) != expected:
+            raise ValueError(f"temporal CUDA preflight {name} is inconsistent")
+    held_out = raw_plan.get("held_out_test")
+    if not isinstance(held_out, Mapping) or dict(held_out) != {
+        "season": config.test_season,
+        "graph_days_loaded": False,
+        "labels_loaded": False,
+        "sealed": True,
+    }:
+        raise ValueError("temporal CUDA preflight does not prove held-out test sealing")
+    return rows
+
+
+def _validate_temporal_measurements(
+    report: Mapping[str, Any],
+    measured: Mapping[str, Any],
+    raw_plan: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    runtime: Mapping[str, Any],
+) -> None:
+    if measured.get("execution_plan") != raw_plan:
+        raise ValueError("temporal selected plan differs from its measured attempt")
+    if measured.get("selected_for_training") is not True:
+        raise ValueError("temporal selected attempt was not selected for training")
+    if measured.get("all_actual_batches_measured") is not True:
+        raise ValueError("temporal selected attempt did not measure every batch")
+    if report.get("all_actual_batches_measured") is not True:
+        raise ValueError("temporal adaptive report did not attest every selected batch")
+    limit = _temporal_preflight_fraction(
+        report.get("max_reserved_fraction"), context="temporal memory limit"
+    )
+    measured_limit = _temporal_preflight_fraction(
+        measured.get("max_reserved_fraction"), context="temporal selected-attempt limit"
+    )
+    if not math.isclose(limit, measured_limit, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("temporal selected-attempt memory limit differs")
+    if limit > 0.85:
+        raise ValueError("temporal CUDA preflight memory limit exceeds 85%")
+    measurements = measured.get("measurements")
+    if not isinstance(measurements, list) or len(measurements) != len(rows):
+        raise ValueError("temporal CUDA preflight did not measure every selected batch")
+    if _temporal_preflight_integer(
+        measured.get("completed_actual_batch_count"),
+        context="temporal completed batch count",
+    ) != len(rows):
+        raise ValueError("temporal CUDA preflight completed batch count is inconsistent")
+
+    fractions: list[float] = []
+    for index, (row, measurement) in enumerate(
+        zip(rows, measurements, strict=True)
+    ):
+        if not isinstance(measurement, Mapping):
+            raise ValueError("temporal CUDA preflight batch evidence is malformed")
+        exact_fields = {
+            "actual_batch_index": index,
+            "split": row["split"],
+            "split_batch_index": row["split_batch_index"],
+            "dates": row["dates"],
+            "nodes": row["nodes"],
+            "edges": row["edges"],
+            "oversize_single_day": row["oversize_single_day"],
+            "prefetch_depth": raw_plan["prefetch_depth"],
+        }
+        if any(measurement.get(name) != expected for name, expected in exact_fields.items()):
+            raise ValueError("temporal CUDA preflight measurement differs from its plan row")
+        expected_next = None
+        if row["prefetch_next"] is True:
+            next_row = rows[index + 1]
+            expected_next = {
+                "split": next_row["split"],
+                "dates": next_row["dates"],
+                "nodes": next_row["nodes"],
+                "edges": next_row["edges"],
+                "oversize_single_day": next_row["oversize_single_day"],
+            }
+        if measurement.get("prefetched_next_batch") != expected_next:
+            raise ValueError("temporal CUDA preflight prefetch evidence differs from its plan")
+        allocated = _temporal_preflight_integer(
+            measurement.get("peak_allocated_bytes"),
+            context=f"temporal measurement {index} peak allocated bytes",
+            minimum=1,
+        )
+        reserved = _temporal_preflight_integer(
+            measurement.get("peak_reserved_bytes"),
+            context=f"temporal measurement {index} peak reserved bytes",
+            minimum=1,
+        )
+        total = _temporal_preflight_integer(
+            measurement.get("total_memory_bytes"),
+            context=f"temporal measurement {index} total memory bytes",
+            minimum=1,
+        )
+        if allocated > reserved or reserved > total:
+            raise ValueError("temporal CUDA preflight byte measurements are inconsistent")
+        if total != runtime.get("total_memory_bytes"):
+            raise ValueError("temporal CUDA preflight measured a different GPU memory size")
+        fraction = _temporal_preflight_fraction(
+            measurement.get("peak_reserved_fraction"),
+            context=f"temporal measurement {index} peak reserved fraction",
+        )
+        if not math.isclose(fraction, reserved / total, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError("temporal CUDA preflight byte/fraction evidence is inconsistent")
+        if fraction > limit:
+            raise ValueError("temporal CUDA preflight selected an over-limit batch")
+        fractions.append(fraction)
+
+    observed_peak = max(fractions)
+    selected_peak = _temporal_preflight_fraction(
+        measured.get("peak_reserved_fraction"), context="temporal selected-attempt peak"
+    )
+    report_peak = _temporal_preflight_fraction(
+        report.get("peak_reserved_fraction"), context="temporal adaptive-report peak"
+    )
+    if not math.isclose(observed_peak, selected_peak, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("temporal selected-attempt peak differs from its measurements")
+    if not math.isclose(observed_peak, report_peak, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("temporal adaptive-report peak differs from its measurements")
+
+
+def _load_temporal_execution(
+    dataset: KBOGraphDatasetLike,
+    config: KBOTrainingConfig,
+    report_path: str | Path,
+    *,
+    runtime: Mapping[str, Any],
+) -> _TemporalExecution:
+    """Load and bind one passed preflight artifact to this exact run."""
+
+    path = Path(report_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"temporal CUDA preflight report does not exist: {path}")
+    payload = path.read_bytes()
+    try:
+        report = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("temporal CUDA preflight report is not valid UTF-8 JSON") from exc
+    if not isinstance(report, Mapping):
+        raise ValueError("temporal CUDA preflight report must contain an object")
+    variant = _temporal_variant(config)
+    from cpv26.training.kbo_temporal_preflight import (
+        TEMPORAL_PREFLIGHT_PROTOCOL,
+        TEMPORAL_PREFLIGHT_PROTOCOL_VERSION,
+        validate_temporal_execution_plan,
+    )
+
+    if report.get("protocol") != f"{TEMPORAL_PREFLIGHT_PROTOCOL}_adaptive":
+        raise ValueError("temporal training requires the adaptive CUDA preflight protocol")
+    if report.get("protocol_version") != TEMPORAL_PREFLIGHT_PROTOCOL_VERSION:
+        raise ValueError("temporal CUDA preflight protocol version differs")
+    rows = validate_temporal_execution_plan(
+        report,
+        dataset_fingerprint=str(dataset.manifest["fingerprint"]),
+        variant=variant,
+    )
+    raw_plan = report["execution_plan"]
+    assert isinstance(raw_plan, Mapping)
+    raw_rows = _validate_temporal_plan_rows(raw_plan, config=config)
+    if len(raw_rows) != len(rows):
+        raise ValueError("temporal CUDA preflight ordered batches are malformed")
+
+    selected_attempt = report.get("selected_attempt")
+    attempts = report.get("attempts")
+    if (
+        isinstance(selected_attempt, bool)
+        or not isinstance(selected_attempt, int)
+        or not isinstance(attempts, list)
+        or not 1 <= selected_attempt <= len(attempts)
+    ):
+        raise ValueError("temporal CUDA preflight selected attempt is malformed")
+    measured = attempts[selected_attempt - 1]
+    if not isinstance(measured, Mapping) or measured.get("status") != "passed":
+        raise ValueError("temporal CUDA preflight selected attempt did not pass")
+    if measured.get("protocol") != TEMPORAL_PREFLIGHT_PROTOCOL:
+        raise ValueError("temporal selected attempt has the wrong protocol")
+    if measured.get("protocol_version") != TEMPORAL_PREFLIGHT_PROTOCOL_VERSION:
+        raise ValueError("temporal selected attempt protocol version differs")
+    raw_saved_config = measured.get("configuration")
+    if not isinstance(raw_saved_config, Mapping):
+        raise ValueError("temporal CUDA preflight is missing its training configuration")
+    saved_config = asdict(KBOTrainingConfig.from_dict(raw_saved_config))
+    expected_config = asdict(config)
+    if variant == "node_only":
+        saved_config["route_schedule"] = "node_only"
+    if saved_config != expected_config:
+        raise ValueError("temporal CUDA preflight configuration differs from training")
+    saved_runtime = measured.get("runtime")
+    if not isinstance(saved_runtime, Mapping):
+        raise ValueError("temporal CUDA preflight is missing its runtime signature")
+    for name in (
+        "device",
+        "gpu_name",
+        "total_memory_bytes",
+        "compute_capability",
+        "torch_version",
+        "cuda_runtime",
+        "precision",
+    ):
+        if saved_runtime.get(name) != runtime.get(name):
+            raise ValueError(f"temporal CUDA preflight runtime.{name} differs from training")
+
+    planned_dates = [day for batch in rows for day in batch]
+    splits = _split_days(dataset, config)
+    expected_dates = [*splits["train"], *splits["validation"]]
+    if planned_dates != expected_dates or any(
+        day.year == config.test_season for day in planned_dates
+    ):
+        raise ValueError("temporal CUDA preflight plan does not exactly cover train/validation")
+    _validate_temporal_measurements(
+        report,
+        measured,
+        raw_plan,
+        raw_rows,
+        runtime=runtime,
+    )
+    return _TemporalExecution(
+        report_path=path,
+        report_sha256=hashlib.sha256(payload).hexdigest(),
+        plan_fingerprint=str(raw_plan["plan_fingerprint"]),
+        variant=variant,
+        rows=tuple(dict(row) for row in raw_rows),
+    )
+
+
+def _validate_temporal_batch(
+    batch: Mapping[str, Any], row: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    dates = list(batch.get("day_ids", ()))
+    if dates != list(row["dates"]):
+        raise RuntimeError("temporal loader dates differ from the selected CUDA plan")
+    nodes = sum(int(values.shape[0]) for values in batch["node_features"].values())
+    edges = sum(int(route.num_edges) for route in batch["routes"])
+    if (nodes, edges) != (int(row["nodes"]), int(row["edges"])):
+        raise RuntimeError("temporal loader topology differs from the selected CUDA plan")
+    return batch
+
+
+def _planned_device_batches(
+    batches: Any,
+    rows: Sequence[Mapping[str, Any]],
+    device: Any,
+) -> Any:
+    """Consume one DataLoader using the preflight's exact prefetch barriers."""
+
+    iterator = iter(batches)
+    start = 0
+    while start < len(rows):
+        end = start
+        while end + 1 < len(rows) and rows[end].get("prefetch_next") is True:
+            end += 1
+        segment_rows = rows[start : end + 1]
+
+        def checked_segment(
+            selected_rows: Sequence[Mapping[str, Any]] = segment_rows,
+        ) -> Any:
+            for row in selected_rows:
+                try:
+                    raw = next(iterator)
+                except StopIteration as exc:
+                    raise RuntimeError("temporal loader ended before its selected plan") from exc
+                yield _validate_temporal_batch(raw, row)
+
+        yield from prefetch_batches(checked_segment(), device, mover=_move)
+        start = end + 1
+        if start < len(rows):
+            # A false prefetch marker is a GPU-storage boundary, not just a
+            # fresh Python generator.  The previous segment's last compute is
+            # asynchronous, so wait before the next copy stream can allocate
+            # the following (often oversize) segment.
+            torch, _ = require_torch()
+            torch.cuda.current_stream(device).synchronize()
+    try:
+        next(iterator)
+    except StopIteration:
+        return
+    raise RuntimeError("temporal loader produced more batches than its selected plan")
+
+
 def _loader(
     directory: Path,
     days: Sequence[date],
@@ -395,31 +874,113 @@ def _loader(
     *,
     epoch: int,
     training: bool,
+    packed_transfers: bool = True,
+    planned_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> Any:
     torch, _ = require_torch()
     generator = torch.Generator().manual_seed(config.seed + epoch)
     ordered_days = sorted(days) if config.chronological or not training else days
-    return torch.utils.data.DataLoader(
-        _DayDataset(directory, ordered_days),
-        batch_size=config.batch_days,
-        shuffle=training and not config.chronological,
-        num_workers=config.workers,
+    common: dict[str, Any] = {
+        "num_workers": config.workers,
         # Workers start after model/CUDA initialization. Do not fork its
         # threaded runtime; keep this choice local to this DataLoader.
-        multiprocessing_context="spawn" if config.workers > 0 else None,
-        pin_memory=config.device.startswith("cuda"),
-        generator=generator,
-        collate_fn=partial(
+        "multiprocessing_context": "spawn" if config.workers > 0 else None,
+        # Packed transfer creates one private pinned buffer per dtype.  Pinning
+        # every collated leaf here as well would copy the same batch into pinned
+        # memory twice before H2D.  The unpacked compatibility path still needs
+        # DataLoader pinning for genuinely asynchronous leaf transfers.
+        "pin_memory": config.device.startswith("cuda") and not packed_transfers,
+        "collate_fn": partial(
             _collate_loader_days,
             config=config,
             epoch=epoch,
             training=training,
         ),
+    }
+    manifest_path = directory / "manifest.json"
+    if manifest_path.is_file():
+        with manifest_path.open(encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    else:
+        # Some unit/profile callers construct only the loader shell.  A real
+        # dataset is still validated when _DayDataset first loads an item.
+        manifest = {}
+    if isinstance(manifest, dict) and manifest.get("graph_schema") == "temporal_v7":
+        if planned_rows is not None:
+            planned_dates = [
+                date.fromisoformat(str(value))
+                for row in planned_rows
+                for value in row["dates"]
+            ]
+            if planned_dates != list(ordered_days):
+                raise ValueError("selected temporal batches do not exactly cover loader days")
+            index_by_day = {day: index for index, day in enumerate(ordered_days)}
+            fingerprint_by_day = {
+                date.fromisoformat(str(day_id)): str(fingerprint)
+                for row in planned_rows
+                for day_id, fingerprint in zip(
+                    row["dates"], row["sample_fingerprints"], strict=True
+                )
+            }
+            if set(fingerprint_by_day) != set(ordered_days):
+                raise ValueError(
+                    "selected temporal sample fingerprints do not exactly cover loader days"
+                )
+            selected_batch_sampler = tuple(
+                tuple(index_by_day[date.fromisoformat(str(value))] for value in row["dates"])
+                for row in planned_rows
+            )
+            if config.workers > 0:
+                common.update(persistent_workers=True, prefetch_factor=2)
+            return torch.utils.data.DataLoader(
+                _DayDataset(
+                    directory,
+                    ordered_days,
+                    expected_sample_fingerprints=fingerprint_by_day,
+                ),
+                batch_sampler=selected_batch_sampler,
+                **common,
+            )
+        from cpv26.training.kbo_temporal_batching import (
+            TemporalBudgetBatchSampler,
+            load_temporal_sample_sizes,
+        )
+
+        batching = manifest.get("temporal_batching")
+        if not isinstance(batching, Mapping):
+            raise ValueError("temporal_v7 manifest is missing its batching contract")
+        sizes = load_temporal_sample_sizes(
+            directory,
+            dataset_fingerprint=str(manifest["fingerprint"]),
+            sampling_policy_fingerprint=str(manifest["sampling_policy_fingerprint"]),
+        )
+        budget_batch_sampler = TemporalBudgetBatchSampler(
+            ordered_days,
+            sizes,
+            max_nodes=int(batching["max_nodes_per_batch"]),
+            max_edges=int(batching["max_edges_per_batch"]),
+            max_days=min(config.batch_days, int(batching["max_days_per_batch"])),
+            shuffle=training and not config.chronological,
+            seed=config.seed + epoch,
+        )
+        if config.workers > 0:
+            common.update(persistent_workers=True, prefetch_factor=2)
+        return torch.utils.data.DataLoader(
+            _DayDataset(directory, ordered_days),
+            batch_sampler=budget_batch_sampler,
+            **common,
+        )
+    return torch.utils.data.DataLoader(
+        _DayDataset(directory, ordered_days),
+        batch_size=config.batch_days,
+        shuffle=training and not config.chronological,
+        generator=generator,
+        **common,
     )
 
 
 def _split_days(
-    dataset: KBOGraphDataset,
+    dataset: KBOGraphDatasetLike,
     config: KBOTrainingConfig,
 ) -> dict[str, tuple[date, ...]]:
     available_days = tuple(sorted(dataset.days()))
@@ -450,7 +1011,7 @@ def _split_days(
 
 
 def _split_summary(
-    dataset: KBOGraphDataset, splits: Mapping[str, Sequence[date]]
+    dataset: KBOGraphDatasetLike, splits: Mapping[str, Sequence[date]]
 ) -> dict[str, Any]:
     entries = {entry["day"]: entry for entry in dataset.manifest["days"]}
     summary: dict[str, Any] = {}
@@ -554,7 +1115,7 @@ def _resolved_route_schedule(
     return ((),) * config.layers
 
 
-def _model_config(dataset: KBOGraphDataset, config: KBOTrainingConfig) -> KBORelGNNConfig:
+def _model_config(dataset: KBOGraphDatasetLike, config: KBOTrainingConfig) -> KBORelGNNConfig:
     manifest = dataset.manifest
     return KBORelGNNConfig(
         node_feature_dims=dict(manifest["node_feature_dims"]),
@@ -684,6 +1245,7 @@ def _evaluate_model(
     collect_predictions: bool = False,
     batch_transform: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     diagnostics: Any | None = None,
+    planned_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     torch, _ = require_torch()
     model.eval()
@@ -708,7 +1270,7 @@ def _evaluate_model(
     box_pitch_queries = 0
     box_pitch_errors = np.zeros(10, dtype=np.float64)
     box_pitch_counts = np.zeros(10, dtype=np.int64)
-    with torch.inference_mode():
+    def prepared_batches() -> Any:
         for raw_batch in loader:
             prepared_batch = (
                 batch_transform(raw_batch) if batch_transform is not None else raw_batch
@@ -717,7 +1279,22 @@ def _evaluate_model(
                 begin_batch = getattr(diagnostics, "begin_batch", None)
                 if callable(begin_batch):
                     begin_batch(prepared_batch)
-            batch = _move(prepared_batch, device)
+            yield prepared_batch
+
+    # Diagnostic observers consume each CPU topology before its corresponding
+    # model call, so retain their sequential path.  Normal training/evaluation
+    # uses one-batch CUDA look-ahead on a dedicated copy stream.
+    device_batches: Any
+    if diagnostics is not None or device.type != "cuda":
+        if planned_rows is not None and diagnostics is not None:
+            raise ValueError("temporal selected plans do not support diagnostic transforms")
+        device_batches = map(partial(_move, device=device), prepared_batches())
+    elif planned_rows is not None:
+        device_batches = _planned_device_batches(prepared_batches(), planned_rows, device)
+    else:
+        device_batches = prefetch_batches(prepared_batches(), device, mover=_move)
+    with torch.inference_mode():
+        for batch in device_batches:
             with torch.autocast(device.type, enabled=dtype is not None, dtype=dtype):
                 outputs = (
                     model(batch, diagnostics_observer=diagnostics)
@@ -773,7 +1350,7 @@ def _evaluate_model(
                 box_pitch_errors += (np.abs(pitch_rates - pitch_targets) * pitch_mask).sum(axis=0)
                 box_pitch_counts += pitch_mask.sum(axis=0)
                 if collect_predictions:
-                    for index, query_id in enumerate(raw_batch["box_pa_query_ids"]):
+                    for index, query_id in enumerate(batch["box_pa_query_ids"]):
                         predictions["box_pa"].append({
                             "query_id": str(query_id),
                             **{
@@ -785,7 +1362,7 @@ def _evaluate_model(
                                 for column, value in enumerate(box_probabilities_array[index])
                             },
                         })
-                    for index, query_id in enumerate(raw_batch["box_pitch_query_ids"]):
+                    for index, query_id in enumerate(batch["box_pitch_query_ids"]):
                         predictions["box_pitch"].append({
                             "query_id": str(query_id),
                             **{
@@ -804,7 +1381,7 @@ def _evaluate_model(
                 probabilities[name].append(probability)
                 targets[name].append(label)
                 if collect_predictions:
-                    query_ids = raw_batch[f"{name}_query_ids"]
+                    query_ids = batch[f"{name}_query_ids"]
                     for index, query_id in enumerate(query_ids):
                         row = {
                             "query_id": str(query_id),
@@ -824,11 +1401,9 @@ def _evaluate_model(
                             if include_boxscore or not known_pa[index]:
                                 row["observed_pa_lower_bound"] = int(pa_minimum[index])
                         predictions[name].append(row)
-            # Drop every GPU-owning iteration local before the next loader item is
-            # transferred.  Python evaluates the next ``_move(...)`` RHS before
-            # rebinding these names; without the explicit release, the previous
-            # batch and outputs overlap the next transfer (and the final training
-            # batch overlaps the first validation batch in the caller).
+            # The prefetcher deliberately overlaps this current device batch
+            # with at most one next device batch.  Release all other iteration
+            # locals promptly so the two-slot pipeline is the only overlap.
             if include_boxscore:
                 del box_probabilities
             del labels, values, losses, outputs, batch
@@ -912,7 +1487,7 @@ def _checkpoint_state(
     model: Any,
     optimizer: Any,
     scaler: Any,
-    dataset: KBOGraphDataset,
+    dataset: KBOGraphDatasetLike,
     dataset_directory: Path,
     config: KBOTrainingConfig,
     model_config: KBORelGNNConfig,
@@ -926,6 +1501,7 @@ def _checkpoint_state(
     history: Sequence[Mapping[str, Any]],
     initial_model_state_sha256: str,
     parameter_count: int,
+    temporal_execution: _TemporalExecution | None,
 ) -> dict[str, Any]:
     torch, _ = require_torch()
     return {
@@ -937,6 +1513,9 @@ def _checkpoint_state(
         "graph_control": _graph_control_report(config),
         "initial_model_state_sha256": initial_model_state_sha256,
         "parameter_count": parameter_count,
+        "temporal_execution": (
+            temporal_execution.lineage() if temporal_execution is not None else None
+        ),
         "epoch": epoch,
         "global_step": global_step,
         "best_score": best_score,
@@ -1007,6 +1586,7 @@ def train_kbo_relgnn(
     *,
     config: KBOTrainingConfig | None = None,
     resume: str | Path | None = None,
+    temporal_preflight_report: str | Path | None = None,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Train on configured past seasons and select with a later validation season."""
@@ -1015,7 +1595,22 @@ def train_kbo_relgnn(
     device, dtype, runtime = _device_and_precision(options.device, options.amp)
     directory = Path(dataset_directory).expanduser().resolve()
     output = Path(run_directory).expanduser().resolve()
-    dataset = KBOGraphDataset(directory)
+    dataset = open_kbo_graph_dataset(directory)
+    temporal_schema = dataset.manifest.get("graph_schema") == "temporal_v7"
+    if temporal_schema != (temporal_preflight_report is not None):
+        raise ValueError(
+            "temporal_v7 training requires exactly one passed adaptive CUDA preflight report"
+        )
+    temporal_execution = (
+        _load_temporal_execution(
+            dataset,
+            options,
+            temporal_preflight_report,
+            runtime=runtime,
+        )
+        if temporal_preflight_report is not None
+        else None
+    )
     splits = _split_days(dataset, options)
     split_summary = _split_summary(
         dataset,
@@ -1062,6 +1657,11 @@ def train_kbo_relgnn(
         saved_parameter_count = state.get("parameter_count")
         if saved_parameter_count is not None and int(saved_parameter_count) != parameter_count:
             raise ValueError("checkpoint parameter count differs from the current model")
+        expected_temporal = (
+            temporal_execution.lineage() if temporal_execution is not None else None
+        )
+        if state.get("temporal_execution") != expected_temporal:
+            raise ValueError("checkpoint temporal execution plan differs from the CUDA gate")
         model.load_state_dict(state["model"])
         optimizer = make_adamw(
             model, learning_rate=options.learning_rate, weight_decay=options.weight_decay,
@@ -1098,6 +1698,11 @@ def train_kbo_relgnn(
                 "model": model_config.to_dict(),
                 "training_policies": _policy_report(options, model_config),
                 "runtime": runtime,
+                "temporal_execution": (
+                    temporal_execution.lineage()
+                    if temporal_execution is not None
+                    else None
+                ),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -1126,10 +1731,45 @@ def train_kbo_relgnn(
         progress(
             f"GPU: {runtime['gpu_name']}; VRAM={runtime['total_memory_bytes'] / 2**30:.1f} GiB"
         )
+    train_plan_rows = (
+        temporal_execution.split_rows("train") if temporal_execution is not None else None
+    )
+    validation_plan_rows = (
+        temporal_execution.split_rows("validation")
+        if temporal_execution is not None
+        else None
+    )
+    reuse_temporal_loaders = temporal_execution is not None
+    reusable_train_loader = (
+        _loader(
+            directory,
+            splits["train"],
+            options,
+            epoch=0,
+            training=True,
+            planned_rows=train_plan_rows,
+        )
+        if reuse_temporal_loaders
+        else None
+    )
+    reusable_validation_loader = (
+        _loader(
+            directory,
+            splits["validation"],
+            options,
+            epoch=0,
+            training=False,
+            planned_rows=validation_plan_rows,
+        )
+        if reuse_temporal_loaders
+        else None
+    )
     for epoch in range(start_epoch, options.epochs):
         started = time.monotonic()
         model.train()
-        loader = _loader(directory, splits["train"], options, epoch=epoch, training=True)
+        loader = reusable_train_loader or _loader(
+            directory, splits["train"], options, epoch=epoch, training=True
+        )
         optimizer.zero_grad(set_to_none=True)
         task_names = ("match", "live_hit", "pa", "run") + (
             ("box_pa", "box_pitch") if model_config.include_boxscore_heads else ()
@@ -1141,8 +1781,18 @@ def train_kbo_relgnn(
                    "max_finite_preclip_norm": 0.0}
             for name in _gradient_parameter_groups(model)
         }
-        for index, raw_batch in enumerate(loader):
-            batch = _move(raw_batch, device)
+        if device.type == "cuda" and train_plan_rows is not None:
+            source_batches = _planned_device_batches(loader, train_plan_rows, device)
+        elif device.type == "cuda":
+            source_batches = prefetch_batches(loader, device, mover=_move)
+        else:
+            source_batches = loader
+        for index, raw_or_device_batch in enumerate(source_batches):
+            batch = (
+                raw_or_device_batch
+                if device.type == "cuda"
+                else _move(raw_or_device_batch, device)
+            )
             with torch.autocast(device.type, enabled=dtype is not None, dtype=dtype):
                 losses = _losses(model(batch), batch, options)
             if not bool(torch.isfinite(losses["loss"])):
@@ -1185,16 +1835,23 @@ def train_kbo_relgnn(
                     f"epoch {epoch + 1}/{options.epochs} batch {index + 1}/{len(loader)} "
                     f"loss={float(losses['loss'].detach().cpu()):.4f}"
                 )
-            # Ensure the next packed H2D transfer cannot overlap the previous
-            # GPU batch through Python's RHS-before-rebind evaluation order.
+            # Retain only the prefetcher's intentional current/next batch pair.
             # This also releases the last training batch before validation.
-            del losses, batch
+            del losses, batch, raw_or_device_batch
         validation, _ = _evaluate_model(
             model,
-            _loader(directory, splits["validation"], options, epoch=epoch, training=False),
+            reusable_validation_loader
+            or _loader(
+                directory,
+                splits["validation"],
+                options,
+                epoch=epoch,
+                training=False,
+            ),
             options,
             device,
             dtype,
+            planned_rows=validation_plan_rows,
         )
         score = float(validation["selection_loss"])
         improved = score < best_score
@@ -1214,6 +1871,11 @@ def train_kbo_relgnn(
             "best_epoch": best_epoch,
             "batch_days": options.batch_days,
             "accumulate_steps": options.accumulate_steps,
+            "temporal_execution_plan_fingerprint": (
+                temporal_execution.plan_fingerprint
+                if temporal_execution is not None
+                else None
+            ),
             **_runtime_memory(device),
         }
         history.append(record)
@@ -1235,6 +1897,7 @@ def train_kbo_relgnn(
             history=history,
             initial_model_state_sha256=initial_model_state_sha256,
             parameter_count=parameter_count,
+            temporal_execution=temporal_execution,
         )
         if improved:
             _atomic_checkpoint(output / "best.pt", state)
@@ -1258,6 +1921,9 @@ def train_kbo_relgnn(
         "graph_control": _graph_control_report(options),
         "initial_model_state_sha256": initial_model_state_sha256,
         "parameter_count": parameter_count,
+        "temporal_execution": (
+            temporal_execution.lineage() if temporal_execution is not None else None
+        ),
         "dataset_fingerprint": dataset.manifest["fingerprint"],
         "training_seasons": list(options.train_seasons),
         "validation_season": options.validation_season,
@@ -1338,6 +2004,7 @@ def evaluate_kbo_relgnn(
     batch_days: int = 2,
     workers: int = 2,
     output_directory: str | Path | None = None,
+    temporal_preflight_report: str | Path | None = None,
 ) -> dict[str, Any]:
     """Reload an explicit checkpoint and write immutable, per-query held-out predictions."""
     torch, _ = require_torch()
@@ -1353,11 +2020,30 @@ def evaluate_kbo_relgnn(
     graph_control = _validate_checkpoint_graph_control(state, options)
     selected, dtype, runtime = _device_and_precision(device, amp)
     directory = Path(dataset_directory or state["dataset_directory"]).expanduser().resolve()
-    dataset = KBOGraphDataset(directory)
+    dataset = open_kbo_graph_dataset(directory)
     if dataset.manifest["fingerprint"] != state["dataset_fingerprint"]:
         raise ValueError("evaluation graph dataset differs from the checkpoint fingerprint")
     if split not in {"train", "validation", "test"}:
         raise ValueError("split must be train, validation, or test")
+    temporal_execution: _TemporalExecution | None = None
+    if dataset.manifest.get("graph_schema") == "temporal_v7":
+        saved_temporal = state.get("temporal_execution")
+        if not isinstance(saved_temporal, Mapping):
+            raise ValueError("temporal checkpoint is missing its selected CUDA plan")
+        selected_report = temporal_preflight_report or saved_temporal.get("report_path")
+        if not isinstance(selected_report, (str, Path)):
+            raise ValueError("temporal evaluation requires its CUDA preflight report")
+        temporal_execution = _load_temporal_execution(
+            dataset, options, selected_report, runtime=runtime
+        )
+        if saved_temporal != temporal_execution.lineage():
+            raise ValueError("temporal checkpoint and evaluation execution plans differ")
+        if split == "test":
+            raise ValueError(
+                "held-out temporal test evaluation requires a separately indexed and gated plan"
+            )
+    elif temporal_preflight_report is not None:
+        raise ValueError("legacy graph evaluation does not accept a temporal preflight report")
     days = _split_days(dataset, options)[split]
     if not days:
         raise ValueError(f"no dates available for the requested {split} split")
@@ -1368,13 +2054,24 @@ def evaluate_kbo_relgnn(
         torch.set_num_threads(min(4, os.cpu_count() or 1))
     else:
         torch.cuda.reset_peak_memory_stats(selected)
+    planned_rows = (
+        temporal_execution.split_rows(split) if temporal_execution is not None else None
+    )
     metrics, predictions = _evaluate_model(
         model,
-        _loader(directory, days, options, epoch=0, training=False),
+        _loader(
+            directory,
+            days,
+            options,
+            epoch=0,
+            training=False,
+            planned_rows=planned_rows,
+        ),
         options,
         selected,
         dtype,
         collect_predictions=True,
+        planned_rows=planned_rows,
     )
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid4().hex[:8]
     output = (
@@ -1414,6 +2111,9 @@ def evaluate_kbo_relgnn(
         "days": len(days),
         "runtime": runtime,
         "graph_control": graph_control,
+        "temporal_execution": (
+            temporal_execution.lineage() if temporal_execution is not None else None
+        ),
         "metrics": metrics,
         "training_policies": _policy_report(options, model.config),
         "prediction_artifacts": artifacts,

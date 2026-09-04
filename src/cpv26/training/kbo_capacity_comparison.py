@@ -14,9 +14,10 @@ import random
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
+from cpv26.data.kbo_dataset_loader import open_kbo_graph_dataset
 from cpv26.data.kbo_graph_dataset import KBOGraphDataset
 from cpv26.data.kbo_playbyplay import sha256_file
 from cpv26.models._torch import require_torch
@@ -1163,6 +1164,7 @@ def _matched_variant_run(
     initialization: Mapping[str, Any],
     variant_protocol: Mapping[str, Any],
     progress: Callable[[str], None],
+    temporal_preflight_report: Path | None = None,
 ) -> dict[str, Any]:
     run_directory = output / run_group / variant
     prefix = f"[{label}/{variant}] "
@@ -1170,14 +1172,25 @@ def _matched_variant_run(
     def child_progress(message: str) -> None:
         progress(prefix + message)
 
-    training = matched._train_or_resume_child(
-        dataset,
-        dataset_directory,
-        run_directory,
-        config,
-        initialization,
-        child_progress,
-    )
+    if temporal_preflight_report is None:
+        training = matched._train_or_resume_child(
+            dataset,
+            dataset_directory,
+            run_directory,
+            config,
+            initialization,
+            child_progress,
+        )
+    else:
+        training = matched._train_or_resume_child(
+            dataset,
+            dataset_directory,
+            run_directory,
+            config,
+            initialization,
+            child_progress,
+            temporal_preflight_report=temporal_preflight_report,
+        )
     matched._verify_initialization_lineage(
         run_directory,
         training,
@@ -1185,7 +1198,17 @@ def _matched_variant_run(
         config,
         initialization,
     )
-    validation = matched._reevaluate_best_on_validation(run_directory, dataset_directory, config)
+    if temporal_preflight_report is None:
+        validation = matched._reevaluate_best_on_validation(
+            run_directory, dataset_directory, config
+        )
+    else:
+        validation = matched._reevaluate_best_on_validation(
+            run_directory,
+            dataset_directory,
+            config,
+            temporal_preflight_report=temporal_preflight_report,
+        )
     if validation.get("split") != "validation":
         raise ValueError("capacity comparison received a non-validation evaluation")
     if training.get("test_used_during_training") is not False:
@@ -1204,6 +1227,12 @@ def _matched_variant_run(
     history_summary = matched._training_history_summary(
         training, context=f"{label}/{variant}"
     )
+    temporal_execution = training.get("temporal_execution")
+    if temporal_preflight_report is not None:
+        if not isinstance(temporal_execution, Mapping):
+            raise ValueError("temporal comparison child omitted its CUDA execution plan")
+        if validation.get("temporal_execution") != temporal_execution:
+            raise ValueError("temporal training and validation execution plans differ")
     return {
         "run_directory": str(run_directory),
         "best_checkpoint": str(run_directory / "best.pt"),
@@ -1229,6 +1258,11 @@ def _matched_variant_run(
         "validation_output_directory": str(validation["output_directory"]),
         "test_used_during_training": False,
         "smoke_test_only": expected_smoke,
+        **(
+            {"temporal_execution": _plain(temporal_execution)}
+            if temporal_execution is not None
+            else {}
+        ),
     }
 
 
@@ -1331,6 +1365,25 @@ def _validate_full_node_config(config: runner.KBOTrainingConfig) -> None:
             raise ValueError(f"full/node base configuration must use {field}={value}")
 
 
+def _temporal_preflight_lineage(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"temporal CUDA preflight report does not exist: {path}")
+    document = _load_json(path)
+    plan = document.get("execution_plan")
+    if (
+        document.get("status") != "passed"
+        or document.get("selected_for_training") is not True
+        or not isinstance(plan, Mapping)
+        or not isinstance(plan.get("plan_fingerprint"), str)
+    ):
+        raise ValueError("temporal CUDA preflight report has no selected passed plan")
+    return {
+        "report_path": str(path),
+        "report_sha256": sha256_file(path),
+        "plan_fingerprint": str(plan["plan_fingerprint"]),
+    }
+
+
 def _full_node_manifest(
     *,
     dataset_directory: Path,
@@ -1339,8 +1392,9 @@ def _full_node_manifest(
     config: runner.KBOTrainingConfig,
     runtime_signature: Mapping[str, Any],
     variant_protocols: Mapping[str, Mapping[str, Any]],
+    temporal_preflight: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "protocol": FULL_NODE_COMPARISON_PROTOCOL,
         "protocol_version": FULL_NODE_COMPARISON_PROTOCOL_VERSION,
         "dataset_directory": str(dataset_directory),
@@ -1353,6 +1407,9 @@ def _full_node_manifest(
         "variant_policies": _plain(variant_protocols),
         "test_policy": "held_out_metadata_only_never_loaded_or_evaluated",
     }
+    if temporal_preflight is not None:
+        result["temporal_preflight"] = _plain(temporal_preflight)
+    return result
 
 
 def _full_node_budget_audit(runs: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
@@ -1436,6 +1493,7 @@ def train_kbo_full_node_comparison(
     output_directory: str | Path,
     *,
     config: runner.KBOTrainingConfig,
+    temporal_preflight_report: str | Path | None = None,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Train exactly full and node_only once, comparing validation only."""
@@ -1443,7 +1501,25 @@ def train_kbo_full_node_comparison(
     _validate_full_node_config(config)
     directory = Path(dataset_directory).expanduser().resolve()
     output = Path(output_directory).expanduser().resolve()
-    dataset = KBOGraphDataset(directory)
+    dataset = cast(
+        KBOGraphDataset,
+        open_kbo_graph_dataset(directory)
+        if (directory / "manifest.json").is_file()
+        else KBOGraphDataset(directory),
+    )
+    temporal_schema = dataset.manifest.get("graph_schema") == "temporal_v7"
+    if temporal_schema != (temporal_preflight_report is not None):
+        raise ValueError(
+            "temporal_v7 comparison requires exactly one passed adaptive CUDA preflight"
+        )
+    temporal_path = (
+        Path(temporal_preflight_report).expanduser().resolve()
+        if temporal_preflight_report is not None
+        else None
+    )
+    temporal_lineage = (
+        _temporal_preflight_lineage(temporal_path) if temporal_path is not None else None
+    )
     split_fingerprint, split_days = matched._split_day_fingerprint(dataset, config)
     runtime_signature = matched._runtime_signature(config)
     variant_protocols = _variant_protocols(config)
@@ -1454,6 +1530,7 @@ def train_kbo_full_node_comparison(
         config=config,
         runtime_signature=runtime_signature,
         variant_protocols=variant_protocols,
+        temporal_preflight=temporal_lineage,
     )
     manifest_path = output / FULL_NODE_COMPARISON_MANIFEST
     if output.exists() and any(output.iterdir()) and not manifest_path.is_file():
@@ -1505,12 +1582,23 @@ def train_kbo_full_node_comparison(
             "No multi-seed or additional ablation variants are implemented by this protocol.",
         ],
     }
+    if temporal_lineage is not None:
+        report["temporal_preflight"] = _plain(temporal_lineage)
+        report["loader_lineage"]["temporal_execution_plan_fingerprint"] = (
+            temporal_lineage["plan_fingerprint"]
+        )
     report_path = output / FULL_NODE_COMPARISON_REPORT
     runner._atomic_json(report_path, report)
 
     try:
         runs: dict[str, dict[str, Any]] = {}
         for variant in CAPACITY_COMPARISON_VARIANTS:
+            if (
+                temporal_path is not None
+                and temporal_lineage is not None
+                and sha256_file(temporal_path) != temporal_lineage["report_sha256"]
+            ):
+                raise ValueError("temporal CUDA preflight changed before child training")
             variant_config = matched._variant_config(config, variant, config.seed)
             runs[variant] = _matched_variant_run(
                 dataset=dataset,
@@ -1523,6 +1611,7 @@ def train_kbo_full_node_comparison(
                 initialization=initialization,
                 variant_protocol=variant_protocols[variant],
                 progress=progress,
+                temporal_preflight_report=temporal_path,
             )
             report["runs"] = runs
             runner._atomic_json(report_path, report)
@@ -1545,6 +1634,24 @@ def train_kbo_full_node_comparison(
         report["budget_audit"] = _full_node_budget_audit(runs)
         report["validation_sample_count_audit"] = _validation_count_audit(runs)
         report["validation_selection_comparison"] = _full_node_selection_comparison(runs)
+        if temporal_lineage is not None:
+            plan_fingerprints = {
+                str(run["temporal_execution"]["plan_fingerprint"])
+                for run in runs.values()
+            }
+            report_hashes = {
+                str(run["temporal_execution"]["report_sha256"])
+                for run in runs.values()
+            }
+            if plan_fingerprints != {temporal_lineage["plan_fingerprint"]} or report_hashes != {
+                temporal_lineage["report_sha256"]
+            }:
+                raise ValueError("full and node_only did not consume the selected CUDA plan")
+            report["temporal_execution_attestation"] = {
+                "all_variants_exact_plan": True,
+                "plan_fingerprint": temporal_lineage["plan_fingerprint"],
+                "preflight_report_sha256": temporal_lineage["report_sha256"],
+            }
         report["status"] = "completed"
         runner._atomic_json(report_path, report)
     except Exception:

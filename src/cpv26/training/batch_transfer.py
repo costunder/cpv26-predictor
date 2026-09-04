@@ -142,3 +142,72 @@ def move_batch(value: Any, device: Any, *, packed: bool = True) -> Any:
         return moved[identity]
 
     return _map_tensors(value, lookup, torch)
+
+
+def _record_cuda_batch_stream(value: Any, stream: Any, torch: Any) -> None:
+    """Tie every CUDA storage in a nested batch to its consumer stream."""
+
+    seen: set[int] = set()
+    for tensor in _tensor_leaves(value, torch):
+        identity = id(tensor)
+        if identity in seen or tensor.device.type != "cuda":
+            continue
+        seen.add(identity)
+        tensor.record_stream(stream)
+
+
+def prefetch_batches(
+    batches: Iterable[Any],
+    device: Any,
+    *,
+    mover: Callable[[Any, Any], Any] | None = None,
+) -> Iterator[Any]:
+    """Move one CUDA batch ahead on a dedicated copy stream.
+
+    The iterator preserves source order and yields the exact structure returned
+    by ``mover``.  On CUDA it holds at most the current and next device batches:
+    batch N+1's H2D copies may overlap batch N's compute, while an explicit
+    stream dependency prevents any consumer from observing an incomplete copy.
+    ``record_stream`` protects packed shared storages from allocator reuse until
+    the compute stream is finished with them.  CPU execution remains a simple,
+    non-look-ahead mapping so validation semantics and object lifetimes stay
+    unchanged.
+    """
+
+    torch, _ = require_torch()
+    selected = torch.device(device)
+    move = mover or (lambda value, target: move_batch(value, target, packed=True))
+    iterator = iter(batches)
+    if selected.type != "cuda":
+        for raw_batch in iterator:
+            moved_batch = move(raw_batch, selected)
+            yield moved_batch
+            del moved_batch
+        return
+
+    copy_stream = torch.cuda.Stream(device=selected)
+    missing = object()
+    next_batch: Any = missing
+
+    def preload() -> None:
+        nonlocal next_batch
+        try:
+            raw_batch = next(iterator)
+        except StopIteration:
+            next_batch = missing
+            return
+        with torch.cuda.stream(copy_stream):
+            next_batch = move(raw_batch, selected)
+
+    preload()
+    while next_batch is not missing:
+        compute_stream = torch.cuda.current_stream(selected)
+        compute_stream.wait_stream(copy_stream)
+        current_batch = next_batch
+        _record_cuda_batch_stream(current_batch, compute_stream, torch)
+        # Queue the next copy before yielding.  The caller subsequently enqueues
+        # current-batch compute on ``compute_stream``, allowing the streams to
+        # overlap without changing batch or optimizer order.
+        preload()
+        yield current_batch
+        del current_batch

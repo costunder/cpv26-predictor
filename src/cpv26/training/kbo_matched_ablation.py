@@ -360,6 +360,7 @@ def _train_or_resume_child(
     config: runner.KBOTrainingConfig,
     initialization: Mapping[str, Any],
     progress: Callable[[str], None],
+    temporal_preflight_report: str | Path | None = None,
 ) -> dict[str, Any]:
     training_report_path = run_directory / "training_report.json"
     previous: dict[str, Any] | None = None
@@ -386,6 +387,7 @@ def _train_or_resume_child(
         run_directory,
         config=config,
         resume=resume,
+        temporal_preflight_report=temporal_preflight_report,
         progress=progress,
     )
 
@@ -394,6 +396,7 @@ def _reevaluate_best_on_validation(
     run_directory: Path,
     dataset_directory: Path,
     config: runner.KBOTrainingConfig,
+    temporal_preflight_report: str | Path | None = None,
 ) -> dict[str, Any]:
     checkpoint = run_directory / "best.pt"
     checkpoint_hash = sha256_file(checkpoint)
@@ -421,6 +424,7 @@ def _reevaluate_best_on_validation(
         batch_days=config.batch_days,
         workers=config.workers,
         output_directory=temporary,
+        temporal_preflight_report=temporal_preflight_report,
     )
     report["output_directory"] = str(output)
     for artifact in report.get("prediction_artifacts", {}).values():

@@ -501,39 +501,55 @@ sealed metadata일 뿐 graph나 label을 로드하거나 평가하지 않는다.
 차이는 capacity/schema 확장 방향을 고르는 screening이며 seed 간 분산이나 안정성의 근거가
 아니다. 이 단계에서는 seed를 추가하지 않고 test도 계속 봉인한다.
 
-### 128×3 이후의 통제된 production-scale 후보
+### 실패한 v5 고정 8일 scale 경로와 temporal-v7 production workflow
 
-128×3×4는 용량 민감도를 보는 중간 지점이다. 현재 v5 서버 schema에서 약 660만 parameter이고,
-후속 후보 256×3×8은 약 2,614만 parameter다. 그래프 감사의 전체 node/edge 수는 날짜별
-snapshot occurrence의 합이며 단일 거대 연결 그래프의 동시 메모리 크기가 아니다. loader는
-`batch_days`개의 독립 날짜 그래프를 합친다.
+기존 v5 `relgnn-scale-train`은 날짜별 크기가 다른 snapshot을 항상 8일씩 묶습니다. 10GB MIG
+실행에서 대부분의 batch는 CUDA reserved 3.07GiB였지만 후반의 큰 날짜에서 5.92GiB를 거쳐
+9.31GiB(98.047%)까지 상승해 85% gate가 학습 전에 거부했습니다. 이는 실제 batch skew이며
+GPU 미사용 현상이 아닙니다. 기존 v5 scale 명령은 같은 고정 경계를 다시 만들므로 재실행하지 않습니다.
 
-`relgnn-scale-train` 하나가 완료된 128×3 capacity report를 검증하고 256×3×8 설정을 파생한 뒤,
-CUDA preflight → `full/node_only` pair → validation scale report를 순서대로 실행한다. v5,
-2001–2024 train, 2025 validation, 봉인된 2026 test, full 기간, uncapped PA/edge, seed 2026,
-30 epochs, batch-days 8과 accumulation 1만 허용한다. split, runtime, optimizer, objective와
-나머지 설정은 baseline에서 상속하므로 CLI에서 다시 적어 drift를 만들 수 없다.
+#### temporal-v7 실행 계약
+
+temporal-v7은 중복된 완성 daily graph가 아니라 immutable season-sharded event archive를
+저장합니다. 질의시각 직전의 사건만 읽어 player/team/game node와 `batter_game_event`,
+`pitcher_game_event`, `team_game_event`, `batter_pa_pitcher_event` 네 route를 갖는 historical
+subgraph를 query-time에 materialize합니다. 현재 질의 경기는 점수 없는 두 team-game edge만
+가지며 현재 출전선수·라인업·PA edge를 topology 선정에 사용하지 않습니다.
+
+각 날짜 질의 그래프의 전체 과거 game node는 최신 160개로 제한하고, seed team별 160개·player별 48개의
+확장 한도와 365일 lookback을 적용합니다. 이는 25시즌 전체를 한 GPU batch에 상주시켜 생기는
+메모리 폭주를 막으면서 과거 경기 단위 관계를 유지하는 sampling contract입니다. PA와 route
+edge의 raw cap은 사용하지 않습니다.
+
+아래 단일 명령이 event archive 작성·검증, 2025 validation까지만 포함한 sample index,
+adaptive all-batch CUDA preflight, seed 2026의 256×3×8-head `full`/`node_only` 각 30 epoch
+학습을 순서대로 수행합니다.
 
 ~~~bash
-cpv26 relgnn-scale-train \
-  --baseline-report var/runs/relgnn_capacity/kbo_2001_2024_v5_64x2_vs_128x3/capacity_comparison_report.json \
-  --dataset var/datasets/kbo_graph_2001_2026_v5 \
-  --output var/runs/relgnn_pairs/kbo_2001_2024_v5_256x3x8_seed2026 \
+cpv26 relgnn-temporal-run \
+  --dataset var/datasets/kbo_temporal_2001_2026_v7 \
+  --output var/runs/relgnn_temporal/kbo_2001_2024_v7_256x3_seed2026 \
+  --start-date 2001-01-01 \
+  --end-date 2026-07-26 \
+  --device cuda:0 \
+  --amp auto \
+  --workers 2 \
   --max-reserved-fraction 0.85
 ~~~
 
-preflight는 하나의 fresh model/AdamW를 유지한다. 첫 batch warmup 후 모든 실제 train/validation
-batch를 실행해 optimizer state를 materialize하고, allocator cache를 한 번 비운 다음 모든 batch를
-다시 실행한다. steady pass에서는 batch 사이 cache를 비우지 않아 장기 caching-allocator reserved
-high-water를 측정한다. 기본 허용선은 선택 GPU memory의 85%이며 실패 JSON도 atomic하게 남는다.
-본 runner도 iteration 끝에 GPU batch/output 참조를 끊어 다음 batch transfer와 겹치지 않는다.
-test GraphDay/label은 열지 않는다.
+batch planner는 일수 대신 sample index의 정확한 node/edge 수와 chronological 순서를 사용합니다.
+초기 한도는 batch당 node 100,000개, edge 200,000개입니다. preflight는 fresh 256×3×8 full
+model, activation checkpointing, persistent AdamW, production precision과 다음 CUDA batch 하나를
+미리 전송하는 실제 실행경로로 train/validation batch 전체를 forward/backward합니다. peak CUDA
+reserved가 선택 장치의 85%를 넘거나 OOM이면 두 예산을 절반으로 줄여 전체를 다시 측정합니다.
+하나의 고립된 oversize day도 gate를 넘으면 pair 학습을 시작하지 않습니다.
 
-preflight 통과 후에만 v5의 full/node_only를 학습한다. 최종 `scale_workflow_report.json`은 두
-용량의 초기화·split·runtime·표본·예산·실제 optimizer-step 수와 baseline/preflight/candidate
-SHA-256을 다시 확인한 뒤 한 번만 기록한다. Activation checkpointing 차이는 허용하지만 compact
-channel mode는 별도 아키텍처이므로 거부한다. 이 경로도 multi-seed와 held-out test 평가는
-수행하지 않는다.
+통과한 계획은 날짜 목록, node/edge 합계, batch 경계와 prefetch barrier까지 fingerprint로
+고정합니다. 두 조건은 같은 topology·질의·초기화·optimizer-step 예산과 정확히 같은 계획을
+사용하며 `node_only`만 relation message를 건너뜁니다. 최종 `temporal_workflow_report.json`은
+archive, sample index, `temporal_cuda_preflight.json`과 선택된 계획에 결속됩니다. checkpoint
+선택과 비교는 2025 validation만 사용하고 2026 sample과 label은 열지 않습니다. 단일 seed
+screening이므로 multi-seed 결론이나 held-out test 평가는 수행하지 않습니다.
 
 ## Matched-from-scratch 그래프 ablation (기존 6조건, 이번 범위에서는 사용하지 않음)
 

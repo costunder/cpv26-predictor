@@ -633,6 +633,136 @@ def kbo_graph_audit(
     )
 
 
+@app.command("relgnn-temporal-run")
+def relgnn_temporal_run(
+    dataset: Annotated[
+        Path | None,
+        typer.Option(help="Immutable temporal-v7 archive directory."),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Resumable single-seed full/node_only workflow directory."),
+    ] = None,
+    start_date: Annotated[
+        str, typer.Option(help="First supervised date included in the archive.")
+    ] = "2001-01-01",
+    end_date: Annotated[
+        str, typer.Option(help="Last archive date; held-out 2026 remains sealed in training.")
+    ] = "2026-07-26",
+    device: Annotated[str, typer.Option(help="Explicit CUDA device.")] = "cuda:0",
+    amp: Annotated[str, typer.Option(help="auto, bf16, fp16, or off.")] = "auto",
+    workers: Annotated[
+        int, typer.Option(min=0, help="Persistent temporal archive loader workers.")
+    ] = 2,
+    max_reserved_fraction: Annotated[
+        float,
+        typer.Option(
+            min=0.01,
+            max=0.85,
+            help="Maximum CUDA reserved-memory fraction accepted by adaptive preflight.",
+        ),
+    ] = 0.85,
+) -> None:
+    """Build/index/preflight temporal-v7, then run one matched full/node-only pair."""
+
+    settings = _settings()
+    _require_database(settings.database_path)
+    archive_directory = (
+        dataset
+        or settings.home / "datasets" / "kbo_temporal_2001_2026_v7"
+    ).expanduser().resolve()
+    run_directory = (
+        output
+        or settings.home
+        / "runs"
+        / "relgnn_temporal"
+        / "kbo_2001_2024_v7_256x3_seed2026"
+    ).expanduser().resolve()
+    try:
+        first = date.fromisoformat(start_date)
+        last = date.fromisoformat(end_date)
+        from cpv26.data.kbo_temporal_archive import (
+            build_kbo_temporal_archive,
+            build_kbo_temporal_sample_index,
+        )
+        from cpv26.training.kbo_runner import KBOTrainingConfig
+        from cpv26.training.kbo_temporal_workflow import (
+            KBOTemporalWorkflowPlan,
+            run_kbo_temporal_workflow,
+        )
+
+        console.print("[cyan]Stage 1/4[/cyan] immutable temporal event archive")
+        archive = build_kbo_temporal_archive(
+            settings.database_path,
+            archive_directory,
+            start_day=first,
+            end_day=last,
+        )
+        sample_index = archive_directory / "sample_index.json"
+        if sample_index.is_file():
+            console.print(
+                "[cyan]Stage 2/4[/cyan] reusing verified-by-workflow index: "
+                f"{sample_index}"
+            )
+        else:
+            console.print("[cyan]Stage 2/4[/cyan] validation-bounded temporal sample index")
+            build_kbo_temporal_sample_index(
+                archive,
+                sample_index,
+                label_year_ceiling=2025,
+                progress=console.print,
+            )
+        config = KBOTrainingConfig(
+            device=device,
+            epochs=30,
+            batch_days=8,
+            hidden_dim=256,
+            layers=3,
+            heads=8,
+            amp=amp,
+            workers=workers,
+            max_pa_per_day=0,
+            max_edges_per_route_per_day=0,
+            patience=0,
+            seed=2026,
+            train_seasons=tuple(range(2001, 2025)),
+            validation_season=2025,
+            test_season=2026,
+            chronological=True,
+            route_schedule="full",
+            activation_checkpointing=True,
+        )
+        console.print(
+            "[cyan]Stage 3/4[/cyan] adaptive all-batch CUDA preflight; "
+            "[cyan]Stage 4/4[/cyan] temporal-v7 256x3x8-head seed-2026 full/node_only"
+        )
+        report = run_kbo_temporal_workflow(
+            KBOTemporalWorkflowPlan(
+                dataset_directory=archive_directory,
+                output_directory=run_directory,
+                config=config,
+                sample_index_path=sample_index,
+                max_reserved_fraction=max_reserved_fraction,
+            ),
+            progress=console.print,
+        )
+    except (
+        DuckDBError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        KeyError,
+    ) as exc:
+        error_console.print(f"[red]Temporal RelGNN workflow failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    comparison = report["validation_selection_comparison"]
+    console.print(f"[green]Temporal RelGNN workflow complete[/green]: {run_directory}")
+    console.print_json(data=comparison)
+    console.print("2026 test labels and samples were not opened.")
+
+
 @app.command("relgnn-train")
 def relgnn_train(
     dataset: Annotated[

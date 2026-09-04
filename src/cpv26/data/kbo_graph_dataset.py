@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import threading
 from collections import defaultdict
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -35,6 +36,14 @@ GRAPH_VNEXT_DATASET_VERSION = 6
 GRAPH_SCHEMAS = ("v5", "vnext")
 _KST = ZoneInfo("Asia/Seoul")
 Array = NDArray[Any]
+
+# Graph caches are immutable inputs during training.  Remember a successful
+# verification only while the file's kernel identity is unchanged; this avoids
+# re-reading every compressed archive solely to hash it again on every epoch.
+# The cache is process-local by design, so it is neither persisted nor part of
+# the dataset fingerprint.
+_VERIFIED_GRAPH_FILES: dict[Path, tuple[str, tuple[int, int, int, int, int]]] = {}
+_VERIFIED_GRAPH_FILES_LOCK = threading.Lock()
 BOX_BATTING_FIELDS = (
     "at_bats",
     "hits",
@@ -255,10 +264,22 @@ class GraphDay:
 
     @property
     def routes(self) -> dict[str, dict[str, Array]]:
-        return {
-            route: {key: self.arrays[f"{route}__{key}"] for key in _ROUTE_ARRAY_FIELDS}
+        known = tuple(
+            route
             for route in VNEXT_ROUTE_METADATA
             if f"{route}__source_index" in self.arrays
+        )
+        discovered = {
+            name.removesuffix("__source_index")
+            for name in self.arrays
+            if name.endswith("__source_index")
+        }
+        # Preserve the v5/v6 insertion contract, then expose versioned route
+        # families without teaching this transport dataclass every new schema.
+        routes = (*known, *sorted(discovered.difference(known)))
+        return {
+            route: {key: self.arrays[f"{route}__{key}"] for key in _ROUTE_ARRAY_FIELDS}
+            for route in routes
         }
 
     def __getattr__(self, name: str) -> Any:
@@ -317,10 +338,9 @@ class KBOGraphDataset:
         path = (self.directory / entry["file"]).resolve()
         if self.directory not in path.parents:
             raise ValueError("graph file escapes dataset directory")
-        if _sha256_file(path) != entry["sha256"]:
-            raise ValueError(f"graph cache checksum mismatch: {key}")
-        with np.load(path, allow_pickle=False) as archive:
-            arrays = {name: archive[name] for name in archive.files}
+        arrays, file_identity = _read_verified_graph_archive(
+            path, str(entry["sha256"]), key
+        )
         has_game_ids = "_game_ids" in arrays
         if has_game_ids != (self.dataset_version == GRAPH_VNEXT_DATASET_VERSION):
             raise ValueError("graph archive game-node contract disagrees with manifest version")
@@ -330,6 +350,7 @@ class KBOGraphDataset:
         _add_box_defaults(arrays, len(players), len(teams))
         graph = GraphDay(date.fromisoformat(key), players, teams, arrays, games)
         _validate_graph(graph)
+        _remember_verified_graph_file(path, str(entry["sha256"]), file_identity)
         return graph
 
 
@@ -2346,6 +2367,76 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _open_file_identity(handle: Any) -> tuple[int, int, int, int, int]:
+    """Return the metadata that must remain stable around one archive read."""
+
+    stat = os.fstat(handle.fileno())
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+
+
+def _sha256_open_file(handle: Any) -> str:
+    """Hash an already-open file and leave it ready for a subsequent reader."""
+
+    digest = hashlib.sha256()
+    handle.seek(0)
+    for block in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(block)
+    handle.seek(0)
+    return digest.hexdigest()
+
+
+def _read_npz_arrays(handle: Any) -> dict[str, Array]:
+    """Read every member while the integrity-checked file descriptor stays open."""
+
+    with np.load(handle, allow_pickle=False) as archive:
+        return {name: archive[name] for name in archive.files}
+
+
+def _read_verified_graph_archive(
+    path: Path,
+    expected_sha256: str,
+    day_key: str,
+) -> tuple[dict[str, Array], tuple[int, int, int, int, int]]:
+    """Verify and load the same open file, rejecting concurrent mutations.
+
+    A cache hit skips only the SHA-256 pass.  Parsing and the caller's complete
+    graph validation still run on every load.  The descriptor identity is
+    checked both before and after NumPy reads so a concurrent in-place write
+    cannot turn an earlier successful hash into a TOCTOU bypass.
+    """
+
+    with path.open("rb") as handle:
+        before = _open_file_identity(handle)
+        with _VERIFIED_GRAPH_FILES_LOCK:
+            cached = _VERIFIED_GRAPH_FILES.get(path) == (expected_sha256, before)
+        if not cached and _sha256_open_file(handle) != expected_sha256:
+            raise ValueError(f"graph cache checksum mismatch: {day_key}")
+        arrays = _read_npz_arrays(handle)
+        after = _open_file_identity(handle)
+    if after != before:
+        with _VERIFIED_GRAPH_FILES_LOCK:
+            _VERIFIED_GRAPH_FILES.pop(path, None)
+        raise ValueError(f"graph cache changed while loading: {day_key}")
+    return arrays, before
+
+
+def _remember_verified_graph_file(
+    path: Path,
+    expected_sha256: str,
+    identity: tuple[int, int, int, int, int],
+) -> None:
+    """Publish a cache entry only after archive parsing and graph validation."""
+
+    with _VERIFIED_GRAPH_FILES_LOCK:
+        _VERIFIED_GRAPH_FILES[path] = (expected_sha256, identity)
 
 
 def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:

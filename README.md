@@ -423,46 +423,47 @@ graph와 label을 로드하거나 평가하지 않습니다. 단일 seed 결과�
 실험 방향을 고르는 screening일 뿐 seed 간 분산이나 안정성의 근거가 아닙니다. 이번 범위에는
 seed 추가와 multi-seed 결론이 없으며 test는 계속 봉인합니다.
 
-#### 128×3 다음의 실제 scale rung
+#### temporal-v7 production RelGNN
 
-`128 hidden × 3 layer × 4 head`는 최종 대형 설정이 아니라 관계 의존도가 작은 원인이 단순
-용량 부족인지 확인한 중간 지점입니다. 서버의 v5 schema에서는 약 660만 parameter이고,
-다음 통제 비교점인 `256 hidden × 3 layer × 8 head`는 약 2,614만 parameter입니다. 실제 수는
-아래 preflight가 현재 manifest로 다시 계산해 기록합니다.
+기존 v5 `relgnn-scale-train`의 고정 8일 minibatch 경로는 10GB MIG 실측에서 후반의 큰 날짜
+그래프가 겹치며 CUDA reserved memory가 9.31GiB, 즉 98.047%까지 올라 85% gate에서 거부됐습니다.
+초반의 3.07GiB plateau는 GPU를 쓰지 않았다는 뜻이 아니라 날짜별 그래프 크기 편차가 뒤늦게
+드러난 것입니다. 같은 v5 명령은 동일한 배치 경계를 만들어 다시 실패하므로 재실행하지 않습니다.
 
-감사에서 나온 2,026,797 node와 6,791,361 edge는 3,870개 날짜 snapshot의 누적 occurrence입니다.
-학습 시 하나의 200만-node 그래프를 올리는 구조가 아니라, `--batch-days 8`이면 서로 연결되지
-않은 8개 날짜 그래프를 한 minibatch로 묶습니다. 따라서 parameter 폭만 무작정 512/1024로
-키우는 대신, 실제 batch shape와 AdamW steady-state VRAM을 먼저 측정합니다.
+production 경로는 temporal-v7의 immutable season-sharded event archive를 만들고, 각 질의시점
+이전의 player/team/game 사건만 사용해 cutoff-safe historical subgraph를 materialize합니다. 한
+날짜의 질의 그래프가 포함할 수 있는 과거 game node는 전역 160개로 제한합니다. 원시 PA나 route edge를
+임의로 잘라내는 cap은 사용하지 않습니다. `full`은 네 temporal relation의 message를 사용하고,
+`node_only`는 정확히 같은 topology와 질의를 받되 relation message만 건너뜁니다.
 
-이 단계는 preflight, pair train, report를 사용자가 따로 조합하지 않습니다. 전용 명령이 완료된
-128×3 capacity report에서 dataset fingerprint, split, seed, epoch, batch, optimizer, loss와 runtime을
-그대로 상속하고, 용량과 activation checkpointing만 256×3×8로 바꿉니다. v5, 2001–2024 train,
-2025 validation, 봉인된 2026 test, seed 2026, 30 epochs, batch-days 8, 무제한 PA/edge가 아니면
-학습 전에 거부합니다. 축소 smoke 결과와 vNext 결과는 이 production-scale 경로에 넣을 수 없습니다.
-
-CUDA 사전검사는 fresh model/AdamW로 첫 batch warmup을 한 뒤 train/validation의 모든 실제
-chronological batch를 한 차례 실행해 lazy optimizer state를 완전히 만듭니다. 이어 allocator cache를
-한 번만 비우고, 모든 실제 batch를 다시 실행하면서 batch 사이 CUDA cache를 유지한 누적 reserved
-high-water를 측정합니다. 10GB MIG의 85%를 넘으면 실패 JSON을 남기고 pair 학습을 시작하지
-않습니다. 본 학습도 iteration 끝에서 GPU batch/output 참조를 해제해 사전검사와 tensor lifetime을
-맞춥니다. 15% 여유는 runtime 변동을 위한 headroom이지 다른 GPU 환경까지 보증한다는 뜻은 아닙니다.
+아래 명령 하나가 archive 작성, 2025년까지의 sample index 작성, adaptive all-batch CUDA preflight,
+`256 hidden × 3 layer × 8 head`의 `full`/`node_only` 학습을 순서대로 수행합니다. seed는 2026
+하나이고 epoch은 30으로 고정되며 activation checkpointing을 사용합니다.
 
 ~~~bash
-cpv26 relgnn-scale-train \
-  --baseline-report var/runs/relgnn_capacity/kbo_2001_2024_v5_64x2_vs_128x3/capacity_comparison_report.json \
-  --dataset var/datasets/kbo_graph_2001_2026_v5 \
-  --output var/runs/relgnn_pairs/kbo_2001_2024_v5_256x3x8_seed2026 \
+cpv26 relgnn-temporal-run \
+  --dataset var/datasets/kbo_temporal_2001_2026_v7 \
+  --output var/runs/relgnn_temporal/kbo_2001_2024_v7_256x3_seed2026 \
+  --start-date 2001-01-01 \
+  --end-date 2026-07-26 \
+  --device cuda:0 \
+  --amp auto \
+  --workers 2 \
   --max-reserved-fraction 0.85
 ~~~
 
-사전검사를 통과한 경우에만 같은 설정의 `full`/`node_only` 두 run을 학습합니다. 128×3 baseline과
-실제 optimizer-step 수까지 동일해야 gated 최종 보고서
-`.../scale_workflow_report.json`이 한 번의 atomic write로 만들어집니다. 이 보고서는 baseline,
-preflight, candidate JSON의 SHA-256과 실제 peak/threshold를 결속합니다. Activation checkpointing은
-parameter·loss·batch를 바꾸지 않는 메모리 실행 정책으로만 허용됩니다. dead channel을 없애는
-compact mode는 별도 아키텍처이므로 이 비교에서 거부합니다. 이 역시 단일 seed validation
-screening이며 multi-seed나 2026 test 평가를 추가하지 않습니다.
+배치는 `batch-days` 고정값이 아니라 sample index의 정확한 node/edge 수로 만듭니다. 최초 예산은
+batch당 node 100,000개와 edge 200,000개이며, fresh model과 persistent AdamW로 실제
+train/validation batch 전체를 forward/backward하고 다음 CUDA batch 하나를 미리 올린 상태까지
+측정합니다. reserved peak가 선택 GPU의 85%를 넘거나 OOM이면 node/edge 예산을 함께 절반으로
+줄여 새 실행계획을 검사합니다. 고립된 하루도 85%를 넘으면 학습하지 않고 실패 증거를 남깁니다.
+
+통과한 정확한 batch 순서·경계와 prefetch barrier를 두 조건이 그대로 사용하며, preflight와
+학습 보고서는 같은 archive/index/plan fingerprint에 결속됩니다. checkpoint 선택과 조건 비교는
+2025 validation까지만 사용합니다. 2026 sample과 label은 열지 않으며 test 평가는 계속 봉인합니다.
+완료 결과는 output의 `temporal_workflow_report.json`, CUDA gate와 선택된 배치계획은
+`temporal_cuda_preflight.json`에서 확인합니다. 이 결과도 단일 seed screening이며 multi-seed
+안정성을 주장하지 않습니다.
 
 ### 5-3. 기존 여섯 조건 전체 비교 (이번 범위에서는 사용하지 않음)
 

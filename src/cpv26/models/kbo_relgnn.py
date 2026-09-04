@@ -40,6 +40,12 @@ KBO_VNEXT_ROUTE_NAMES = (
     "pitcher_game_participation",
     "team_game_context",
 )
+KBO_TEMPORAL_ROUTE_NAMES = (
+    "batter_game_event",
+    "pitcher_game_event",
+    "team_game_event",
+    "batter_pa_pitcher_event",
+)
 
 
 def kbo_route_registry() -> RouteRegistry:
@@ -103,8 +109,67 @@ def kbo_route_registry() -> RouteRegistry:
                 "shared",
                 "shared",
             ),
+            AtomicRoute(
+                "batter_game_event",
+                "player",
+                "historical_batting_game_event",
+                "game",
+                "batting",
+                "shared",
+            ),
+            AtomicRoute(
+                "pitcher_game_event",
+                "player",
+                "historical_pitching_game_event",
+                "game",
+                "pitching",
+                "shared",
+            ),
+            AtomicRoute(
+                "team_game_event",
+                "team",
+                "historical_or_query_team_game_event",
+                "game",
+                "shared",
+                "shared",
+            ),
+            AtomicRoute(
+                "batter_pa_pitcher_event",
+                "player",
+                "historical_plate_appearance_event",
+                "player",
+                "batting",
+                "pitching",
+            ),
         )
     )
+
+
+def _validate_kbo_route_schema(
+    route_names: set[str],
+    node_types: set[str],
+    *,
+    context: str,
+) -> None:
+    """Fail closed when a temporal-v7 route appears outside its exact schema.
+
+    Legacy v5/v6 accepted any non-empty subset of their reviewed routes.  Keep
+    that contract untouched; the disjoint temporal-v7 names are the schema
+    discriminator and must always travel as one complete route family.
+    """
+
+    temporal_names = set(KBO_TEMPORAL_ROUTE_NAMES)
+    if not route_names.intersection(temporal_names):
+        return
+    if node_types != {"player", "team", "game"}:
+        raise ValueError(f"{context} temporal_v7 routes require player/team/game nodes")
+    if route_names != temporal_names:
+        missing = sorted(temporal_names - route_names)
+        extra = sorted(route_names - temporal_names)
+        raise ValueError(
+            f"{context} temporal_v7 routes must match the exact reviewed route set; "
+            f"missing={missing}, extra={extra}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,10 +211,21 @@ class KBORelGNNConfig:
             raise ValueError("KBO role features must be batting/pitching observations")
         if any(width < 0 for width in self.role_feature_dims.values()):
             raise ValueError("role feature widths cannot be negative")
-        allowed_routes = (
-            set(KBO_VNEXT_ROUTE_NAMES) if "game" in node_types else set(KBO_ROUTE_NAMES)
+        route_names = set(self.route_feature_dims)
+        _validate_kbo_route_schema(
+            route_names,
+            node_types,
+            context="KBO RelGNN configuration",
         )
-        if not self.route_feature_dims or set(self.route_feature_dims) - allowed_routes:
+        temporal_v7 = bool(route_names.intersection(KBO_TEMPORAL_ROUTE_NAMES))
+        allowed_routes = (
+            set(KBO_TEMPORAL_ROUTE_NAMES)
+            if temporal_v7
+            else set(KBO_VNEXT_ROUTE_NAMES)
+            if "game" in node_types
+            else set(KBO_ROUTE_NAMES)
+        )
+        if not self.route_feature_dims or route_names - allowed_routes:
             raise ValueError("route_feature_dims must name reviewed KBO routes")
         if any(width < 0 for width in self.route_feature_dims.values()):
             raise ValueError("route feature widths cannot be negative")
@@ -704,6 +780,11 @@ def collate_kbo_day_graphs(
         routes = _get(day, "routes", {})
         if not isinstance(routes, Mapping):
             raise ValueError("routes must map reviewed names to numeric arrays")
+        _validate_kbo_route_schema(
+            set(routes),
+            node_types,
+            context=f"KBO graph {day_id!r}",
+        )
         for name, raw_route in routes.items():
             route = registry.require(name)
             if route.source_type not in counts or route.destination_type not in counts:
@@ -928,6 +1009,7 @@ def collate_kbo_day_graphs(
 
 __all__ = [
     "KBO_ROUTE_NAMES",
+    "KBO_TEMPORAL_ROUTE_NAMES",
     "KBO_VNEXT_ROUTE_NAMES",
     "KBORelGNNConfig",
     "KBORelGNNModel",

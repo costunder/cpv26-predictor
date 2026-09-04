@@ -303,7 +303,14 @@ def _compare_optimizations(
         for name in order:
             optimized = name == "optimized"
             session = _new_session(state, config, device, optimized=optimized)
-            loader = _loader(directory, days, config, epoch=0, training=True)
+            loader = _loader(
+                directory,
+                days,
+                config,
+                epoch=0,
+                training=True,
+                packed_transfers=optimized,
+            )
             result = _measure(
                 session, loader, config, device, warmup=warmup, steps=steps,
                 resident=False, statistics_enabled=True, packed_transfers=optimized,

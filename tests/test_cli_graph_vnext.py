@@ -86,6 +86,71 @@ def test_graph_audit_writes_json_report(tmp_path: Path, monkeypatch: Any) -> Non
     assert "unique edge occurrences: 20" in result.output
 
 
+def test_temporal_run_builds_indexes_and_starts_one_fixed_pair(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from cpv26.data import kbo_temporal_archive
+    from cpv26.training import kbo_temporal_workflow
+
+    runtime, database = _runtime(tmp_path, monkeypatch)
+    calls: dict[str, Any] = {}
+
+    class _Archive:
+        pass
+
+    def fake_archive(*args: Any, **kwargs: Any) -> _Archive:
+        calls["archive"] = (args, kwargs)
+        return _Archive()
+
+    def fake_index(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls["index"] = (args, kwargs)
+        return {}
+
+    def fake_workflow(plan: Any, **kwargs: Any) -> dict[str, Any]:
+        calls["plan"] = plan
+        return {
+            "validation_selection_comparison": {
+                "full": 4.5,
+                "node_only": 4.6,
+                "node_only_minus_full": 0.1,
+            }
+        }
+
+    monkeypatch.setattr(kbo_temporal_archive, "build_kbo_temporal_archive", fake_archive)
+    monkeypatch.setattr(
+        kbo_temporal_archive, "build_kbo_temporal_sample_index", fake_index
+    )
+    monkeypatch.setattr(kbo_temporal_workflow, "run_kbo_temporal_workflow", fake_workflow)
+    dataset = runtime / "datasets" / "temporal"
+    output = runtime / "runs" / "temporal"
+    result = CliRunner().invoke(
+        app,
+        [
+            "relgnn-temporal-run",
+            "--dataset",
+            str(dataset),
+            "--output",
+            str(output),
+            "--workers",
+            "4",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls["archive"][0] == (database.resolve(), dataset.resolve())
+    assert calls["index"][1]["label_year_ceiling"] == 2025
+    config = calls["plan"].config
+    assert (config.hidden_dim, config.layers, config.heads) == (256, 3, 8)
+    assert config.train_seasons == tuple(range(2001, 2025))
+    assert config.validation_season == 2025
+    assert config.test_season == 2026
+    assert config.seed == 2026
+    assert config.chronological is True
+    assert config.activation_checkpointing is True
+    assert config.workers == 4
+    assert "2026 test labels and samples were not opened" in result.output
+
+
 def test_capacity_command_reuses_baseline_and_requests_only_128x3(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

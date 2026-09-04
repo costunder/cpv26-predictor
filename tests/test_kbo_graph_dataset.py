@@ -518,6 +518,66 @@ def test_cache_incremental_reuse_integrity_and_corruption_rebuild(tmp_path: Path
     assert not list(output.rglob("*.part"))
 
 
+def test_load_day_reuses_checksum_only_while_file_identity_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
+    entry = dataset.manifest["days"][0]
+    path = (dataset.directory / entry["file"]).resolve()
+    with graph_module._VERIFIED_GRAPH_FILES_LOCK:
+        graph_module._VERIFIED_GRAPH_FILES.pop(path, None)
+
+    original_hash = graph_module._sha256_open_file
+    hash_calls = 0
+
+    def tracked_hash(handle: object) -> str:
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(handle)
+
+    monkeypatch.setattr(graph_module, "_sha256_open_file", tracked_hash)
+    assert dataset.load_day(entry["day"]).day.isoformat() == entry["day"]
+    # A new Dataset instance models the runner's epoch-local loader wrapper.
+    assert KBOGraphDataset(dataset.directory).load_day(entry["day"]).day.isoformat() == entry["day"]
+    assert hash_calls == 1
+
+    path.write_bytes(b"corrupt-after-successful-verification")
+    with pytest.raises(ValueError, match="checksum"):
+        dataset.load_day(entry["day"])
+    assert hash_calls == 2
+
+
+def test_load_day_rejects_archive_identity_change_during_same_open_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "canonical.duckdb"
+    _database(database)
+    dataset = build_kbo_graph_dataset(database, tmp_path / "graph")
+    entry = dataset.manifest["days"][0]
+    path = (dataset.directory / entry["file"]).resolve()
+    with graph_module._VERIFIED_GRAPH_FILES_LOCK:
+        graph_module._VERIFIED_GRAPH_FILES.pop(path, None)
+
+    original_identity = graph_module._open_file_identity
+    identity_calls = 0
+
+    def changing_identity(handle: object) -> tuple[int, int, int, int, int]:
+        nonlocal identity_calls
+        identity_calls += 1
+        identity = original_identity(handle)
+        if identity_calls == 2:
+            return (*identity[:-1], identity[-1] + 1)
+        return identity
+
+    monkeypatch.setattr(graph_module, "_open_file_identity", changing_identity)
+    with pytest.raises(ValueError, match="changed while loading"):
+        dataset.load_day(entry["day"])
+    with graph_module._VERIFIED_GRAPH_FILES_LOCK:
+        assert path not in graph_module._VERIFIED_GRAPH_FILES
+
+
 def test_coverage_metadata_upgrade_reuses_legacy_graph_arrays_and_fingerprint(
     tmp_path: Path,
 ) -> None:

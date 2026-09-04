@@ -1041,6 +1041,37 @@ def test_loader_orders_training_dates_only_when_requested(
     assert loader["dataset"].selected_days == expected_days
 
 
+def test_packed_cuda_loader_avoids_double_pinning_but_legacy_path_pins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Generator:
+        def manual_seed(self, value: int) -> Generator:
+            return self
+
+    def capture_loader(dataset: Any, **options: Any) -> Any:
+        return {"dataset": dataset, **options}
+
+    fake_torch = SimpleNamespace(
+        Generator=Generator,
+        utils=SimpleNamespace(data=SimpleNamespace(DataLoader=capture_loader)),
+    )
+    monkeypatch.setattr(runner_module, "require_torch", lambda: (fake_torch, None))
+    config = replace(_config(), device="cuda:0")
+    days = (date(2024, 4, 1),)
+
+    packed = _loader(tmp_path, days, config, epoch=0, training=True)
+    legacy = _loader(
+        tmp_path,
+        days,
+        config,
+        epoch=0,
+        training=True,
+        packed_transfers=False,
+    )
+    assert packed["pin_memory"] is False
+    assert legacy["pin_memory"] is True
+
+
 @pytest.mark.parametrize("manifest_version", [2, 3, 4, 5])
 def test_training_never_loads_held_out_test_graphs_for_any_dataset_version(
     graph_directory: Path,

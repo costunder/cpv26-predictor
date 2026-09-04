@@ -51,6 +51,85 @@ def test_transfer_module_imports_without_optional_torch() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_cuda_prefetch_preserves_order_waits_and_records_consumer_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    active_stream: list[str | None] = [None]
+
+    class FakeDevice:
+        type = "cuda"
+
+    class FakeStream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def wait_stream(self, other: FakeStream) -> None:
+            events.append(f"wait:{self.name}<-{other.name}")
+
+    class FakeStreamContext:
+        def __init__(self, stream: FakeStream) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> None:
+            active_stream[0] = self.stream.name
+
+        def __exit__(self, *_: object) -> None:
+            active_stream[0] = None
+
+    class FakeTensor:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.device = FakeDevice()
+
+        def record_stream(self, stream: FakeStream) -> None:
+            events.append(f"record:{self.name}:{stream.name}")
+
+    copy = FakeStream("copy")
+    compute = FakeStream("compute")
+    fake_torch = SimpleNamespace(
+        device=lambda _: FakeDevice(),
+        is_tensor=lambda value: isinstance(value, FakeTensor),
+        cuda=SimpleNamespace(
+            Stream=lambda **_: copy,
+            stream=lambda value: FakeStreamContext(value),
+            current_stream=lambda _: compute,
+        ),
+    )
+    monkeypatch.setattr(batch_transfer, "require_torch", lambda: (fake_torch, None))
+
+    def source() -> Any:
+        for name in ("first", "second"):
+            events.append(f"source:{name}")
+            yield name
+
+    def move(name: str, _: object) -> dict[str, FakeTensor]:
+        events.append(f"move:{name}:{active_stream[0]}")
+        return {"tensor": FakeTensor(name)}
+
+    prefetched = batch_transfer.prefetch_batches(source(), "cuda:0", mover=move)
+    first = next(prefetched)
+    assert first["tensor"].name == "first"
+    assert events == [
+        "source:first",
+        "move:first:copy",
+        "wait:compute<-copy",
+        "record:first:compute",
+        "source:second",
+        "move:second:copy",
+    ]
+    events.append("compute:first")
+    second = next(prefetched)
+    assert second["tensor"].name == "second"
+    assert events[-3:] == [
+        "compute:first",
+        "wait:compute<-copy",
+        "record:second:compute",
+    ]
+    with pytest.raises(StopIteration):
+        next(prefetched)
+
+
 @pytest.mark.parametrize(("names", "expected"), [
     (None, True),
     ((None, None), True),

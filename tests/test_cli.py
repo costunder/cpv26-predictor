@@ -49,6 +49,7 @@ def test_kbo_commands_are_available_without_loading_catboost() -> None:
         "kbo-live-hit-evaluate",
         "gpu-check",
         "kbo-graph-build",
+        "relgnn-temporal-run",
         "relgnn-train",
         "relgnn-ablation-train",
         "relgnn-ablation-report",
